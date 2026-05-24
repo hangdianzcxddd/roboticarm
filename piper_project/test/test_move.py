@@ -8,9 +8,34 @@ from robot.piper_controller import EndPose, PiperController
 from robot.safety import SafetyError
 
 
+class FakeJointState:
+    def __init__(self, joints: tuple[int, int, int, int, int, int]) -> None:
+        (
+            self.joint_1,
+            self.joint_2,
+            self.joint_3,
+            self.joint_4,
+            self.joint_5,
+            self.joint_6,
+        ) = joints
+
+
+class FakeJointFeedback:
+    def __init__(
+        self,
+        joints: tuple[int, int, int, int, int, int],
+        time_stamp: float | None = None,
+    ) -> None:
+        self.joint_state = FakeJointState(joints)
+        if time_stamp is not None:
+            self.time_stamp = time_stamp
+
+
 class FakePiperSdk:
     def __init__(self) -> None:
         self.calls: list[tuple[str, tuple[object, ...]]] = []
+        self.joint_feedbacks: list[FakeJointFeedback] = []
+        self.joint_feedback = FakeJointFeedback((0, 0, 0, 0, 0, 0))
 
     def ConnectPort(self, can_init=False, piper_init=True, start_thread=True):
         self.calls.append(("ConnectPort", (can_init, piper_init, start_thread)))
@@ -78,13 +103,38 @@ class FakePiperSdk:
         return "pose"
 
     def GetArmJointMsgs(self):
-        return "joints"
+        if self.joint_feedbacks:
+            return self.joint_feedbacks.pop(0)
+        return self.joint_feedback
 
     def GetArmGripperMsgs(self):
         return "gripper"
 
     def SetSDKJointLimitParam(self, joint_name, min_val, max_val):
         self.calls.append(("SetSDKJointLimitParam", (joint_name, min_val, max_val)))
+
+    def CrashProtectionConfig(
+        self,
+        joint_1_protection_level,
+        joint_2_protection_level,
+        joint_3_protection_level,
+        joint_4_protection_level,
+        joint_5_protection_level,
+        joint_6_protection_level,
+    ):
+        self.calls.append(
+            (
+                "CrashProtectionConfig",
+                (
+                    joint_1_protection_level,
+                    joint_2_protection_level,
+                    joint_3_protection_level,
+                    joint_4_protection_level,
+                    joint_5_protection_level,
+                    joint_6_protection_level,
+                ),
+            )
+        )
 
 
 def make_controller() -> tuple[PiperController, FakePiperSdk]:
@@ -140,20 +190,31 @@ class TestMove(unittest.TestCase):
 
         controller.move_joints(
             [
-                math.radians(154.0),
-                math.radians(195.0),
-                math.radians(-175.0),
-                math.radians(112.0),
-                math.radians(75.0),
-                math.radians(170.0),
+                math.radians(150.0),
+                math.radians(180.0),
+                math.radians(-170.0),
+                math.radians(100.0),
+                math.radians(70.0),
+                math.radians(120.0),
             ],
             speed_percent=20,
         )
 
         self.assertEqual(
             sdk.calls[-1],
-            ("JointCtrl", (154000, 195000, -175000, 112000, 75000, 170000)),
+            ("JointCtrl", (150000, 180000, -170000, 100000, 70000, 120000)),
         )
+
+    def test_joint_outside_configured_limit_is_rejected_before_sdk_call(self):
+        controller, sdk = make_controller()
+
+        with self.assertRaisesRegex(
+            SafetyError,
+            "Motion rejected: joint_6=.*outside the allowed range",
+        ):
+            controller.move_joints([0.0, 0.0, 0.0, 0.0, 0.0, math.radians(121.0)])
+
+        self.assertEqual(sdk.calls, [])
 
     def test_pose_outside_safety_limits_is_rejected_before_sdk_call(self):
         controller, sdk = make_controller()
@@ -202,11 +263,52 @@ class TestMove(unittest.TestCase):
         self.assertEqual(len(sdk.calls), 6)
         self.assertEqual(sdk.calls[0][0], "SetSDKJointLimitParam")
         self.assertEqual(sdk.calls[0][1][0], "j1")
-        self.assertAlmostEqual(sdk.calls[0][1][1], math.radians(-154.0))
-        self.assertAlmostEqual(sdk.calls[0][1][2], math.radians(154.0))
+        self.assertAlmostEqual(sdk.calls[0][1][1], math.radians(-150.0))
+        self.assertAlmostEqual(sdk.calls[0][1][2], math.radians(150.0))
         self.assertEqual(sdk.calls[-1][1][0], "j6")
-        self.assertAlmostEqual(sdk.calls[-1][1][1], math.radians(-170.0))
-        self.assertAlmostEqual(sdk.calls[-1][1][2], math.radians(170.0))
+        self.assertAlmostEqual(sdk.calls[-1][1][1], math.radians(-120.0))
+        self.assertAlmostEqual(sdk.calls[-1][1][2], math.radians(120.0))
+
+    def test_safe_disable_parks_before_disabling(self):
+        config = RobotConfig(
+            command_interval_s=0,
+            connect_timeout_s=0.1,
+            disable_park_joints_rad=(0.0, 0.0, -0.5, 0.0, 0.5, 0.0),
+            disable_park_speed_percent=10,
+            disable_park_settle_s=0,
+        )
+        sdk = FakePiperSdk()
+        sdk.joint_feedbacks = [
+            FakeJointFeedback((0, 0, 0, 0, 0, 0), time_stamp=1.0),
+            FakeJointFeedback((0, 0, -28648, 0, 28648, 0), time_stamp=2.0),
+        ]
+        controller = PiperController(config=config, sdk=sdk)
+
+        controller.safe_disable()
+
+        self.assertEqual(
+            sdk.calls,
+            [
+                ("MotionCtrl_2", (0x01, 0x01, 10, 0x00, 0, 0x00)),
+                ("JointCtrl", (0, 0, -28648, 0, 28648, 0)),
+                ("DisablePiper", ()),
+            ],
+        )
+
+    def test_set_collision_protection_sends_valid_levels(self):
+        controller, sdk = make_controller()
+
+        controller.set_collision_protection([1, 2, 3, 4, 5, 6])
+
+        self.assertEqual(sdk.calls, [("CrashProtectionConfig", (1, 2, 3, 4, 5, 6))])
+
+    def test_set_collision_protection_rejects_invalid_levels(self):
+        controller, sdk = make_controller()
+
+        with self.assertRaises(ValueError):
+            controller.set_collision_protection([1, 2, 3, 4, 5, 9])
+
+        self.assertEqual(sdk.calls, [])
 
 
 if __name__ == "__main__":

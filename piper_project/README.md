@@ -60,6 +60,18 @@ python3 main.py enable
 python3 main.py disable
 ```
 
+默认 `disable` 会先用低速移动到 `RobotConfig.disable_park_joints_rad`，再执行真正失能，以减少电机释放后因重力下落造成的碰撞风险。如果确认当前姿态已经安全，可以跳过停放动作：
+
+```bash
+python3 main.py disable --no-park
+```
+
+建议根据你的安装方式、末端工具、负载和桌面高度，实机低速标定一个安全停放关节姿态，然后写入：
+
+```text
+config/robot_config.py -> RobotConfig.disable_park_joints_rad
+```
+
 ## 测试末端位姿运动
 
 单位说明：
@@ -108,7 +120,10 @@ python3 main.py joints 0 0 -0.5 0 0.5 0 --speed 20
 3. CAN 口配置正确。
 4. config/robot_config.py 中的坐标范围、关节范围、默认速度符合当前安装环境。
 5. 第一次测试建议使用较低速度，例如 --speed 10 或 --speed 20。
+6. 失能前的停放姿态 disable_park_joints_rad 已经在实机上验证，不会与桌面、夹具或周边设备碰撞。
 ```
+
+当前工程会在发送 SDK 运动指令前校验输入。`pose` 会检查 xyz/rpy 是否在配置工作范围内，`joints` 会检查 6 个关节是否在 SDK 文档的默认关节范围内；超出范围时不会移动，并输出英文错误信息。
 
 ## 视觉模块
 

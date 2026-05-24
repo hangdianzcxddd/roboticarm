@@ -10,7 +10,7 @@ import sys
 from typing import Any, Protocol
 
 from config.robot_config import MoveMode, RobotConfig, ROBOT_CONFIG
-from robot.safety import SafetyChecker
+from robot.safety import SafetyChecker, SafetyError
 
 
 SDK_DEG_FACTOR = 1000
@@ -70,6 +70,16 @@ class PiperSdkLike(Protocol):
         gripper_effort: int = 0,
         gripper_code: int = 0,
         set_zero: int = 0,
+    ) -> None: ...
+
+    def CrashProtectionConfig(
+        self,
+        joint_1_protection_level: int,
+        joint_2_protection_level: int,
+        joint_3_protection_level: int,
+        joint_4_protection_level: int,
+        joint_5_protection_level: int,
+        joint_6_protection_level: int,
     ) -> None: ...
 
     def GetArmStatus(self) -> Any: ...
@@ -192,11 +202,114 @@ class PiperController:
             time.sleep(self.config.command_interval_s)
         raise TimeoutError("Piper arm disable timed out")
 
+    def safe_disable(self, park: bool | None = None) -> None:
+        should_park = self.config.park_before_disable if park is None else park
+        if should_park:
+            self.park_for_disable()
+        self.disable()
+
+    def park_for_disable(
+        self,
+        joints_rad: tuple[float, ...] | list[float] | None = None,
+        speed_percent: int | None = None,
+        timeout_s: float | None = None,
+    ) -> None:
+        target_joints = (
+            list(self.config.disable_park_joints_rad)
+            if joints_rad is None
+            else list(joints_rad)
+        )
+        speed = (
+            self.config.disable_park_speed_percent
+            if speed_percent is None
+            else speed_percent
+        )
+        timeout = self.config.disable_park_timeout_s if timeout_s is None else timeout_s
+        initial_feedback_stamp = self._read_joint_feedback_timestamp()
+        self.move_joints(target_joints, speed_percent=speed)
+        self._wait_until_joints_reached(target_joints, timeout, initial_feedback_stamp)
+        if self.config.disable_park_settle_s > 0:
+            time.sleep(self.config.disable_park_settle_s)
+
+    def _wait_until_joints_reached(
+        self,
+        target_joints_rad: list[float],
+        timeout_s: float,
+        initial_feedback_stamp: float | None = None,
+    ) -> None:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            feedback = self.get_joint_state()
+            current_joints = self._joint_feedback_to_rad(feedback)
+            feedback_stamp = self._joint_feedback_timestamp(feedback)
+            feedback_is_fresh = (
+                initial_feedback_stamp is None
+                or feedback_stamp is None
+                or feedback_stamp > initial_feedback_stamp
+            )
+            if (
+                feedback_is_fresh
+                and current_joints is not None
+                and self._joints_are_close(current_joints, target_joints_rad)
+            ):
+                return
+            time.sleep(max(self.config.command_interval_s, 0.01))
+        raise TimeoutError("Piper arm parking before disable timed out")
+
+    def _read_joint_feedback_rad(self) -> list[float] | None:
+        joint_feedback = self.get_joint_state()
+        return self._joint_feedback_to_rad(joint_feedback)
+
+    def _read_joint_feedback_timestamp(self) -> float | None:
+        joint_feedback = self.get_joint_state()
+        return self._joint_feedback_timestamp(joint_feedback)
+
+    @staticmethod
+    def _joint_feedback_timestamp(joint_feedback: Any) -> float | None:
+        timestamp = getattr(joint_feedback, "time_stamp", None)
+        if timestamp is None:
+            return None
+        return float(timestamp)
+
+    @staticmethod
+    def _joint_feedback_to_rad(joint_feedback: Any) -> list[float] | None:
+        joint_state = getattr(joint_feedback, "joint_state", None)
+        if joint_state is None:
+            return None
+        joint_values = [
+            getattr(joint_state, f"joint_{index}", None) for index in range(1, 7)
+        ]
+        if any(value is None for value in joint_values):
+            return None
+        return [float(value) / RAD_TO_MILLI_DEG for value in joint_values]
+
+    def _joints_are_close(
+        self,
+        current_joints_rad: list[float],
+        target_joints_rad: list[float],
+    ) -> bool:
+        tolerance = self.config.disable_park_tolerance_rad
+        return all(
+            abs(current - target) <= tolerance
+            for current, target in zip(current_joints_rad, target_joints_rad)
+        )
+
     def emergency_stop(self) -> None:
         self.sdk.EmergencyStop(0x01)
 
     def resume_from_emergency_stop(self) -> None:
         self.sdk.EmergencyStop(0x02)
+
+    def set_collision_protection(self, levels: tuple[int, ...] | list[int]) -> None:
+        if len(levels) != 6:
+            raise ValueError(f"expected 6 collision protection levels, got {len(levels)}")
+        for index, level in enumerate(levels, start=1):
+            if not isinstance(level, int) or not 0 <= level <= 8:
+                raise ValueError(
+                    f"collision protection level {index} must be an integer in [0, 8], "
+                    f"got {level!r}"
+                )
+        self.sdk.CrashProtectionConfig(*levels)
 
     def set_motion_mode(self, move_mode: MoveMode, speed_percent: int | None = None) -> None:
         speed = self.config.default_speed_percent if speed_percent is None else speed_percent
@@ -212,6 +325,11 @@ class PiperController:
         mode = self.config.default_move_mode if move_mode is None else move_mode
         if mode not in ("P", "L"):
             raise ValueError("Cartesian pose control supports MOVE P or MOVE L")
+        self.validate_pose(pose)
+        self.set_motion_mode(mode, speed_percent)
+        self.sdk.EndPoseCtrl(*pose.as_sdk_units())
+
+    def validate_pose(self, pose: EndPose) -> None:
         self._safety.validate_pose_mm_deg(
             pose.x_mm,
             pose.y_mm,
@@ -220,8 +338,6 @@ class PiperController:
             pose.ry_deg,
             pose.rz_deg,
         )
-        self.set_motion_mode(mode, speed_percent)
-        self.sdk.EndPoseCtrl(*pose.as_sdk_units())
 
     def move_joints(
         self,
@@ -229,10 +345,13 @@ class PiperController:
         | list[float],
         speed_percent: int | None = None,
     ) -> None:
-        self._safety.validate_joints_rad(joints_rad)
+        self.validate_joints(joints_rad)
         self.set_motion_mode("J", speed_percent)
         sdk_joints = tuple(round(value * RAD_TO_MILLI_DEG) for value in joints_rad)
         self.sdk.JointCtrl(*sdk_joints)
+
+    def validate_joints(self, joints_rad: tuple[float, ...] | list[float]) -> None:
+        self._safety.validate_joints_rad(joints_rad)
 
     def set_gripper(
         self,
@@ -273,6 +392,6 @@ class PiperController:
         return self
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
-        if exc_type is not None:
+        if exc_type is not None and not issubclass(exc_type, SafetyError):
             self.emergency_stop()
         self.disconnect()

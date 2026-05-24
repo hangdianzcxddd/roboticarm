@@ -17,8 +17,15 @@ class SafetyChecker:
     config: RobotConfig
 
     def validate_speed(self, speed_percent: int) -> None:
+        if not isinstance(speed_percent, int):
+            raise SafetyError(f"speed_percent must be an integer, got {speed_percent!r}")
         if not 0 <= speed_percent <= 100:
             raise SafetyError(f"speed_percent must be in [0, 100], got {speed_percent}")
+
+    @staticmethod
+    def _validate_finite(name: str, value: float) -> None:
+        if not math.isfinite(value):
+            raise SafetyError(f"{name} must be finite, got {value}")
 
     def validate_pose_mm_deg(
         self,
@@ -38,25 +45,28 @@ class SafetyChecker:
             ("rz_deg", rz_deg, self.config.rz_limit_deg),
         )
         for name, value, limit in checks:
+            self._validate_finite(name, value)
             if not limit.contains(value):
                 raise SafetyError(
-                    f"{name}={value} outside [{limit.min_value}, {limit.max_value}]"
+                    f"Motion rejected: {name}={value} is outside the allowed range "
+                    f"[{limit.min_value}, {limit.max_value}]"
                 )
         horizontal_radius = math.hypot(x_mm, y_mm)
         if horizontal_radius > self.config.work_radius_mm:
             raise SafetyError(
-                f"horizontal radius={horizontal_radius} mm outside "
-                f"[0, {self.config.work_radius_mm}]"
+                f"Motion rejected: horizontal radius={horizontal_radius} mm is outside "
+                f"the allowed range [0, {self.config.work_radius_mm}]"
             )
 
     def validate_joints_rad(self, joints_rad: tuple[float, ...] | list[float]) -> None:
         if len(joints_rad) != 6:
-            raise SafetyError(f"expected 6 joint angles, got {len(joints_rad)}")
+            raise SafetyError(f"Motion rejected: expected 6 joint angles, got {len(joints_rad)}")
         for index, (value, limit) in enumerate(
             zip(joints_rad, self.config.joint_limits_rad), start=1
         ):
+            self._validate_finite(f"joint_{index}", value)
             if not limit.contains(value):
                 raise SafetyError(
-                    f"joint_{index}={value} rad outside "
-                    f"[{limit.min_value}, {limit.max_value}]"
+                    f"Motion rejected: joint_{index}={value} rad is outside the "
+                    f"allowed range [{limit.min_value}, {limit.max_value}]"
                 )

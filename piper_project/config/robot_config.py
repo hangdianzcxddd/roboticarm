@@ -46,6 +46,14 @@ class RobotConfig:
     start_sdk_joint_limit: bool = True
     start_sdk_gripper_limit: bool = True
     auto_enable: bool = True
+    park_before_disable: bool = True
+    disable_park_speed_percent: int = 10
+    disable_park_timeout_s: float = 10.0
+    disable_park_tolerance_rad: float = math.radians(2.0)
+    disable_park_settle_s: float = 0.5
+    disable_park_joints_rad: tuple[float, ...] = field(
+        default_factory=lambda: (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    )
 
     x_limit_mm: PoseLimit = field(default_factory=lambda: PoseLimit(-626.75, 626.75))
     y_limit_mm: PoseLimit = field(default_factory=lambda: PoseLimit(-626.75, 626.75))
@@ -56,12 +64,12 @@ class RobotConfig:
 
     joint_limits_rad: tuple[PoseLimit, ...] = field(
         default_factory=lambda: (
-            PoseLimit(math.radians(-154.0), math.radians(154.0)),
-            PoseLimit(math.radians(0.0), math.radians(195.0)),
-            PoseLimit(math.radians(-175.0), math.radians(0.0)),
-            PoseLimit(math.radians(-100.0), math.radians(112.0)),
-            PoseLimit(math.radians(-75.0), math.radians(75.0)),
-            PoseLimit(math.radians(-170.0), math.radians(170.0)),
+            PoseLimit(math.radians(-150.0), math.radians(150.0)),
+            PoseLimit(0.0, math.radians(180.0)),
+            PoseLimit(math.radians(-170.0), 0.0),
+            PoseLimit(math.radians(-100.0), math.radians(100.0)),
+            PoseLimit(math.radians(-70.0), math.radians(70.0)),
+            PoseLimit(math.radians(-120.0), math.radians(120.0)),
         )
     )
     joint_max_speeds_rad_s: tuple[float, ...] = field(
