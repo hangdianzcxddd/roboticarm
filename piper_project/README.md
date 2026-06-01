@@ -48,6 +48,13 @@ python3 -m robot_control.linux.gripper.gripper_debug status --can can0 --enable 
 python3 -m robot_control.linux.gripper.gripper_debug command open --can can0 --width 50 --effort 1.0
 ```
 
+J6 驱动板 / 末端转接板 / 夹爪链路诊断：
+
+```bash
+python3 -m robot_control.linux.gripper.diagnose_j6_gripper --can can0
+python3 -m robot_control.linux.gripper.diagnose_j6_gripper --can can0 --json
+```
+
 Linux VM TCP server：
 
 ```bash
