@@ -1,138 +1,92 @@
 # Piper Project
 
-## 当前测试范围
+## 架构
 
-目前只实现并测试以下链路：
-
-```text
-机械臂坐标系 -> Piper SDK -> 机械臂运动
-```
-
-视觉识别、深度计算、手眼标定、分拣任务逻辑暂时留空。
-
-## 环境准备
-
-进入工程目录：
-
-```bash
-cd /home/fishros/projects/roboticarm/piper_project
-```
-
-安装依赖：
-
-```bash
-python3 -m pip install -r requirements.txt
-```
-
-确认 Piper CAN 口已经配置好，例如使用 `can0`。默认配置在：
+工程现在按运行主机拆分：
 
 ```text
-config/robot_config.py
+robot_control/
+  shared/                  # Windows 和 Linux 共用的数据结构、协议、路径
+  windows/
+    vision/                # D435i、深度、OpenCV/YOLO 检测
+    client/                # Windows 视觉侧手动/联调入口
+    task/                  # 视觉侧抓取任务生成
+  linux/
+    arm/                   # Piper SDK 机械臂控制、运动、安全、测试
+    gripper/               # 夹爪控制、调试、配置、测试
+    server/                # Linux VM TCP server
+    tcp_calibration/       # TCP 标定采集、求解、验证入口
+    config/                # Linux 机器人配置
 ```
 
-如果你的 CAN 口不是 `can0`，修改 `RobotConfig.can_name`。
+旧的分散目录已经删除，后续代码和测试都放到 `robot_control/` 对应模块内。根目录的 `main.py` 和 `gripper_debug.py` 仅作为临时兼容入口保留。
 
-## 运行单元测试
-
-这些测试不需要连接真实机械臂，使用的是 mock SDK：
-
-```bash
-python3 -m unittest discover -s test -p 'test_*.py'
-```
-
-## 读取机械臂状态
-
-连接机械臂但不使能，只读取状态、末端位姿和关节状态：
-
-```bash
-python3 main.py status
-```
-
-## 使能机械臂
-
-```bash
-python3 main.py enable
-```
-
-## 失能机械臂
-
-```bash
-python3 main.py disable
-```
-
-默认 `disable` 会先用低速移动到 `RobotConfig.disable_park_joints_rad`，再执行真正失能，以减少电机释放后因重力下落造成的碰撞风险。如果确认当前姿态已经安全，可以跳过停放动作：
-
-```bash
-python3 main.py disable --no-park
-```
-
-建议根据你的安装方式、末端工具、负载和桌面高度，实机低速标定一个安全停放关节姿态，然后写入：
+## 数据流
 
 ```text
-config/robot_config.py -> RobotConfig.disable_park_joints_rad
+Windows 主机
+  D435i RGB+Depth -> Vision Pipeline -> TCP JSON task
+
+Linux VM
+  TCP Server -> 任务/轨迹 -> Piper SDK -> CAN -> Piper 机械臂/夹爪
 ```
 
-## 测试末端位姿运动
+## Linux 侧命令
 
-单位说明：
-
-```text
-x y z: mm
-rx ry rz: degree
-speed: 0-100
-mode: P 或 L
-```
-
-示例：
+机械臂 CLI：
 
 ```bash
-python3 main.py pose 150 0 215 0 85 0 --speed 20 --mode P
+python3 -m robot_control.linux.arm.arm_cli status
+python3 -m robot_control.linux.arm.arm_cli enable
+python3 -m robot_control.linux.arm.arm_cli pose 150 0 215 0 85 0 --speed 20 --mode P
 ```
 
-直线运动示例：
+夹爪调试：
 
 ```bash
-python3 main.py pose 150 50 215 0 85 0 --speed 20 --mode L
+python3 -m robot_control.linux.gripper.gripper_debug status --can can0 --enable --pretty
+python3 -m robot_control.linux.gripper.gripper_debug command open --can can0 --width 50 --effort 1.0
 ```
 
-## 测试关节运动
-
-单位说明：
-
-```text
-j1-j6: rad
-speed: 0-100
-```
-
-示例：
+Linux VM TCP server：
 
 ```bash
-python3 main.py joints 0 0 -0.5 0 0.5 0 --speed 20
+python3 -m robot_control.linux.server.tcp_server --host 0.0.0.0 --port 5005
 ```
 
-## 安全注意
+实机执行前再加 `--execute`，并先确认机械臂工作空间安全。
 
-运行真实机械臂前，请先确认：
+## Windows 侧命令
+
+点击 RGB 图发送相机坐标到 Linux VM：
+
+```bash
+python -m robot_control.windows.client.click_send_tcp --host <linux-vm-ip> --port 5005
+```
+
+单机视觉调试：
+
+```bash
+python -m robot_control.windows.client.click_to_camera_xyz
+python -m robot_control.windows.client.opencv_detection_to_camera_xyz
+python -m robot_control.windows.client.yolo_detection_to_camera_xyz
+```
+
+## 测试
+
+不连接真实硬件的测试：
+
+```bash
+python3 -m unittest discover -s . -p '*test.py'
+```
+
+后续新增测试应和模块放在一起，例如：
 
 ```text
-1. 机械臂工作空间内没有障碍物。
-2. 急停按钮可用。
-3. CAN 口配置正确。
-4. config/robot_config.py 中的坐标范围、关节范围、默认速度符合当前安装环境。
-5. 第一次测试建议使用较低速度，例如 --speed 10 或 --speed 20。
-6. 失能前的停放姿态 disable_park_joints_rad 已经在实机上验证，不会与桌面、夹具或周边设备碰撞。
+robot_control/linux/gripper/gripper_test.py
+robot_control/windows/vision/detector_test.py
 ```
 
-当前工程会在发送 SDK 运动指令前校验输入。`pose` 会检查 xyz/rpy 是否在配置工作范围内，`joints` 会检查 6 个关节是否在 SDK 文档的默认关节范围内；超出范围时不会移动，并输出英文错误信息。
+## 安全
 
-## 视觉模块
-
-待补充。
-
-## 标定模块
-
-待补充。
-
-## 分拣任务
-
-待补充。
+真实机械臂运行前确认 CAN 口、工作空间、急停、速度、关节限位、停放姿态都符合当前安装环境。默认 TCP server 是 dry-run，不会移动机械臂。

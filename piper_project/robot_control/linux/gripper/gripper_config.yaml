@@ -1,0 +1,41 @@
+gripper:
+  min_width: 0.000
+  max_width: 0.000
+  source: feedback_position_mm
+calibration_points:
+  - command_percent: 0.000
+    command_width_mm: 0.000
+    feedback_position_mm: 0.000
+    feedback_effort_nm: 0.000
+    status_code: 0
+    actual_width_mm: null
+  - command_percent: 20.000
+    command_width_mm: 14.000
+    feedback_position_mm: 0.000
+    feedback_effort_nm: 0.000
+    status_code: 0
+    actual_width_mm: null
+  - command_percent: 40.000
+    command_width_mm: 28.000
+    feedback_position_mm: 0.000
+    feedback_effort_nm: 0.000
+    status_code: 0
+    actual_width_mm: null
+  - command_percent: 60.000
+    command_width_mm: 42.000
+    feedback_position_mm: 0.000
+    feedback_effort_nm: 0.000
+    status_code: 0
+    actual_width_mm: null
+  - command_percent: 80.000
+    command_width_mm: 56.000
+    feedback_position_mm: 0.000
+    feedback_effort_nm: 0.000
+    status_code: 0
+    actual_width_mm: null
+  - command_percent: 100.000
+    command_width_mm: 70.000
+    feedback_position_mm: 0.000
+    feedback_effort_nm: 0.000
+    status_code: 0
+    actual_width_mm: null

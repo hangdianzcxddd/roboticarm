@@ -1,0 +1,10 @@
+tcp_calibration:
+  status: uncalibrated
+  transform:
+    x_mm: null
+    y_mm: null
+    z_mm: null
+    rx_deg: null
+    ry_deg: null
+    rz_deg: null
+  notes: "Collect samples with collect_tcp_data.py, solve with solve_tcp.py, then validate."
