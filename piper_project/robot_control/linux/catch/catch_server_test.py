@@ -3,11 +3,15 @@ from __future__ import annotations
 import argparse
 import contextlib
 import io
+import json
+from pathlib import Path
+import tempfile
 import unittest
 
 import numpy as np
 
 from robot_control.linux.catch.catch_server import handle_message
+from robot_control.linux.catch.hand_eye_mapping import load_camera_to_base_transform
 from robot_control.linux.arm.piper_arm import PiperController
 from robot_control.linux.arm.piper_arm_test import FakePiperSdk
 from robot_control.linux.config.robot_config import RobotConfig
@@ -26,6 +30,9 @@ def make_args(**overrides: object) -> argparse.Namespace:
         "approach_height_mm": 40.0,
         "lift_height_mm": 60.0,
         "target_z_offset_mm": -5.0,
+        "rx_deg": 0.0,
+        "ry_deg": 85.0,
+        "rz_deg": 0.0,
         "speed": 10,
         "approach_mode": "P",
         "grasp_mode": "L",
@@ -151,6 +158,56 @@ class TestCatchServer(unittest.TestCase):
         self.assertEqual(response["payload"]["place_tcp_pose"]["z_mm"], 150.0)
         self.assertEqual(response["payload"]["catch"]["open_command_mm"], 0.0)
         self.assertEqual(response["payload"]["catch"]["grasp_command_mm"], -100.0)
+
+    def test_handle_message_can_use_hand_eye_camera_to_base_mapping(self):
+        message = make_camera_point_message(
+            CameraPointCommand(x_m=0.10, y_m=-0.05, z_m=0.30, command_id="cmd-he")
+        )
+        camera_to_base = np.eye(4, dtype=float)
+        camera_to_base[:3, 3] = np.array([0.20, 0.10, 0.00])
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            response = handle_message(
+                message,
+                SimulatedMappingConfig(),
+                tcp_offset_j6_mm=(0.0, 0.0, 145.0),
+                execute=False,
+                controller=None,
+                args=make_args(
+                    target_z_offset_mm=0.0,
+                    rx_deg=0.0,
+                    ry_deg=90.0,
+                    rz_deg=0.0,
+                ),
+                hand_eye_camera_to_base=camera_to_base,
+            )
+
+        self.assertEqual(response["payload"]["mapping_source"], "hand_eye")
+        self.assertAlmostEqual(response["payload"]["target_tcp_pose"]["x_mm"], 300.0)
+        self.assertAlmostEqual(response["payload"]["target_tcp_pose"]["y_mm"], 50.0)
+        self.assertAlmostEqual(response["payload"]["target_tcp_pose"]["z_mm"], 300.0)
+        self.assertAlmostEqual(response["payload"]["grasp_j6_pose"]["x_mm"], 155.0)
+
+    def test_load_camera_to_base_transform_reads_hand_eye_result(self):
+        document = {
+            "hand_eye_calibration": {
+                "mode": "eye_to_hand",
+                "transform": {
+                    "from_frame": "camera",
+                    "to_frame": "base",
+                    "rotation_matrix": np.eye(3).tolist(),
+                    "translation_m": [0.1, 0.2, 0.3],
+                },
+            }
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "hand_eye_result.json"
+            path.write_text(json.dumps(document), encoding="utf-8")
+
+            transform = load_camera_to_base_transform(path)
+
+        np.testing.assert_allclose(transform[:3, :3], np.eye(3))
+        np.testing.assert_allclose(transform[:3, 3], [0.1, 0.2, 0.3])
 
     def test_execute_uses_open_zero_gripper_sequence_and_place_motion(self):
         message = make_camera_point_message(

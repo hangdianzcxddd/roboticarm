@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import math
+from pathlib import Path
 import socket
 import time
 from dataclasses import dataclass, replace
@@ -17,6 +18,10 @@ from robot_control.linux.catch.tcp_offset import (
     tcp_pose_for_j6_pose,
 )
 from robot_control.linux.catch.set_gripper_zero import set_gripper_zero
+from robot_control.linux.catch.hand_eye_mapping import (
+    camera_xyz_to_hand_eye_robot_pose,
+    load_camera_to_base_transform,
+)
 from robot_control.linux.config.robot_config import ROBOT_CONFIG
 from robot_control.shared.geometry import EndPose
 from robot_control.shared.protocol import (
@@ -30,6 +35,11 @@ from robot_control.shared.simulated_mapping import (
     SimulatedMappingConfig,
     camera_xyz_to_simulated_robot_pose,
     pose_to_dict,
+)
+
+
+DEFAULT_HAND_EYE_RESULT = (
+    Path(__file__).resolve().parents[1] / "hand_eye" / "hand_eye_result.json"
 )
 
 
@@ -63,6 +73,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="When executing, use the current gripper TCP pose as the mapping center.",
     )
     parser.add_argument("--print-feedback", action="store_true")
+    parser.add_argument(
+        "--hand-eye-result",
+        type=Path,
+        help=(
+            "Use an eye_to_hand hand_eye_result.json camera->base transform. "
+            f"If omitted, keep using the temporary simulated mapping. Default "
+            f"path when supplied without a value is not supported; use "
+            f"{DEFAULT_HAND_EYE_RESULT} explicitly."
+        ),
+    )
     parser.add_argument("--base-x-mm", type=float, default=150.0)
     parser.add_argument("--base-y-mm", type=float, default=0.0)
     parser.add_argument("--base-z-mm", type=float, default=220.0)
@@ -165,6 +185,8 @@ def tcp_offset_from_args(args: argparse.Namespace) -> tuple[float, float, float]
 def validate_args(args: argparse.Namespace) -> None:
     if args.use_current_pose_as_base and not args.execute:
         raise ValueError("--use-current-pose-as-base requires --execute")
+    if args.use_current_pose_as_base and args.hand_eye_result is not None:
+        raise ValueError("--use-current-pose-as-base is only for simulated mapping")
     if args.command_duration_s < 0:
         raise ValueError("--command-duration-s must be >= 0")
     if args.command_period_s <= 0:
@@ -440,14 +462,28 @@ def handle_message(
     execute: bool,
     controller: PiperController | None,
     args: argparse.Namespace,
+    hand_eye_camera_to_base: Any | None = None,
 ) -> dict[str, Any]:
     command = camera_point_from_message(message)
-    target_tcp_pose = camera_xyz_to_simulated_robot_pose(
-        command.x_m,
-        command.y_m,
-        command.z_m,
-        mapping_config,
-    )
+    if hand_eye_camera_to_base is None:
+        target_tcp_pose = camera_xyz_to_simulated_robot_pose(
+            command.x_m,
+            command.y_m,
+            command.z_m,
+            mapping_config,
+        )
+        mapping_source = "simulated"
+    else:
+        target_tcp_pose = camera_xyz_to_hand_eye_robot_pose(
+            command.x_m,
+            command.y_m,
+            command.z_m,
+            hand_eye_camera_to_base,
+            rx_deg=args.rx_deg,
+            ry_deg=args.ry_deg,
+            rz_deg=args.rz_deg,
+        )
+        mapping_source = "hand_eye"
     plan = build_catch_plan(
         target_tcp_pose,
         offset_j6_tcp_mm=tcp_offset_j6_mm,
@@ -472,6 +508,7 @@ def handle_message(
     print(
         "camera_xyz="
         f"({command.x_m:.4f}, {command.y_m:.4f}, {command.z_m:.4f}) m -> "
+        f"mapping={mapping_source} "
         f"target_tcp={format_pose(plan.target_tcp_pose)} "
         f"grasp_j6={format_pose(plan.grasp_j6_pose)}",
         flush=True,
@@ -495,6 +532,7 @@ def handle_message(
                 "y_mm": float(tcp_offset_j6_mm[1]),
                 "z_mm": float(tcp_offset_j6_mm[2]),
             },
+            "mapping_source": mapping_source,
             "catch": {
                 "send_counts": send_counts,
                 "open_command_mm": args.open_command_mm,
@@ -514,6 +552,13 @@ def serve(args: argparse.Namespace) -> None:
     mapping_config = mapping_config_from_args(args)
     tcp_offset_j6_mm = tcp_offset_from_args(args)
     controller: PiperController | None = None
+    hand_eye_camera_to_base = None
+    if args.hand_eye_result is not None:
+        hand_eye_camera_to_base = load_camera_to_base_transform(args.hand_eye_result)
+        print(
+            f"Using hand-eye camera->base transform: {args.hand_eye_result}",
+            flush=True,
+        )
 
     if args.execute:
         config = replace(ROBOT_CONFIG, can_name=args.can)
@@ -566,6 +611,7 @@ def serve(args: argparse.Namespace) -> None:
                                     execute=args.execute,
                                     controller=controller,
                                     args=args,
+                                    hand_eye_camera_to_base=hand_eye_camera_to_base,
                                 )
                             except Exception as exc:  # noqa: BLE001 - sent to client
                                 response = make_error_message(command_id, str(exc))

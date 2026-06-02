@@ -1,0 +1,689 @@
+{
+  "hand_eye_samples": {
+    "schema_version": 1,
+    "mode": "eye_to_hand",
+    "captured_at": "2026-06-02T09:35:35+00:00",
+    "robot_pose_frame": "base_to_gripper",
+    "target_pose_frame": "target_to_camera",
+    "robot_rotation_convention": "extrinsic_xyz_degrees_rz_ry_rx",
+    "sample_count": 25,
+    "samples": [
+      {
+        "index": 1,
+        "sample_id": "sample-001",
+        "robot_base_to_gripper": {
+          "x_mm": 88.526,
+          "y_mm": -18.245,
+          "z_mm": 199.983,
+          "rx_deg": 103.185,
+          "ry_deg": 53.671,
+          "rz_deg": 89.056
+        },
+        "target_to_camera": {
+          "rvec": [
+            0.2018623800423926,
+            0.19033993183319914,
+            0.16000085078202023
+          ],
+          "tvec_m": [
+            0.0015467190142775696,
+            -0.10620444442827899,
+            0.23770096637880045
+          ]
+        },
+        "image_path": "D:\\git\\projects\\roboticarm\\piper_project\\robot_control\\windows\\hand_eye\\captures\\hand_eye_001_20260602_172324.png",
+        "reprojection_error_px": 3.036228656768799,
+        "detected_corners": 70
+      },
+      {
+        "index": 2,
+        "sample_id": "sample-002",
+        "robot_base_to_gripper": {
+          "x_mm": 88.526,
+          "y_mm": -18.245,
+          "z_mm": 199.983,
+          "rx_deg": 100.549,
+          "ry_deg": 42.432,
+          "rz_deg": 85.53
+        },
+        "target_to_camera": {
+          "rvec": [
+            0.6405842700589526,
+            0.4068225688100881,
+            0.1251848418375954
+          ],
+          "tvec_m": [
+            -0.0030512813421703865,
+            -0.09969977677407532,
+            0.23162193189930594
+          ]
+        },
+        "image_path": "D:\\git\\projects\\roboticarm\\piper_project\\robot_control\\windows\\hand_eye\\captures\\hand_eye_002_20260602_172338.png",
+        "reprojection_error_px": 3.8013174533843994,
+        "detected_corners": 70
+      },
+      {
+        "index": 3,
+        "sample_id": "sample-003",
+        "robot_base_to_gripper": {
+          "x_mm": 90.569,
+          "y_mm": -10.163,
+          "z_mm": 216.127,
+          "rx_deg": 86.968,
+          "ry_deg": 36.936,
+          "rz_deg": 81.8
+        },
+        "target_to_camera": {
+          "rvec": [
+            0.7750252269451479,
+            0.3260663662553994,
+            -0.019898621648506594
+          ],
+          "tvec_m": [
+            -0.0018562028053281403,
+            -0.13360338681264536,
+            0.24078206743073727
+          ]
+        },
+        "image_path": "D:\\git\\projects\\roboticarm\\piper_project\\robot_control\\windows\\hand_eye\\captures\\hand_eye_003_20260602_172411.png",
+        "reprojection_error_px": 4.232445240020752,
+        "detected_corners": 70
+      },
+      {
+        "index": 4,
+        "sample_id": "sample-004",
+        "robot_base_to_gripper": {
+          "x_mm": 91.131,
+          "y_mm": -1.074,
+          "z_mm": 216.127,
+          "rx_deg": 86.968,
+          "ry_deg": 36.936,
+          "rz_deg": 87.528
+        },
+        "target_to_camera": {
+          "rvec": [
+            0.7506375924233444,
+            0.24404569410722543,
+            0.011347033079548197
+          ],
+          "tvec_m": [
+            0.0027474723866179845,
+            -0.13382721543922155,
+            0.25211593259964493
+          ]
+        },
+        "image_path": "D:\\git\\projects\\roboticarm\\piper_project\\robot_control\\windows\\hand_eye\\captures\\hand_eye_004_20260602_172425.png",
+        "reprojection_error_px": 3.3049092292785645,
+        "detected_corners": 70
+      },
+      {
+        "index": 5,
+        "sample_id": "sample-005",
+        "robot_base_to_gripper": {
+          "x_mm": 87.405,
+          "y_mm": 25.814,
+          "z_mm": 216.127,
+          "rx_deg": 86.968,
+          "ry_deg": 36.936,
+          "rz_deg": 104.657
+        },
+        "target_to_camera": {
+          "rvec": [
+            0.7351933918664622,
+            -0.059775167356621965,
+            0.09325333387165935
+          ],
+          "tvec_m": [
+            0.004177185069174738,
+            -0.1322827283410538,
+            0.28216682884017513
+          ]
+        },
+        "image_path": "D:\\git\\projects\\roboticarm\\piper_project\\robot_control\\windows\\hand_eye\\captures\\hand_eye_005_20260602_172439.png",
+        "reprojection_error_px": 1.6909196376800537,
+        "detected_corners": 70
+      },
+      {
+        "index": 6,
+        "sample_id": "sample-006",
+        "robot_base_to_gripper": {
+          "x_mm": 90.941,
+          "y_mm": 26.146,
+          "z_mm": 249.667,
+          "rx_deg": 79.87,
+          "ry_deg": 37.614,
+          "rz_deg": 100.34
+        },
+        "target_to_camera": {
+          "rvec": [
+            0.7621089850052871,
+            -0.046773330489553504,
+            0.006918073563171421
+          ],
+          "tvec_m": [
+            0.0030153214157099114,
+            -0.17364656717829838,
+            0.28715206402248356
+          ]
+        },
+        "image_path": "D:\\git\\projects\\roboticarm\\piper_project\\robot_control\\windows\\hand_eye\\captures\\hand_eye_006_20260602_172456.png",
+        "reprojection_error_px": 1.9596723318099976,
+        "detected_corners": 70
+      },
+      {
+        "index": 7,
+        "sample_id": "sample-007",
+        "robot_base_to_gripper": {
+          "x_mm": 49.348,
+          "y_mm": 35.91,
+          "z_mm": 242.486,
+          "rx_deg": 57.895,
+          "ry_deg": 63.716,
+          "rz_deg": 96.151
+        },
+        "target_to_camera": {
+          "rvec": [
+            0.3183930302511427,
+            -0.4633476008547467,
+            -0.16509753513422876
+          ],
+          "tvec_m": [
+            -0.051273679341528725,
+            -0.1885132724271955,
+            0.3215221483981069
+          ]
+        },
+        "image_path": "D:\\git\\projects\\roboticarm\\piper_project\\robot_control\\windows\\hand_eye\\captures\\hand_eye_007_20260602_172744.png",
+        "reprojection_error_px": 1.6923270225524902,
+        "detected_corners": 70
+      },
+      {
+        "index": 8,
+        "sample_id": "sample-008",
+        "robot_base_to_gripper": {
+          "x_mm": 66.235,
+          "y_mm": 29.926,
+          "z_mm": 235.653,
+          "rx_deg": 70.574,
+          "ry_deg": 65.952,
+          "rz_deg": 96.185
+        },
+        "target_to_camera": {
+          "rvec": [
+            0.22379426656493737,
+            -0.25963628157181,
+            -0.0749030920058878
+          ],
+          "tvec_m": [
+            -0.023933948111017764,
+            -0.1717210786170468,
+            0.30697139967176984
+          ]
+        },
+        "image_path": "D:\\git\\projects\\roboticarm\\piper_project\\robot_control\\windows\\hand_eye\\captures\\hand_eye_008_20260602_172801.png",
+        "reprojection_error_px": 0.6187576651573181,
+        "detected_corners": 70
+      },
+      {
+        "index": 9,
+        "sample_id": "sample-009",
+        "robot_base_to_gripper": {
+          "x_mm": 49.359,
+          "y_mm": 35.924,
+          "z_mm": 242.412,
+          "rx_deg": 69.367,
+          "ry_deg": 48.274,
+          "rz_deg": 109.822
+        },
+        "target_to_camera": {
+          "rvec": [
+            0.6256086095770569,
+            -0.4710081957723107,
+            -0.06712826768511082
+          ],
+          "tvec_m": [
+            -0.044149058871718924,
+            -0.18102954456983117,
+            0.3118258508205144
+          ]
+        },
+        "image_path": "D:\\git\\projects\\roboticarm\\piper_project\\robot_control\\windows\\hand_eye\\captures\\hand_eye_009_20260602_172820.png",
+        "reprojection_error_px": 3.2081363201141357,
+        "detected_corners": 70
+      },
+      {
+        "index": 10,
+        "sample_id": "sample-010",
+        "robot_base_to_gripper": {
+          "x_mm": 56.722,
+          "y_mm": 26.937,
+          "z_mm": 233.124,
+          "rx_deg": 70.933,
+          "ry_deg": 66.078,
+          "rz_deg": 97.129
+        },
+        "target_to_camera": {
+          "rvec": [
+            0.22473857829508706,
+            -0.27062370994605844,
+            -0.06531122569018272
+          ],
+          "tvec_m": [
+            -0.030703226004665563,
+            -0.1682218953320112,
+            0.3065392512739894
+          ]
+        },
+        "image_path": "D:\\git\\projects\\roboticarm\\piper_project\\robot_control\\windows\\hand_eye\\captures\\hand_eye_010_20260602_172922.png",
+        "reprojection_error_px": 0.6497660875320435,
+        "detected_corners": 70
+      },
+      {
+        "index": 11,
+        "sample_id": "sample-011",
+        "robot_base_to_gripper": {
+          "x_mm": 62.776,
+          "y_mm": 7.652,
+          "z_mm": 228.955,
+          "rx_deg": 77.368,
+          "ry_deg": 66.656,
+          "rz_deg": 84.947
+        },
+        "target_to_camera": {
+          "rvec": [
+            0.1295413725142865,
+            -0.026739363613083433,
+            -0.027842986238342915
+          ],
+          "tvec_m": [
+            -0.01771790197351342,
+            -0.15745604651322256,
+            0.2720447046731374
+          ]
+        },
+        "image_path": "D:\\git\\projects\\roboticarm\\piper_project\\robot_control\\windows\\hand_eye\\captures\\hand_eye_011_20260602_172942.png",
+        "reprojection_error_px": 0.30420100688934326,
+        "detected_corners": 70
+      },
+      {
+        "index": 12,
+        "sample_id": "sample-012",
+        "robot_base_to_gripper": {
+          "x_mm": 62.776,
+          "y_mm": 7.652,
+          "z_mm": 228.955,
+          "rx_deg": -49.328,
+          "ry_deg": 82.359,
+          "rz_deg": -43.006
+        },
+        "target_to_camera": {
+          "rvec": [
+            -0.24462769102339788,
+            -0.039504103527765885,
+            -0.05399302997296897
+          ],
+          "tvec_m": [
+            -0.019290107642791227,
+            -0.15941479084758353,
+            0.28706700021340154
+          ]
+        },
+        "image_path": "D:\\git\\projects\\roboticarm\\piper_project\\robot_control\\windows\\hand_eye\\captures\\hand_eye_012_20260602_172951.png",
+        "reprojection_error_px": 0.7711061239242554,
+        "detected_corners": 70
+      },
+      {
+        "index": 13,
+        "sample_id": "sample-013",
+        "robot_base_to_gripper": {
+          "x_mm": 63.068,
+          "y_mm": 6.816,
+          "z_mm": 226.183,
+          "rx_deg": -74.282,
+          "ry_deg": 78.029,
+          "rz_deg": -68.578
+        },
+        "target_to_camera": {
+          "rvec": [
+            -0.33662722769524345,
+            -0.04171105452955675,
+            -0.021072260481413283
+          ],
+          "tvec_m": [
+            -0.017392034833881215,
+            -0.1536544243768161,
+            0.2908257820522298
+          ]
+        },
+        "image_path": "D:\\git\\projects\\roboticarm\\piper_project\\robot_control\\windows\\hand_eye\\captures\\hand_eye_013_20260602_173004.png",
+        "reprojection_error_px": 0.903438925743103,
+        "detected_corners": 70
+      },
+      {
+        "index": 14,
+        "sample_id": "sample-014",
+        "robot_base_to_gripper": {
+          "x_mm": 64.475,
+          "y_mm": 6.999,
+          "z_mm": 209.004,
+          "rx_deg": -87.992,
+          "ry_deg": 78.474,
+          "rz_deg": -81.976
+        },
+        "target_to_camera": {
+          "rvec": [
+            -0.35134266013321924,
+            -0.05824913222590163,
+            0.038283752488467035
+          ],
+          "tvec_m": [
+            -0.01346013851635264,
+            -0.13434966906592788,
+            0.2928209599304759
+          ]
+        },
+        "image_path": "D:\\git\\projects\\roboticarm\\piper_project\\robot_control\\windows\\hand_eye\\captures\\hand_eye_014_20260602_173028.png",
+        "reprojection_error_px": 0.9779583811759949,
+        "detected_corners": 70
+      },
+      {
+        "index": 15,
+        "sample_id": "sample-015",
+        "robot_base_to_gripper": {
+          "x_mm": 63.196,
+          "y_mm": 6.316,
+          "z_mm": 224.552,
+          "rx_deg": -69.112,
+          "ry_deg": 83.857,
+          "rz_deg": -63.514
+        },
+        "target_to_camera": {
+          "rvec": [
+            -0.2625460054775848,
+            -0.06452391818546303,
+            0.011079069849315438
+          ],
+          "tvec_m": [
+            -0.015723873256075157,
+            -0.1495912684670858,
+            0.28726394900132374
+          ]
+        },
+        "image_path": "D:\\git\\projects\\roboticarm\\piper_project\\robot_control\\windows\\hand_eye\\captures\\hand_eye_015_20260602_173243.png",
+        "reprojection_error_px": 0.7820640206336975,
+        "detected_corners": 70
+      },
+      {
+        "index": 16,
+        "sample_id": "sample-016",
+        "robot_base_to_gripper": {
+          "x_mm": 63.38,
+          "y_mm": 4.998,
+          "z_mm": 220.244,
+          "rx_deg": -95.263,
+          "ry_deg": 84.246,
+          "rz_deg": -90.366
+        },
+        "target_to_camera": {
+          "rvec": [
+            -0.26653841386692156,
+            -0.058677577469689254,
+            0.06176457458733499
+          ],
+          "tvec_m": [
+            -0.013128813628487527,
+            -0.14044030773684982,
+            0.2864764842679065
+          ]
+        },
+        "image_path": "D:\\git\\projects\\roboticarm\\piper_project\\robot_control\\windows\\hand_eye\\captures\\hand_eye_016_20260602_173259.png",
+        "reprojection_error_px": 0.8149418234825134,
+        "detected_corners": 70
+      },
+      {
+        "index": 17,
+        "sample_id": "sample-017",
+        "robot_base_to_gripper": {
+          "x_mm": 63.255,
+          "y_mm": 3.067,
+          "z_mm": 214.04,
+          "rx_deg": -127.605,
+          "ry_deg": 82.716,
+          "rz_deg": -123.719
+        },
+        "target_to_camera": {
+          "rvec": [
+            -0.27463301536497126,
+            -0.05051308738291746,
+            0.132667909720318
+          ],
+          "tvec_m": [
+            -0.010350026737108869,
+            -0.1272639213504809,
+            0.28532269639314267
+          ]
+        },
+        "image_path": "D:\\git\\projects\\roboticarm\\piper_project\\robot_control\\windows\\hand_eye\\captures\\hand_eye_017_20260602_173311.png",
+        "reprojection_error_px": 0.8337752223014832,
+        "detected_corners": 70
+      },
+      {
+        "index": 18,
+        "sample_id": "sample-018",
+        "robot_base_to_gripper": {
+          "x_mm": 61.358,
+          "y_mm": -15.677,
+          "z_mm": 214.04,
+          "rx_deg": -127.605,
+          "ry_deg": 82.716,
+          "rz_deg": -140.828
+        },
+        "target_to_camera": {
+          "rvec": [
+            -0.2261065685696064,
+            0.2042057291875517,
+            0.19331125943589808
+          ],
+          "tvec_m": [
+            -0.014445287473414666,
+            -0.12923503070893175,
+            0.2556211815658279
+          ]
+        },
+        "image_path": "D:\\git\\projects\\roboticarm\\piper_project\\robot_control\\windows\\hand_eye\\captures\\hand_eye_018_20260602_173325.png",
+        "reprojection_error_px": 1.2545626163482666,
+        "detected_corners": 70
+      },
+      {
+        "index": 19,
+        "sample_id": "sample-019",
+        "robot_base_to_gripper": {
+          "x_mm": 56.989,
+          "y_mm": -27.618,
+          "z_mm": 214.04,
+          "rx_deg": -127.605,
+          "ry_deg": 82.716,
+          "rz_deg": -152.351
+        },
+        "target_to_camera": {
+          "rvec": [
+            -0.19947890702964144,
+            0.37267706345643925,
+            0.23565953677607643
+          ],
+          "tvec_m": [
+            -0.026883356322945775,
+            -0.1310705444590529,
+            0.2377667761851252
+          ]
+        },
+        "image_path": "D:\\git\\projects\\roboticarm\\piper_project\\robot_control\\windows\\hand_eye\\captures\\hand_eye_019_20260602_173336.png",
+        "reprojection_error_px": 2.2243683338165283,
+        "detected_corners": 70
+      },
+      {
+        "index": 20,
+        "sample_id": "sample-020",
+        "robot_base_to_gripper": {
+          "x_mm": 65.169,
+          "y_mm": -31.041,
+          "z_mm": 207.315,
+          "rx_deg": -149.76,
+          "ry_deg": 78.236,
+          "rz_deg": -174.203
+        },
+        "target_to_camera": {
+          "rvec": [
+            -0.19202103404902698,
+            0.3568509290478651,
+            0.3258665746753297
+          ],
+          "tvec_m": [
+            -0.01876206260774248,
+            -0.11164674937428441,
+            0.23567122640523172
+          ]
+        },
+        "image_path": "D:\\git\\projects\\roboticarm\\piper_project\\robot_control\\windows\\hand_eye\\captures\\hand_eye_020_20260602_173355.png",
+        "reprojection_error_px": 2.263723373413086,
+        "detected_corners": 70
+      },
+      {
+        "index": 21,
+        "sample_id": "sample-021",
+        "robot_base_to_gripper": {
+          "x_mm": 59.624,
+          "y_mm": -21.323,
+          "z_mm": 213.946,
+          "rx_deg": -146.416,
+          "ry_deg": 84.598,
+          "rz_deg": -165.236
+        },
+        "target_to_camera": {
+          "rvec": [
+            -0.16549627992903895,
+            0.279919496339307,
+            0.2030128091372031
+          ],
+          "tvec_m": [
+            -0.020044413191890025,
+            -0.12984792597034445,
+            0.24489010944917003
+          ]
+        },
+        "image_path": "D:\\git\\projects\\roboticarm\\piper_project\\robot_control\\windows\\hand_eye\\captures\\hand_eye_021_20260602_173412.png",
+        "reprojection_error_px": 1.5134491920471191,
+        "detected_corners": 70
+      },
+      {
+        "index": 22,
+        "sample_id": "sample-022",
+        "robot_base_to_gripper": {
+          "x_mm": 59.175,
+          "y_mm": -21.878,
+          "z_mm": 211.346,
+          "rx_deg": 125.976,
+          "ry_deg": 79.506,
+          "rz_deg": 106.156
+        },
+        "target_to_camera": {
+          "rvec": [
+            0.018112589308137896,
+            0.26420886209797184,
+            0.1902057524918267
+          ],
+          "tvec_m": [
+            -0.02337567148952702,
+            -0.12244290333876148,
+            0.23482501468083428
+          ]
+        },
+        "image_path": "D:\\git\\projects\\roboticarm\\piper_project\\robot_control\\windows\\hand_eye\\captures\\hand_eye_022_20260602_173428.png",
+        "reprojection_error_px": 1.1772487163543701,
+        "detected_corners": 70
+      },
+      {
+        "index": 23,
+        "sample_id": "sample-023",
+        "robot_base_to_gripper": {
+          "x_mm": 56.772,
+          "y_mm": -25.157,
+          "z_mm": 204.001,
+          "rx_deg": 163.788,
+          "ry_deg": 78.727,
+          "rz_deg": 141.63
+        },
+        "target_to_camera": {
+          "rvec": [
+            -0.058550446218180376,
+            0.302435136091848,
+            0.2945026187303846
+          ],
+          "tvec_m": [
+            -0.024062374160689477,
+            -0.10604719481011746,
+            0.2347856643376947
+          ]
+        },
+        "image_path": "D:\\git\\projects\\roboticarm\\piper_project\\robot_control\\windows\\hand_eye\\captures\\hand_eye_023_20260602_173459.png",
+        "reprojection_error_px": 1.6101881265640259,
+        "detected_corners": 70
+      },
+      {
+        "index": 24,
+        "sample_id": "sample-024",
+        "robot_base_to_gripper": {
+          "x_mm": 58.7,
+          "y_mm": -24.232,
+          "z_mm": 216.864,
+          "rx_deg": 127.015,
+          "ry_deg": 85.583,
+          "rz_deg": 105.239
+        },
+        "target_to_camera": {
+          "rvec": [
+            -0.058821976485713266,
+            0.32055762989616654,
+            0.15973248621857186
+          ],
+          "tvec_m": [
+            -0.02681160853401767,
+            -0.13631392303983597,
+            0.2357070826593013
+          ]
+        },
+        "image_path": "D:\\git\\projects\\roboticarm\\piper_project\\robot_control\\windows\\hand_eye\\captures\\hand_eye_024_20260602_173521.png",
+        "reprojection_error_px": 1.588851809501648,
+        "detected_corners": 70
+      },
+      {
+        "index": 25,
+        "sample_id": "sample-025",
+        "robot_base_to_gripper": {
+          "x_mm": 61.643,
+          "y_mm": -28.994,
+          "z_mm": 213.473,
+          "rx_deg": 148.472,
+          "ry_deg": 83.439,
+          "rz_deg": 123.685
+        },
+        "target_to_camera": {
+          "rvec": [
+            -0.04611266215250635,
+            0.36523812077029183,
+            0.21521160932476052
+          ],
+          "tvec_m": [
+            -0.026559192363697283,
+            -0.12733853274268445,
+            0.23017014996932353
+          ]
+        },
+        "image_path": "D:\\git\\projects\\roboticarm\\piper_project\\robot_control\\windows\\hand_eye\\captures\\hand_eye_025_20260602_173536.png",
+        "reprojection_error_px": 1.979730248451233,
+        "detected_corners": 70
+      }
+    ],
+    "can_name": "can0"
+  }
+}
