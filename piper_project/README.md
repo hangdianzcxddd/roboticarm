@@ -55,6 +55,16 @@ python3 -m robot_control.linux.gripper.diagnose_j6_gripper --can can0
 python3 -m robot_control.linux.gripper.diagnose_j6_gripper --can can0 --json
 ```
 
+夹爪 TCP 固定点多姿态标定：
+
+```bash
+python3 -m robot_control.linux.tcp_calibration.collect_tcp_data --can can0 --overwrite
+python3 -m robot_control.linux.tcp_calibration.solve_tcp
+python3 -m robot_control.linux.tcp_calibration.validate_tcp --collect --can can0 --overwrite
+```
+
+详细操作见 `robot_control/linux/tcp_calibration/README.md`。该流程标定的是 `J6 -> gripper_tcp` 平移偏移，不是相机外参或手眼标定。
+
 Linux VM TCP server：
 
 ```bash
@@ -62,6 +72,14 @@ python3 -m robot_control.linux.server.tcp_server --host 0.0.0.0 --port 5005
 ```
 
 实机执行前再加 `--execute`，并先确认机械臂工作空间安全。
+
+点击抓取 server，使用官方夹爪 `J6 -> TCP` 的 `145 mm` 偏移：
+
+```bash
+python3 -m robot_control.linux.catch.catch_server --host 0.0.0.0 --port 5005 --execute --speed 10 --use-current-pose-as-base
+```
+
+详细参数见 `robot_control/linux/catch/README.md`。当前点击抓取仍使用临时相机到机器人小范围映射，不是手眼标定。
 
 ## Windows 侧命令
 

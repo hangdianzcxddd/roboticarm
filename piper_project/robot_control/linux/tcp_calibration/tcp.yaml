@@ -1,10 +1,19 @@
 tcp_calibration:
+  schema_version: 1
   status: uncalibrated
+  method: fixed_point_pivot
   transform:
+    from_frame: j6
+    to_frame: gripper_tcp
     x_mm: null
     y_mm: null
     z_mm: null
-    rx_deg: null
-    ry_deg: null
-    rz_deg: null
-  notes: "Collect samples with collect_tcp_data.py, solve with solve_tcp.py, then validate."
+    rx_deg: 0.0
+    ry_deg: 0.0
+    rz_deg: 0.0
+    rotation_source: assumed_aligned_with_j6
+  fixed_reference_point_base_mm:
+    x_mm: null
+    y_mm: null
+    z_mm: null
+  notes: "Fixed-point pivot calibration solves the J6-to-TCP translation only. TCP orientation is assumed to be aligned with J6."
