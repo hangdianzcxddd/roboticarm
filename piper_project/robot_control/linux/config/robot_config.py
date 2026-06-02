@@ -45,6 +45,8 @@ class RobotConfig:
     default_move_mode: MoveMode = "P"
     start_sdk_joint_limit: bool = True
     start_sdk_gripper_limit: bool = True
+    gripper_command_min_m: float = -0.10
+    gripper_command_max_m: float = 0.10
     auto_enable: bool = True
     park_before_disable: bool = True
     disable_park_speed_percent: int = 10

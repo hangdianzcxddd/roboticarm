@@ -13,9 +13,12 @@ Important test modules:
 - `robot_control/linux/arm/piper_arm_test.py`
 - `robot_control/linux/gripper/gripper_test.py`
 - `robot_control/linux/gripper/gripper_debug_test.py`
+- `robot_control/linux/hand_eye/calibration_test.py`
 - `robot_control/shared/protocol_test.py`
+- `robot_control/shared/hand_eye_protocol_test.py`
 - `robot_control/windows/vision/detector_test.py`
 - `robot_control/windows/vision/yolo_detector_test.py`
+- `robot_control/windows/hand_eye/chessboard_test.py`
 
 ## Model Download
 
@@ -79,4 +82,24 @@ Local protocol loopback without RealSense:
 
 ```bash
 python -c "from robot_control.shared.protocol import CameraPointCommand, send_camera_point; print(send_camera_point('127.0.0.1', 5005, CameraPointCommand(x_m=0.1, y_m=-0.05, z_m=0.4, u=320, v=240, depth_m=0.4)))"
+```
+
+## Hand-Eye Calibration
+
+Linux sample server:
+
+```bash
+python3 -m robot_control.linux.hand_eye.collect_server --host 0.0.0.0 --port 5010 --mode eye_to_hand
+```
+
+Windows chessboard capture:
+
+```bash
+python -m robot_control.windows.hand_eye.capture_chessboard --host <linux-vm-ip> --port 5010 --corners-rows 8 --corners-cols 11 --checker-size-mm 15
+```
+
+Solve on Linux after collecting 20-30 samples:
+
+```bash
+python3 -m robot_control.linux.hand_eye.solve_hand_eye --mode eye_to_hand
 ```

@@ -8,6 +8,9 @@ import unittest
 import numpy as np
 
 from robot_control.linux.catch.catch_server import handle_message
+from robot_control.linux.arm.piper_arm import PiperController
+from robot_control.linux.arm.piper_arm_test import FakePiperSdk
+from robot_control.linux.config.robot_config import RobotConfig
 from robot_control.linux.catch.tcp_offset import (
     build_catch_plan,
     j6_pose_for_tcp_pose,
@@ -35,8 +38,20 @@ def make_args(**overrides: object) -> argparse.Namespace:
         "no_gripper": False,
         "open_width_mm": 70.0,
         "close_width_mm": 0.0,
+        "open_command_mm": 0.0,
+        "grasp_command_mm": -100.0,
+        "release_command_mm": None,
         "effort_nm": 1.0,
+        "grasp_effort_nm": None,
+        "release_effort_nm": None,
         "gripper_settle_s": 0.0,
+        "place_x_mm": 0.0,
+        "place_y_mm": 150.0,
+        "place_z_mm": 150.0,
+        "place_rx_deg": None,
+        "place_ry_deg": None,
+        "place_rz_deg": None,
+        "place_approach_height_mm": 50.0,
     }
     values.update(overrides)
     return argparse.Namespace(**values)
@@ -132,6 +147,65 @@ class TestCatchServer(unittest.TestCase):
         self.assertEqual(response["payload"]["target_tcp_pose"]["y_mm"], -10.0)
         self.assertAlmostEqual(response["payload"]["grasp_j6_pose"]["x_mm"], 165.0)
         self.assertEqual(response["payload"]["catch"]["gripper_enabled"], True)
+        self.assertEqual(response["payload"]["place_tcp_pose"]["y_mm"], 150.0)
+        self.assertEqual(response["payload"]["place_tcp_pose"]["z_mm"], 150.0)
+        self.assertEqual(response["payload"]["catch"]["open_command_mm"], 0.0)
+        self.assertEqual(response["payload"]["catch"]["grasp_command_mm"], -100.0)
+
+    def test_execute_uses_open_zero_gripper_sequence_and_place_motion(self):
+        message = make_camera_point_message(
+            CameraPointCommand(x_m=0.0, y_m=0.0, z_m=0.3, command_id="cmd-2")
+        )
+        mapping = SimulatedMappingConfig(
+            base_x_mm=250.0,
+            base_y_mm=0.0,
+            base_z_mm=250.0,
+            rx_deg=0.0,
+            ry_deg=85.0,
+            rz_deg=0.0,
+        )
+        sdk = FakePiperSdk()
+        controller = PiperController(
+            config=RobotConfig(command_interval_s=0, connect_timeout_s=0.1),
+            sdk=sdk,
+        )
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            response = handle_message(
+                message,
+                mapping,
+                tcp_offset_j6_mm=(0.0, 0.0, 145.0),
+                execute=True,
+                controller=controller,
+                args=make_args(
+                    command_duration_s=0.0,
+                    open_command_mm=0.0,
+                    grasp_command_mm=-100.0,
+                    release_command_mm=0.0,
+                    effort_nm=1.0,
+                    grasp_effort_nm=1.5,
+                    release_effort_nm=0.4,
+                    place_x_mm=0.0,
+                    place_y_mm=150.0,
+                    place_z_mm=150.0,
+                ),
+            )
+
+        gripper_calls = [call for call in sdk.calls if call[0] == "GripperCtrl"]
+        end_pose_calls = [call for call in sdk.calls if call[0] == "EndPoseCtrl"]
+        self.assertEqual(
+            gripper_calls,
+            [
+                ("GripperCtrl", (0, 400, 0x01, 0)),
+                ("GripperCtrl", (-100000, 1500, 0x01, 0)),
+                ("GripperCtrl", (0, 400, 0x01, 0)),
+            ],
+        )
+        self.assertEqual(len(end_pose_calls), 6)
+        self.assertEqual(
+            sorted(response["payload"]["catch"]["send_counts"]),
+            ["approach", "grasp", "lift", "place", "place_approach", "place_retreat"],
+        )
 
 
 if __name__ == "__main__":

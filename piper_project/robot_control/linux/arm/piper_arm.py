@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import time
 from pathlib import Path
 import sys
@@ -98,6 +99,12 @@ class PiperSdkLike(Protocol):
         max_val: float,
     ) -> None: ...
 
+    def SetSDKGripperRangeParam(
+        self,
+        min_val: float,
+        max_val: float,
+    ) -> None: ...
+
 
 class PiperController:
     """Controller for the SDK segment: robot frame command -> Piper SDK -> motion."""
@@ -143,10 +150,14 @@ class PiperController:
         return sdk
 
     def _configure_sdk_limits(self, sdk: PiperSdkLike) -> None:
-        if not self.config.start_sdk_joint_limit:
-            return
-        for index, limit in enumerate(self.config.joint_limits_rad, start=1):
-            sdk.SetSDKJointLimitParam(f"j{index}", limit.min_value, limit.max_value)
+        if self.config.start_sdk_joint_limit:
+            for index, limit in enumerate(self.config.joint_limits_rad, start=1):
+                sdk.SetSDKJointLimitParam(f"j{index}", limit.min_value, limit.max_value)
+        if self.config.start_sdk_gripper_limit:
+            sdk.SetSDKGripperRangeParam(
+                self.config.gripper_command_min_m,
+                self.config.gripper_command_max_m,
+            )
 
     def connect(self, enable: bool | None = None) -> None:
         self.sdk.ConnectPort()
@@ -342,8 +353,8 @@ class PiperController:
         clear_error: bool = False,
         set_zero: bool = False,
     ) -> None:
-        if width_mm < 0:
-            raise ValueError("width_mm must be >= 0")
+        if not math.isfinite(width_mm):
+            raise ValueError("width_mm must be finite")
         if not 0 <= effort_nm <= 5:
             raise ValueError("effort_nm must be in [0, 5]")
         if clear_error:

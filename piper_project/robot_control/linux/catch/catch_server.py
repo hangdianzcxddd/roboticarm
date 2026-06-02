@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import math
 import socket
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any, Sequence
 
 from robot_control.linux.arm.piper_arm import PiperController
@@ -15,6 +16,7 @@ from robot_control.linux.catch.tcp_offset import (
     build_catch_plan,
     tcp_pose_for_j6_pose,
 )
+from robot_control.linux.catch.set_gripper_zero import set_gripper_zero
 from robot_control.linux.config.robot_config import ROBOT_CONFIG
 from robot_control.shared.geometry import EndPose
 from robot_control.shared.protocol import (
@@ -29,6 +31,16 @@ from robot_control.shared.simulated_mapping import (
     camera_xyz_to_simulated_robot_pose,
     pose_to_dict,
 )
+
+
+@dataclass(frozen=True)
+class PlacePlan:
+    place_tcp_pose: EndPose
+    approach_tcp_pose: EndPose
+    retreat_tcp_pose: EndPose
+    place_j6_pose: EndPose
+    approach_j6_pose: EndPose
+    retreat_j6_pose: EndPose
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -74,10 +86,51 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--target-z-offset-mm", type=float, default=0.0)
     parser.add_argument("--approach-height-mm", type=float, default=50.0)
     parser.add_argument("--lift-height-mm", type=float, default=50.0)
-    parser.add_argument("--open-width-mm", type=float, default=70.0)
-    parser.add_argument("--close-width-mm", type=float, default=0.0)
+    parser.add_argument("--place-x-mm", type=float, default=0.0)
+    parser.add_argument("--place-y-mm", type=float, default=150.0)
+    parser.add_argument("--place-z-mm", type=float, default=150.0)
+    parser.add_argument("--place-rx-deg", type=float)
+    parser.add_argument("--place-ry-deg", type=float)
+    parser.add_argument("--place-rz-deg", type=float)
+    parser.add_argument("--place-approach-height-mm", type=float, default=50.0)
+    parser.add_argument(
+        "--open-command-mm",
+        "--open-width-mm",
+        dest="open_command_mm",
+        type=float,
+        default=0.0,
+        help="Gripper open command. With open-zero calibration, 0 mm is fully open.",
+    )
+    parser.add_argument(
+        "--grasp-command-mm",
+        "--close-command-mm",
+        "--close-width-mm",
+        dest="grasp_command_mm",
+        type=float,
+        default=-100.0,
+        help=(
+            "Gripper close command. With open-zero calibration, negative values "
+            "move toward closing; default -100 mm."
+        ),
+    )
+    parser.add_argument(
+        "--release-command-mm",
+        type=float,
+        help="Gripper release command; defaults to --open-command-mm.",
+    )
     parser.add_argument("--effort-nm", type=float, default=1.0)
+    parser.add_argument("--grasp-effort-nm", type=float)
+    parser.add_argument("--release-effort-nm", type=float)
     parser.add_argument("--gripper-settle-s", type=float, default=0.6)
+    parser.add_argument(
+        "--set-open-zero-on-start",
+        action="store_true",
+        help=(
+            "Set the current physical gripper position as zero at startup. "
+            "Before using this, manually make the gripper fully open at 100 mm."
+        ),
+    )
+    parser.add_argument("--zero-settle-s", type=float, default=1.5)
     parser.add_argument("--clear-gripper-error", action="store_true")
     parser.add_argument("--no-pre-open", action="store_true")
     parser.add_argument("--no-gripper", action="store_true")
@@ -120,12 +173,45 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--approach-height-mm must be >= 0")
     if args.lift_height_mm < 0:
         raise ValueError("--lift-height-mm must be >= 0")
-    if args.open_width_mm < 0 or args.close_width_mm < 0:
-        raise ValueError("gripper widths must be >= 0")
+    if args.place_approach_height_mm < 0:
+        raise ValueError("--place-approach-height-mm must be >= 0")
+    for option_name, value in (
+        ("--open-command-mm", args.open_command_mm),
+        ("--grasp-command-mm", args.grasp_command_mm),
+        ("--release-command-mm", release_command_mm(args)),
+    ):
+        if not math.isfinite(value):
+            raise ValueError(f"{option_name} must be finite")
     if args.gripper_settle_s < 0:
         raise ValueError("--gripper-settle-s must be >= 0")
+    if args.zero_settle_s < 0:
+        raise ValueError("--zero-settle-s must be >= 0")
     if not 0 <= args.effort_nm <= 5:
         raise ValueError("--effort-nm must be in [0, 5]")
+    for option_name, value in (
+        ("--grasp-effort-nm", args.grasp_effort_nm),
+        ("--release-effort-nm", args.release_effort_nm),
+    ):
+        if value is not None and not 0 <= value <= 5:
+            raise ValueError(f"{option_name} must be in [0, 5]")
+
+
+def grasp_effort_nm(args: argparse.Namespace) -> float:
+    return float(args.effort_nm if args.grasp_effort_nm is None else args.grasp_effort_nm)
+
+
+def release_effort_nm(args: argparse.Namespace) -> float:
+    return float(
+        args.effort_nm if args.release_effort_nm is None else args.release_effort_nm
+    )
+
+
+def release_command_mm(args: argparse.Namespace) -> float:
+    return float(
+        args.open_command_mm
+        if args.release_command_mm is None
+        else args.release_command_mm
+    )
 
 
 def feedback_to_pose(feedback: Any) -> EndPose | None:
@@ -175,15 +261,82 @@ def execute_pose_for_duration(
     return send_count
 
 
-def validate_plan(controller: PiperController, plan: CatchPlan) -> None:
-    controller.validate_pose(plan.approach_j6_pose)
-    controller.validate_pose(plan.grasp_j6_pose)
-    controller.validate_pose(plan.lift_j6_pose)
+def build_place_plan(
+    target_tcp_pose: EndPose,
+    offset_j6_tcp_mm: Sequence[float],
+    args: argparse.Namespace,
+) -> PlacePlan:
+    rx_deg = target_tcp_pose.rx_deg if args.place_rx_deg is None else args.place_rx_deg
+    ry_deg = target_tcp_pose.ry_deg if args.place_ry_deg is None else args.place_ry_deg
+    rz_deg = target_tcp_pose.rz_deg if args.place_rz_deg is None else args.place_rz_deg
+    place_tcp_pose = EndPose(
+        args.place_x_mm,
+        args.place_y_mm,
+        args.place_z_mm,
+        rx_deg,
+        ry_deg,
+        rz_deg,
+    )
+    approach_tcp_pose = EndPose(
+        place_tcp_pose.x_mm,
+        place_tcp_pose.y_mm,
+        place_tcp_pose.z_mm + args.place_approach_height_mm,
+        place_tcp_pose.rx_deg,
+        place_tcp_pose.ry_deg,
+        place_tcp_pose.rz_deg,
+    )
+    return PlacePlan(
+        place_tcp_pose=place_tcp_pose,
+        approach_tcp_pose=approach_tcp_pose,
+        retreat_tcp_pose=approach_tcp_pose,
+        place_j6_pose=build_catch_j6_pose(place_tcp_pose, offset_j6_tcp_mm),
+        approach_j6_pose=build_catch_j6_pose(approach_tcp_pose, offset_j6_tcp_mm),
+        retreat_j6_pose=build_catch_j6_pose(approach_tcp_pose, offset_j6_tcp_mm),
+    )
+
+
+def build_catch_j6_pose(
+    tcp_pose: EndPose,
+    offset_j6_tcp_mm: Sequence[float],
+) -> EndPose:
+    from robot_control.linux.catch.tcp_offset import j6_pose_for_tcp_pose
+
+    return j6_pose_for_tcp_pose(tcp_pose, offset_j6_tcp_mm)
+
+
+def validate_plan(
+    controller: PiperController,
+    catch_plan: CatchPlan,
+    place_plan: PlacePlan,
+) -> None:
+    controller.validate_pose(catch_plan.approach_j6_pose)
+    controller.validate_pose(catch_plan.grasp_j6_pose)
+    controller.validate_pose(catch_plan.lift_j6_pose)
+    controller.validate_pose(place_plan.approach_j6_pose)
+    controller.validate_pose(place_plan.place_j6_pose)
+    controller.validate_pose(place_plan.retreat_j6_pose)
+
+
+def maybe_set_open_zero(controller: PiperController, args: argparse.Namespace) -> None:
+    if args.no_gripper or not args.set_open_zero_on_start:
+        return
+    print(
+        "Setting gripper zero at current physical fully-open position "
+        f"(command={args.open_command_mm:.3f} mm).",
+        flush=True,
+    )
+    set_gripper_zero(
+        controller,
+        zero_command_mm=args.open_command_mm,
+        effort_nm=release_effort_nm(args),
+        settle_s=args.zero_settle_s,
+    )
 
 
 def execute_catch_plan(
     controller: PiperController,
-    plan: CatchPlan,
+    catch_plan: CatchPlan,
+    place_plan: PlacePlan,
     args: argparse.Namespace,
 ) -> dict[str, int]:
     counts: dict[str, int] = {}
@@ -192,15 +345,24 @@ def execute_catch_plan(
 
     if not args.no_gripper:
         if args.clear_gripper_error:
-            controller.set_gripper(0.0, args.effort_nm, enable=True, clear_error=True)
+            controller.set_gripper(
+                args.open_command_mm,
+                release_effort_nm(args),
+                enable=True,
+                clear_error=True,
+            )
             time.sleep(args.gripper_settle_s)
         if not args.no_pre_open:
-            controller.set_gripper(args.open_width_mm, args.effort_nm, enable=True)
+            controller.set_gripper(
+                args.open_command_mm,
+                release_effort_nm(args),
+                enable=True,
+            )
             time.sleep(args.gripper_settle_s)
 
     counts["approach"] = execute_pose_for_duration(
         controller,
-        plan.approach_j6_pose,
+        catch_plan.approach_j6_pose,
         args.speed,
         args.approach_mode,
         args.command_duration_s,
@@ -208,7 +370,7 @@ def execute_catch_plan(
     )
     counts["grasp"] = execute_pose_for_duration(
         controller,
-        plan.grasp_j6_pose,
+        catch_plan.grasp_j6_pose,
         args.speed,
         args.grasp_mode,
         args.command_duration_s,
@@ -216,12 +378,49 @@ def execute_catch_plan(
     )
 
     if not args.no_gripper:
-        controller.set_gripper(args.close_width_mm, args.effort_nm, enable=True)
+        controller.set_gripper(
+            args.grasp_command_mm,
+            grasp_effort_nm(args),
+            enable=True,
+        )
         time.sleep(args.gripper_settle_s)
 
     counts["lift"] = execute_pose_for_duration(
         controller,
-        plan.lift_j6_pose,
+        catch_plan.lift_j6_pose,
+        args.speed,
+        args.lift_mode,
+        args.command_duration_s,
+        args.command_period_s,
+    )
+    counts["place_approach"] = execute_pose_for_duration(
+        controller,
+        place_plan.approach_j6_pose,
+        args.speed,
+        args.approach_mode,
+        args.command_duration_s,
+        args.command_period_s,
+    )
+    counts["place"] = execute_pose_for_duration(
+        controller,
+        place_plan.place_j6_pose,
+        args.speed,
+        args.grasp_mode,
+        args.command_duration_s,
+        args.command_period_s,
+    )
+
+    if not args.no_gripper:
+        controller.set_gripper(
+            release_command_mm(args),
+            release_effort_nm(args),
+            enable=True,
+        )
+        time.sleep(args.gripper_settle_s)
+
+    counts["place_retreat"] = execute_pose_for_duration(
+        controller,
+        place_plan.retreat_j6_pose,
         args.speed,
         args.lift_mode,
         args.command_duration_s,
@@ -256,14 +455,19 @@ def handle_message(
         lift_height_mm=args.lift_height_mm,
         target_z_offset_mm=args.target_z_offset_mm,
     )
+    place_plan = build_place_plan(
+        target_tcp_pose,
+        offset_j6_tcp_mm=tcp_offset_j6_mm,
+        args=args,
+    )
 
     validator = controller or PiperController()
-    validate_plan(validator, plan)
+    validate_plan(validator, plan, place_plan)
     send_counts: dict[str, int] = {}
     if execute:
         if controller is None:
             raise RuntimeError("execute=True requires a connected PiperController")
-        send_counts = execute_catch_plan(controller, plan, args)
+        send_counts = execute_catch_plan(controller, plan, place_plan, args)
 
     print(
         "camera_xyz="
@@ -283,6 +487,9 @@ def handle_message(
             "approach_j6_pose": pose_to_dict(plan.approach_j6_pose),
             "grasp_j6_pose": pose_to_dict(plan.grasp_j6_pose),
             "lift_j6_pose": pose_to_dict(plan.lift_j6_pose),
+            "place_tcp_pose": pose_to_dict(place_plan.place_tcp_pose),
+            "place_j6_pose": pose_to_dict(place_plan.place_j6_pose),
+            "place_approach_j6_pose": pose_to_dict(place_plan.approach_j6_pose),
             "tcp_offset_j6_mm": {
                 "x_mm": float(tcp_offset_j6_mm[0]),
                 "y_mm": float(tcp_offset_j6_mm[1]),
@@ -290,9 +497,11 @@ def handle_message(
             },
             "catch": {
                 "send_counts": send_counts,
-                "open_width_mm": args.open_width_mm,
-                "close_width_mm": args.close_width_mm,
-                "effort_nm": args.effort_nm,
+                "open_command_mm": args.open_command_mm,
+                "grasp_command_mm": args.grasp_command_mm,
+                "release_command_mm": release_command_mm(args),
+                "grasp_effort_nm": grasp_effort_nm(args),
+                "release_effort_nm": release_effort_nm(args),
                 "gripper_enabled": not args.no_gripper,
             },
         }
@@ -312,6 +521,7 @@ def serve(args: argparse.Namespace) -> None:
         print("Connecting and enabling Piper arm...", flush=True)
         controller.connect(enable=True)
         print("Piper arm enabled", flush=True)
+        maybe_set_open_zero(controller, args)
         if args.use_current_pose_as_base:
             current_j6_pose = read_current_j6_pose(controller)
             current_tcp_pose = tcp_pose_for_j6_pose(current_j6_pose, tcp_offset_j6_mm)

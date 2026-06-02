@@ -117,6 +117,9 @@ class FakePiperSdk:
     def SetSDKJointLimitParam(self, joint_name, min_val, max_val):
         self.calls.append(("SetSDKJointLimitParam", (joint_name, min_val, max_val)))
 
+    def SetSDKGripperRangeParam(self, min_val, max_val):
+        self.calls.append(("SetSDKGripperRangeParam", (min_val, max_val)))
+
     def CrashProtectionConfig(
         self,
         joint_1_protection_level,
@@ -264,14 +267,23 @@ class TestMove(unittest.TestCase):
 
         controller._configure_sdk_limits(sdk)
 
-        self.assertEqual(len(sdk.calls), 6)
-        self.assertEqual(sdk.calls[0][0], "SetSDKJointLimitParam")
-        self.assertEqual(sdk.calls[0][1][0], "j1")
-        self.assertAlmostEqual(sdk.calls[0][1][1], math.radians(-150.0))
-        self.assertAlmostEqual(sdk.calls[0][1][2], math.radians(150.0))
-        self.assertEqual(sdk.calls[-1][1][0], "j6")
-        self.assertAlmostEqual(sdk.calls[-1][1][1], math.radians(-120.0))
-        self.assertAlmostEqual(sdk.calls[-1][1][2], math.radians(120.0))
+        joint_calls = [call for call in sdk.calls if call[0] == "SetSDKJointLimitParam"]
+        gripper_calls = [call for call in sdk.calls if call[0] == "SetSDKGripperRangeParam"]
+        self.assertEqual(len(joint_calls), 6)
+        self.assertEqual(joint_calls[0][1][0], "j1")
+        self.assertAlmostEqual(joint_calls[0][1][1], math.radians(-150.0))
+        self.assertAlmostEqual(joint_calls[0][1][2], math.radians(150.0))
+        self.assertEqual(joint_calls[-1][1][0], "j6")
+        self.assertAlmostEqual(joint_calls[-1][1][1], math.radians(-120.0))
+        self.assertAlmostEqual(joint_calls[-1][1][2], math.radians(120.0))
+        self.assertEqual(gripper_calls, [("SetSDKGripperRangeParam", (-0.10, 0.10))])
+
+    def test_set_gripper_allows_negative_open_zero_command(self):
+        controller, sdk = make_controller()
+
+        controller.set_gripper(-100.0, effort_nm=1.5, enable=True)
+
+        self.assertEqual(sdk.calls, [("GripperCtrl", (-100000, 1500, 0x01, 0))])
 
     def test_safe_disable_parks_before_disabling(self):
         config = RobotConfig(
