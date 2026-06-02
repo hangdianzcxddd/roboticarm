@@ -23,7 +23,7 @@ from robot_control.linux.catch.hand_eye_mapping import (
     load_camera_to_base_transform,
 )
 from robot_control.linux.config.robot_config import ROBOT_CONFIG
-from robot_control.shared.geometry import EndPose
+from robot_control.shared.geometry import EndPose, TOP_DOWN_TCP_ORIENTATION_DEG
 from robot_control.shared.protocol import (
     camera_point_from_message,
     make_ack_message,
@@ -68,6 +68,29 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--command-duration-s", type=float, default=1.0)
     parser.add_argument("--command-period-s", type=float, default=0.02)
     parser.add_argument(
+        "--motion-timeout-s",
+        type=float,
+        default=8.0,
+        help="seconds to wait for each waypoint after command streaming",
+    )
+    parser.add_argument(
+        "--position-tolerance-mm",
+        type=float,
+        default=8.0,
+        help="J6 feedback position tolerance for waypoint arrival",
+    )
+    parser.add_argument(
+        "--orientation-tolerance-deg",
+        type=float,
+        default=8.0,
+        help="J6 feedback orientation tolerance for waypoint arrival",
+    )
+    parser.add_argument(
+        "--no-wait-waypoints",
+        action="store_true",
+        help="do not wait for waypoint arrival before continuing",
+    )
+    parser.add_argument(
         "--use-current-pose-as-base",
         action="store_true",
         help="When executing, use the current gripper TCP pose as the mapping center.",
@@ -92,9 +115,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-delta-x-mm", type=float, default=40.0)
     parser.add_argument("--max-delta-y-mm", type=float, default=40.0)
     parser.add_argument("--max-delta-z-mm", type=float, default=30.0)
-    parser.add_argument("--rx-deg", type=float, default=0.0)
-    parser.add_argument("--ry-deg", type=float, default=85.0)
-    parser.add_argument("--rz-deg", type=float, default=0.0)
+    default_rx, default_ry, default_rz = TOP_DOWN_TCP_ORIENTATION_DEG
+    parser.add_argument("--rx-deg", type=float, default=default_rx)
+    parser.add_argument("--ry-deg", type=float, default=default_ry)
+    parser.add_argument("--rz-deg", type=float, default=default_rz)
+    parser.add_argument(
+        "--use-current-orientation",
+        action="store_true",
+        help=(
+            "When executing, use the current gripper TCP orientation for the "
+            "clicked target instead of --rx-deg/--ry-deg/--rz-deg. This is useful "
+            "for first hand-eye motion tests because it avoids large orientation jumps."
+        ),
+    )
     parser.add_argument("--tcp-offset-x-mm", type=float, default=0.0)
     parser.add_argument("--tcp-offset-y-mm", type=float, default=0.0)
     parser.add_argument(
@@ -113,6 +146,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--place-ry-deg", type=float)
     parser.add_argument("--place-rz-deg", type=float)
     parser.add_argument("--place-approach-height-mm", type=float, default=50.0)
+    parser.add_argument(
+        "--stop-after-lift",
+        action="store_true",
+        help="execute only approach, grasp, and lift; skip place/release sequence",
+    )
     parser.add_argument(
         "--open-command-mm",
         "--open-width-mm",
@@ -187,10 +225,18 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--use-current-pose-as-base requires --execute")
     if args.use_current_pose_as_base and args.hand_eye_result is not None:
         raise ValueError("--use-current-pose-as-base is only for simulated mapping")
+    if args.use_current_orientation and not args.execute:
+        raise ValueError("--use-current-orientation requires --execute")
     if args.command_duration_s < 0:
         raise ValueError("--command-duration-s must be >= 0")
     if args.command_period_s <= 0:
         raise ValueError("--command-period-s must be > 0")
+    if args.motion_timeout_s < 0:
+        raise ValueError("--motion-timeout-s must be >= 0")
+    if args.position_tolerance_mm < 0:
+        raise ValueError("--position-tolerance-mm must be >= 0")
+    if args.orientation_tolerance_deg < 0:
+        raise ValueError("--orientation-tolerance-deg must be >= 0")
     if args.approach_height_mm < 0:
         raise ValueError("--approach-height-mm must be >= 0")
     if args.lift_height_mm < 0:
@@ -283,6 +329,81 @@ def execute_pose_for_duration(
     return send_count
 
 
+def execute_waypoint(
+    controller: PiperController,
+    label: str,
+    pose: EndPose,
+    speed: int,
+    mode: str,
+    args: argparse.Namespace,
+) -> int:
+    send_count = execute_pose_for_duration(
+        controller,
+        pose,
+        speed,
+        mode,
+        args.command_duration_s,
+        args.command_period_s,
+    )
+    if not args.no_wait_waypoints:
+        wait_until_pose_reached(
+            controller,
+            label,
+            pose,
+            timeout_s=args.motion_timeout_s,
+            position_tolerance_mm=args.position_tolerance_mm,
+            orientation_tolerance_deg=args.orientation_tolerance_deg,
+        )
+    return send_count
+
+
+def wait_until_pose_reached(
+    controller: PiperController,
+    label: str,
+    target: EndPose,
+    timeout_s: float,
+    position_tolerance_mm: float,
+    orientation_tolerance_deg: float,
+) -> EndPose:
+    deadline = time.monotonic() + timeout_s
+    last_pose: EndPose | None = None
+    while timeout_s == 0 or time.monotonic() < deadline:
+        pose = feedback_to_pose(controller.get_end_pose())
+        if pose is not None:
+            last_pose = pose
+            position_error, orientation_error = pose_errors(target, pose)
+            if (
+                position_error <= position_tolerance_mm
+                and orientation_error <= orientation_tolerance_deg
+            ):
+                return pose
+        if timeout_s == 0:
+            break
+        time.sleep(0.05)
+    position_error, orientation_error = (
+        pose_errors(target, last_pose) if last_pose is not None else (float("inf"), float("inf"))
+    )
+    raise RuntimeError(
+        f"waypoint {label} not reached: target={format_pose(target)} "
+        f"last={format_pose(last_pose)} pos_err={position_error:.3f} mm "
+        f"ori_err={orientation_error:.3f} deg"
+    )
+
+
+def pose_errors(target: EndPose, actual: EndPose) -> tuple[float, float]:
+    position_error = math.sqrt(
+        (actual.x_mm - target.x_mm) ** 2
+        + (actual.y_mm - target.y_mm) ** 2
+        + (actual.z_mm - target.z_mm) ** 2
+    )
+    orientation_error = max(
+        abs(actual.rx_deg - target.rx_deg),
+        abs(actual.ry_deg - target.ry_deg),
+        abs(actual.rz_deg - target.rz_deg),
+    )
+    return position_error, orientation_error
+
+
 def build_place_plan(
     target_tcp_pose: EndPose,
     offset_j6_tcp_mm: Sequence[float],
@@ -362,8 +483,10 @@ def execute_catch_plan(
     args: argparse.Namespace,
 ) -> dict[str, int]:
     counts: dict[str, int] = {}
+    before_pose = None
     if args.print_feedback:
-        print(f"Before catch J6: {format_pose(feedback_to_pose(controller.get_end_pose()))}")
+        before_pose = feedback_to_pose(controller.get_end_pose())
+        print(f"Before catch J6: {format_pose(before_pose)}")
 
     if not args.no_gripper:
         if args.clear_gripper_error:
@@ -382,21 +505,21 @@ def execute_catch_plan(
             )
             time.sleep(args.gripper_settle_s)
 
-    counts["approach"] = execute_pose_for_duration(
+    counts["approach"] = execute_waypoint(
         controller,
+        "approach",
         catch_plan.approach_j6_pose,
         args.speed,
         args.approach_mode,
-        args.command_duration_s,
-        args.command_period_s,
+        args,
     )
-    counts["grasp"] = execute_pose_for_duration(
+    counts["grasp"] = execute_waypoint(
         controller,
+        "grasp",
         catch_plan.grasp_j6_pose,
         args.speed,
         args.grasp_mode,
-        args.command_duration_s,
-        args.command_period_s,
+        args,
     )
 
     if not args.no_gripper:
@@ -407,29 +530,32 @@ def execute_catch_plan(
         )
         time.sleep(args.gripper_settle_s)
 
-    counts["lift"] = execute_pose_for_duration(
+    counts["lift"] = execute_waypoint(
         controller,
+        "lift",
         catch_plan.lift_j6_pose,
         args.speed,
         args.lift_mode,
-        args.command_duration_s,
-        args.command_period_s,
+        args,
     )
-    counts["place_approach"] = execute_pose_for_duration(
+    if args.stop_after_lift:
+        return counts
+
+    counts["place_approach"] = execute_waypoint(
         controller,
+        "place_approach",
         place_plan.approach_j6_pose,
         args.speed,
         args.approach_mode,
-        args.command_duration_s,
-        args.command_period_s,
+        args,
     )
-    counts["place"] = execute_pose_for_duration(
+    counts["place"] = execute_waypoint(
         controller,
+        "place",
         place_plan.place_j6_pose,
         args.speed,
         args.grasp_mode,
-        args.command_duration_s,
-        args.command_period_s,
+        args,
     )
 
     if not args.no_gripper:
@@ -440,18 +566,21 @@ def execute_catch_plan(
         )
         time.sleep(args.gripper_settle_s)
 
-    counts["place_retreat"] = execute_pose_for_duration(
+    counts["place_retreat"] = execute_waypoint(
         controller,
+        "place_retreat",
         place_plan.retreat_j6_pose,
         args.speed,
         args.lift_mode,
-        args.command_duration_s,
-        args.command_period_s,
+        args,
     )
 
     if args.print_feedback:
         time.sleep(0.1)
-        print(f"After catch J6: {format_pose(feedback_to_pose(controller.get_end_pose()))}")
+        after_pose = feedback_to_pose(controller.get_end_pose())
+        print(f"After catch J6: {format_pose(after_pose)}")
+        print(f"Catch send counts: {counts}")
+        print(f"Feedback delta: {pose_delta(before_pose, after_pose)}")
     return counts
 
 
@@ -465,12 +594,30 @@ def handle_message(
     hand_eye_camera_to_base: Any | None = None,
 ) -> dict[str, Any]:
     command = camera_point_from_message(message)
+    rx_deg = args.rx_deg
+    ry_deg = args.ry_deg
+    rz_deg = args.rz_deg
+    if args.use_current_orientation:
+        if controller is None:
+            raise RuntimeError("--use-current-orientation requires a controller")
+        current_tcp_pose = tcp_pose_for_j6_pose(
+            read_current_j6_pose(controller),
+            tcp_offset_j6_mm,
+        )
+        rx_deg = current_tcp_pose.rx_deg
+        ry_deg = current_tcp_pose.ry_deg
+        rz_deg = current_tcp_pose.rz_deg
+
     if hand_eye_camera_to_base is None:
         target_tcp_pose = camera_xyz_to_simulated_robot_pose(
             command.x_m,
             command.y_m,
             command.z_m,
-            mapping_config,
+            (
+                replace(mapping_config, rx_deg=rx_deg, ry_deg=ry_deg, rz_deg=rz_deg)
+                if args.use_current_orientation
+                else mapping_config
+            ),
         )
         mapping_source = "simulated"
     else:
@@ -479,9 +626,9 @@ def handle_message(
             command.y_m,
             command.z_m,
             hand_eye_camera_to_base,
-            rx_deg=args.rx_deg,
-            ry_deg=args.ry_deg,
-            rz_deg=args.rz_deg,
+            rx_deg=rx_deg,
+            ry_deg=ry_deg,
+            rz_deg=rz_deg,
         )
         mapping_source = "hand_eye"
     plan = build_catch_plan(
@@ -628,6 +775,19 @@ def format_pose(pose: EndPose | None) -> str:
     return (
         f"x={pose.x_mm:.3f} y={pose.y_mm:.3f} z={pose.z_mm:.3f} "
         f"rx={pose.rx_deg:.3f} ry={pose.ry_deg:.3f} rz={pose.rz_deg:.3f}"
+    )
+
+
+def pose_delta(before: EndPose | None, after: EndPose | None) -> str:
+    if before is None or after is None:
+        return "unavailable"
+    return (
+        f"dx={after.x_mm - before.x_mm:.3f} "
+        f"dy={after.y_mm - before.y_mm:.3f} "
+        f"dz={after.z_mm - before.z_mm:.3f} "
+        f"drx={after.rx_deg - before.rx_deg:.3f} "
+        f"dry={after.ry_deg - before.ry_deg:.3f} "
+        f"drz={after.rz_deg - before.rz_deg:.3f}"
     )
 
 

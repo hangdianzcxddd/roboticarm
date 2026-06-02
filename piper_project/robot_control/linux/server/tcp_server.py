@@ -29,7 +29,7 @@ from robot_control.shared.protocol import (
     send_json_line,
 )
 from robot_control.linux.config.robot_config import ROBOT_CONFIG
-from robot_control.shared.geometry import EndPose
+from robot_control.shared.geometry import EndPose, TOP_DOWN_TCP_ORIENTATION_DEG
 from robot_control.linux.arm.piper_arm import PiperController
 
 
@@ -77,9 +77,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-delta-x-mm", type=float, default=40.0)
     parser.add_argument("--max-delta-y-mm", type=float, default=40.0)
     parser.add_argument("--max-delta-z-mm", type=float, default=30.0)
-    parser.add_argument("--rx-deg", type=float, default=0.0)
-    parser.add_argument("--ry-deg", type=float, default=85.0)
-    parser.add_argument("--rz-deg", type=float, default=0.0)
+    default_rx, default_ry, default_rz = TOP_DOWN_TCP_ORIENTATION_DEG
+    parser.add_argument("--rx-deg", type=float, default=default_rx)
+    parser.add_argument("--ry-deg", type=float, default=default_ry)
+    parser.add_argument("--rz-deg", type=float, default=default_rz)
     return parser
 
 

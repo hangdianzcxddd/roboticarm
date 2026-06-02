@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 
+from robot_control.shared.geometry import TOP_DOWN_TCP_ORIENTATION_DEG
 from robot_control.shared.simulated_mapping import camera_xyz_to_simulated_robot_pose
 from robot_control.shared.protocol import (
     CameraPointCommand,
@@ -41,7 +42,10 @@ class TestTcpProtocol(unittest.TestCase):
         self.assertEqual(pose.x_mm, 190.0)
         self.assertEqual(pose.y_mm, -40.0)
         self.assertEqual(pose.z_mm, 250.0)
-        self.assertEqual((pose.rx_deg, pose.ry_deg, pose.rz_deg), (0.0, 85.0, 0.0))
+        self.assertEqual(
+            (pose.rx_deg, pose.ry_deg, pose.rz_deg),
+            TOP_DOWN_TCP_ORIENTATION_DEG,
+        )
 
 
 if __name__ == "__main__":

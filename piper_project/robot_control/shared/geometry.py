@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 
 SDK_DEG_FACTOR = 1000
+TOP_DOWN_TCP_ORIENTATION_DEG = (180.0, 0.0, 0.0)
 
 
 @dataclass(frozen=True)

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 
-from robot_control.shared.geometry import EndPose
+from robot_control.shared.geometry import EndPose, TOP_DOWN_TCP_ORIENTATION_DEG
 
 
 @dataclass(frozen=True)
@@ -20,9 +20,9 @@ class SimulatedMappingConfig:
     max_delta_x_mm: float = 40.0
     max_delta_y_mm: float = 40.0
     max_delta_z_mm: float = 30.0
-    rx_deg: float = 0.0
-    ry_deg: float = 85.0
-    rz_deg: float = 0.0
+    rx_deg: float = TOP_DOWN_TCP_ORIENTATION_DEG[0]
+    ry_deg: float = TOP_DOWN_TCP_ORIENTATION_DEG[1]
+    rz_deg: float = TOP_DOWN_TCP_ORIENTATION_DEG[2]
 
 
 def _clamp(value: float, limit: float) -> float:

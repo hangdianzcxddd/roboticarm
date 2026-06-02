@@ -18,9 +18,10 @@ from robot_control.linux.config.robot_config import RobotConfig
 from robot_control.linux.catch.tcp_offset import (
     build_catch_plan,
     j6_pose_for_tcp_pose,
+    rotation_matrix_xyz_deg,
     tcp_pose_for_j6_pose,
 )
-from robot_control.shared.geometry import EndPose
+from robot_control.shared.geometry import EndPose, TOP_DOWN_TCP_ORIENTATION_DEG
 from robot_control.shared.protocol import CameraPointCommand, make_camera_point_message
 from robot_control.shared.simulated_mapping import SimulatedMappingConfig
 
@@ -30,15 +31,20 @@ def make_args(**overrides: object) -> argparse.Namespace:
         "approach_height_mm": 40.0,
         "lift_height_mm": 60.0,
         "target_z_offset_mm": -5.0,
-        "rx_deg": 0.0,
-        "ry_deg": 85.0,
-        "rz_deg": 0.0,
+        "rx_deg": TOP_DOWN_TCP_ORIENTATION_DEG[0],
+        "ry_deg": TOP_DOWN_TCP_ORIENTATION_DEG[1],
+        "rz_deg": TOP_DOWN_TCP_ORIENTATION_DEG[2],
+        "use_current_orientation": False,
         "speed": 10,
         "approach_mode": "P",
         "grasp_mode": "L",
         "lift_mode": "L",
         "command_duration_s": 0.0,
         "command_period_s": 0.02,
+        "motion_timeout_s": 0.0,
+        "position_tolerance_mm": 8.0,
+        "orientation_tolerance_deg": 8.0,
+        "no_wait_waypoints": True,
         "print_feedback": False,
         "clear_gripper_error": False,
         "no_pre_open": False,
@@ -59,12 +65,33 @@ def make_args(**overrides: object) -> argparse.Namespace:
         "place_ry_deg": None,
         "place_rz_deg": None,
         "place_approach_height_mm": 50.0,
+        "stop_after_lift": False,
     }
     values.update(overrides)
     return argparse.Namespace(**values)
 
 
 class TestTcpOffset(unittest.TestCase):
+    def test_top_down_orientation_points_tool_z_to_base_negative_z(self):
+        tool_z_in_base = rotation_matrix_xyz_deg(*TOP_DOWN_TCP_ORIENTATION_DEG) @ np.array(
+            [0.0, 0.0, 1.0]
+        )
+
+        np.testing.assert_allclose(tool_z_in_base, [0.0, 0.0, -1.0], atol=1e-12)
+
+    def test_top_down_j6_pose_places_flange_above_tcp(self):
+        tcp_pose = EndPose(420.0, 150.0, 30.0, *TOP_DOWN_TCP_ORIENTATION_DEG)
+
+        j6_pose = j6_pose_for_tcp_pose(tcp_pose, (0.0, 0.0, 145.0))
+
+        self.assertAlmostEqual(j6_pose.x_mm, 420.0, places=9)
+        self.assertAlmostEqual(j6_pose.y_mm, 150.0, places=9)
+        self.assertAlmostEqual(j6_pose.z_mm, 175.0, places=9)
+        self.assertEqual(
+            (j6_pose.rx_deg, j6_pose.ry_deg, j6_pose.rz_deg),
+            TOP_DOWN_TCP_ORIENTATION_DEG,
+        )
+
     def test_j6_pose_for_tcp_pose_subtracts_offset_in_j6_frame(self):
         tcp_pose = EndPose(200.0, 10.0, 120.0, 0.0, 90.0, 0.0)
 
@@ -217,9 +244,9 @@ class TestCatchServer(unittest.TestCase):
             base_x_mm=250.0,
             base_y_mm=0.0,
             base_z_mm=250.0,
-            rx_deg=0.0,
-            ry_deg=85.0,
-            rz_deg=0.0,
+            rx_deg=TOP_DOWN_TCP_ORIENTATION_DEG[0],
+            ry_deg=TOP_DOWN_TCP_ORIENTATION_DEG[1],
+            rz_deg=TOP_DOWN_TCP_ORIENTATION_DEG[2],
         )
         sdk = FakePiperSdk()
         controller = PiperController(
