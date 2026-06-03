@@ -26,6 +26,32 @@ from robot_control.shared.protocol import CameraPointCommand, make_camera_point_
 from robot_control.shared.simulated_mapping import SimulatedMappingConfig
 
 
+class FakeEndPose:
+    def __init__(self, pose: EndPose) -> None:
+        self.X_axis = round(pose.x_mm * 1000)
+        self.Y_axis = round(pose.y_mm * 1000)
+        self.Z_axis = round(pose.z_mm * 1000)
+        self.RX_axis = round(pose.rx_deg * 1000)
+        self.RY_axis = round(pose.ry_deg * 1000)
+        self.RZ_axis = round(pose.rz_deg * 1000)
+
+
+class FakeEndPoseFeedback:
+    def __init__(self, pose: EndPose) -> None:
+        self.end_pose = FakeEndPose(pose)
+        self.time_stamp = 1.0
+        self.Hz = 50.0
+
+
+class FakeCatchPiperSdk(FakePiperSdk):
+    def __init__(self, pose: EndPose) -> None:
+        super().__init__()
+        self.end_pose_feedback = FakeEndPoseFeedback(pose)
+
+    def GetArmEndPoseMsgs(self):
+        return self.end_pose_feedback
+
+
 def make_args(**overrides: object) -> argparse.Namespace:
     values = {
         "approach_height_mm": 40.0,
@@ -66,6 +92,9 @@ def make_args(**overrides: object) -> argparse.Namespace:
         "place_rz_deg": None,
         "place_approach_height_mm": 50.0,
         "stop_after_lift": False,
+        "auto_top_down_yaw": True,
+        "staged_approach": False,
+        "stage_height_mm": 80.0,
     }
     values.update(overrides)
     return argparse.Namespace(**values)
@@ -248,7 +277,7 @@ class TestCatchServer(unittest.TestCase):
             ry_deg=TOP_DOWN_TCP_ORIENTATION_DEG[1],
             rz_deg=TOP_DOWN_TCP_ORIENTATION_DEG[2],
         )
-        sdk = FakePiperSdk()
+        sdk = FakeCatchPiperSdk(EndPose(250.0, 0.0, 250.0, 180.0, 0.0, 0.0))
         controller = PiperController(
             config=RobotConfig(command_interval_s=0, connect_timeout_s=0.1),
             sdk=sdk,
@@ -290,6 +319,45 @@ class TestCatchServer(unittest.TestCase):
             sorted(response["payload"]["catch"]["send_counts"]),
             ["approach", "grasp", "lift", "place", "place_approach", "place_retreat"],
         )
+
+    def test_execute_auto_top_down_yaw_keeps_current_reachable_rz_branch(self):
+        message = make_camera_point_message(
+            CameraPointCommand(x_m=0.0, y_m=0.0, z_m=0.3, command_id="cmd-yaw")
+        )
+        current_j6_pose = EndPose(48.833, 0.0, 168.837, 180.0, 66.354, 180.0)
+        sdk = FakeCatchPiperSdk(current_j6_pose)
+        controller = PiperController(
+            config=RobotConfig(command_interval_s=0, connect_timeout_s=0.1),
+            sdk=sdk,
+        )
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            response = handle_message(
+                message,
+                SimulatedMappingConfig(
+                    base_x_mm=150.0,
+                    base_y_mm=0.0,
+                    base_z_mm=220.0,
+                    rx_deg=TOP_DOWN_TCP_ORIENTATION_DEG[0],
+                    ry_deg=TOP_DOWN_TCP_ORIENTATION_DEG[1],
+                    rz_deg=TOP_DOWN_TCP_ORIENTATION_DEG[2],
+                ),
+                tcp_offset_j6_mm=(0.0, 0.0, 145.0),
+                execute=True,
+                controller=controller,
+                args=make_args(
+                    command_duration_s=0.0,
+                    no_gripper=True,
+                    stop_after_lift=True,
+                    no_wait_waypoints=True,
+                ),
+            )
+
+        self.assertEqual(response["payload"]["orientation_source"], "auto_top_down_yaw")
+        self.assertEqual(response["payload"]["target_tcp_pose"]["rx_deg"], 180.0)
+        self.assertEqual(response["payload"]["target_tcp_pose"]["ry_deg"], 0.0)
+        self.assertEqual(response["payload"]["target_tcp_pose"]["rz_deg"], 180.0)
+        self.assertEqual(response["payload"]["grasp_j6_pose"]["z_mm"], 360.0)
 
 
 if __name__ == "__main__":

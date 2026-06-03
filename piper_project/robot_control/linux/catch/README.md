@@ -136,13 +136,52 @@ python3 -m robot_control.linux.catch.set_gripper_zero --can can0 --yes --verify
 --set-open-zero-on-start
 ```
 
+## 不依赖相机的完整流程测试
+
+如果手眼标定或点击目标还不稳定，先用固定脚本验证完整动作链路：
+
+```bash
+python3 -m robot_control.linux.catch.scripted_catch_demo \
+  --can can0 \
+  --speed 5 \
+  --approach-height-mm 40 \
+  --descend-mm 15 \
+  --lift-height-mm 50 \
+  --place-dy-mm 30 \
+  --place-z-mm 80 \
+  --continue-on-waypoint-error \
+  --no-gripper \
+  --print-feedback
+```
+
+不加 `--execute` 时只连接读取当前位姿并打印所有目标 J6。确认目标都在安全范围内后再加：
+
+```bash
+--execute
+```
+
+默认抓取点会从当前 J6 附近推导：保持当前 J6 的 X/Y，只把目标姿态切成垂直向下，并小幅下降
+`--descend-mm`；随后上方 approach、下降、闭合、抬升、移动到附近放置点、松开、撤离。这个脚本不使用
+Windows 点击、相机深度或 `hand_eye_result.json`，适合先验证“机械臂能否完整跑完路径”。路径确认后去掉
+`--no-gripper`，再验证夹爪闭合和松开。不要一开始指定很远的 `--place-x-mm/--place-y-mm`，先用默认
+`--place-dy-mm 30` 在当前位置附近完成流程。
+
+如果某个 waypoint 已经接近但仍因为 8mm/8deg 阈值失败，`--continue-on-waypoint-error` 会打印警告并继续，
+用于先验证完整流程。等流程能跑完后再去掉这个参数，逐步收紧精度。
+
+如果启动时报 `Piper arm enable timed out`，先确认没有另一个 `catch_server` 或 demo 脚本还连着 `can0`。
+若机械臂本来已经处于使能状态，可以在 demo 命令中临时加 `--no-enable`，让脚本只连接反馈和下发命令，
+不再调用 `EnablePiper()`。如果机械臂未使能，`--no-enable` 不会让它运动。
+
 ## 常用调参
 
 - `--hand-eye-result robot_control/linux/hand_eye/hand_eye_result.json`：使用手眼标定 `camera -> base` 变换。
 - `--tcp-offset-z-mm 145`：官方夹爪默认值，等于 `0.145 m`。
 - `--approach-height-mm 50`：先移动到目标 TCP 上方多少毫米。
 - `--lift-height-mm 50`：抓取后抬升多少毫米。
-- `--rx-deg 180 --ry-deg 0 --rz-deg 0`：默认 Top-Down 抓取姿态，工具 Z 轴指向机器人基座 `-Z`，即夹爪垂直向下。
+- `--rx-deg 180 --ry-deg 0 --rz-deg 0`：默认 Top-Down 抓取姿态，工具 Z 轴指向机器人基座 `-Z`，即夹爪垂直向下。执行时默认会自动保留当前 `rz` 分支，例如当前反馈 `rz=180` 时会使用等价的 `rx=180 ry=0 rz=180`，避免第一步因为欧拉角分支大跳变而不动。
+- `--no-auto-top-down-yaw`：关闭上面的自动 `rz` 分支选择，严格使用命令行给出的 `--rx-deg/--ry-deg/--rz-deg`。
+- `--stage-height-mm 80`：执行抓取前先用当前姿态抬高并移动到目标上方，再切换到抓取姿态。默认开启；如果要恢复直接去 approach，可加 `--no-staged-approach`。
 - `--target-z-offset-mm 0`：对点击点做额外 Z 修正。负数表示更低。
 - `--open-command-mm 0`：张开命令。完全张开设零后，`0 mm` 表示张开。
 - `--grasp-command-mm -100`：抓取闭合命令。完全张开设零后，`-100 mm` 表示向闭合方向走 100 mm。
@@ -199,7 +238,7 @@ pos_err=217.509 mm ori_err=0.000 deg
 - `target`：本次下发给机械臂的目标 J6 位姿。
 - `last`：等待超时前最后一次读到的 J6 反馈。
 - `pos_err`：`target` 和 `last` 的位置距离。这个值小于 `--position-tolerance-mm` 才认为位置到达。
-- `ori_err`：`target` 和 `last` 的最大姿态角误差。这个值小于 `--orientation-tolerance-deg` 才认为姿态到达。
+- `ori_err`：`target` 和 `last` 的旋转角误差。这个值小于 `--orientation-tolerance-deg` 才认为姿态到达。
 
 上面这个例子里，`ori_err=0`，说明姿态没有问题；`pos_err=217.509 mm`，而且 `last` 和
 `Before catch J6` 完全一样，说明机械臂没有朝第一个目标移动。此时优先排查运动控制状态、
@@ -209,6 +248,10 @@ pos_err=217.509 mm ori_err=0.000 deg
 `--rx-deg/--ry-deg/--rz-deg`。例如 `Catch args` 中即使显示 `rx_deg=180.0 ry_deg=0.0 rz_deg=0.0`，
 只要 `use_current_orientation=True`，实际 waypoint 仍会使用 `Before catch J6` 对应的当前姿态。
 如果要测试默认 Top-Down 垂直向下抓取，去掉 `--use-current-orientation`。
+
+默认 Top-Down 执行还会打印 `orientation=auto_top_down_yaw`。这表示目标仍然是垂直向下，但 `rz`
+会贴近当前反馈分支。以你的日志 `rx=180 ry=66 rz=180` 为例，旧目标 `rx=180 ry=0 rz=0`
+需要 180 度姿态跳变；自动分支会改成 `rx=180 ry=0 rz=180`，更容易被 Piper 接受。
 
 ## 按现象调试
 

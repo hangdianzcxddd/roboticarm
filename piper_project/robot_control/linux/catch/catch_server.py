@@ -15,6 +15,7 @@ from robot_control.linux.catch.tcp_offset import (
     OFFICIAL_GRIPPER_TCP_OFFSET_MM,
     CatchPlan,
     build_catch_plan,
+    rotation_matrix_xyz_deg,
     tcp_pose_for_j6_pose,
 )
 from robot_control.linux.catch.set_gripper_zero import set_gripper_zero
@@ -51,6 +52,14 @@ class PlacePlan:
     place_j6_pose: EndPose
     approach_j6_pose: EndPose
     retreat_j6_pose: EndPose
+
+
+@dataclass(frozen=True)
+class TargetOrientation:
+    rx_deg: float
+    ry_deg: float
+    rz_deg: float
+    source: str
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -128,6 +137,17 @@ def build_parser() -> argparse.ArgumentParser:
             "for first hand-eye motion tests because it avoids large orientation jumps."
         ),
     )
+    parser.add_argument(
+        "--no-auto-top-down-yaw",
+        dest="auto_top_down_yaw",
+        action="store_false",
+        help=(
+            "Keep the exact --rx-deg/--ry-deg/--rz-deg values. By default, when "
+            "the requested orientation is top-down, execution keeps the current "
+            "reachable yaw/roll Euler branch while forcing the tool Z axis down."
+        ),
+    )
+    parser.set_defaults(auto_top_down_yaw=True)
     parser.add_argument("--tcp-offset-x-mm", type=float, default=0.0)
     parser.add_argument("--tcp-offset-y-mm", type=float, default=0.0)
     parser.add_argument(
@@ -192,6 +212,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--clear-gripper-error", action="store_true")
     parser.add_argument("--no-pre-open", action="store_true")
     parser.add_argument("--no-gripper", action="store_true")
+    parser.add_argument(
+        "--no-staged-approach",
+        dest="staged_approach",
+        action="store_false",
+        help=(
+            "Move directly to the target approach pose. By default, execution "
+            "first lifts and aligns above the target using the current orientation."
+        ),
+    )
+    parser.set_defaults(staged_approach=True)
+    parser.add_argument(
+        "--stage-height-mm",
+        type=float,
+        default=80.0,
+        help="minimum J6 lift before the auto staged approach XY alignment",
+    )
     return parser
 
 
@@ -243,6 +279,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--lift-height-mm must be >= 0")
     if args.place_approach_height_mm < 0:
         raise ValueError("--place-approach-height-mm must be >= 0")
+    if getattr(args, "stage_height_mm", 0.0) < 0:
+        raise ValueError("--stage-height-mm must be >= 0")
     for option_name, value in (
         ("--open-command-mm", args.open_command_mm),
         ("--grasp-command-mm", args.grasp_command_mm),
@@ -280,6 +318,90 @@ def release_command_mm(args: argparse.Namespace) -> float:
         if args.release_command_mm is None
         else args.release_command_mm
     )
+
+
+def requested_orientation_from_context(
+    args: argparse.Namespace,
+    mapping_config: SimulatedMappingConfig,
+    hand_eye_camera_to_base: Any | None,
+) -> TargetOrientation:
+    if hand_eye_camera_to_base is None:
+        return TargetOrientation(
+            float(mapping_config.rx_deg),
+            float(mapping_config.ry_deg),
+            float(mapping_config.rz_deg),
+            "mapping",
+        )
+    return TargetOrientation(
+        float(args.rx_deg),
+        float(args.ry_deg),
+        float(args.rz_deg),
+        "args",
+    )
+
+
+def resolve_target_orientation(
+    requested: TargetOrientation,
+    args: argparse.Namespace,
+    controller: PiperController | None,
+    tcp_offset_j6_mm: Sequence[float],
+    execute: bool,
+) -> TargetOrientation:
+    if args.use_current_orientation:
+        if controller is None:
+            raise RuntimeError("--use-current-orientation requires a controller")
+        current_tcp_pose = tcp_pose_for_j6_pose(
+            read_current_j6_pose(controller),
+            tcp_offset_j6_mm,
+        )
+        return TargetOrientation(
+            current_tcp_pose.rx_deg,
+            current_tcp_pose.ry_deg,
+            current_tcp_pose.rz_deg,
+            "current",
+        )
+
+    if (
+        execute
+        and controller is not None
+        and getattr(args, "auto_top_down_yaw", False)
+        and orientation_points_tool_z_down(requested)
+    ):
+        current_tcp_pose = tcp_pose_for_j6_pose(
+            read_current_j6_pose(controller),
+            tcp_offset_j6_mm,
+        )
+        return TargetOrientation(
+            180.0,
+            0.0,
+            normalize_deg(current_tcp_pose.rz_deg),
+            "auto_top_down_yaw",
+        )
+
+    return requested
+
+
+def orientation_points_tool_z_down(
+    orientation: TargetOrientation,
+    tolerance_deg: float = 2.0,
+) -> bool:
+    tool_z = rotation_matrix_xyz_deg(
+        orientation.rx_deg,
+        orientation.ry_deg,
+        orientation.rz_deg,
+    ) @ (0.0, 0.0, 1.0)
+    dot = float(tool_z[2] * -1.0)
+    angle_deg = math.degrees(math.acos(max(-1.0, min(1.0, dot))))
+    return angle_deg <= tolerance_deg
+
+
+def normalize_deg(value: float) -> float:
+    normalized = float(value)
+    while normalized > 180.0:
+        normalized -= 360.0
+    while normalized < -180.0:
+        normalized += 360.0
+    return normalized
 
 
 def feedback_to_pose(feedback: Any) -> EndPose | None:
@@ -357,6 +479,65 @@ def execute_waypoint(
     return send_count
 
 
+def execute_staged_approach(
+    controller: PiperController,
+    catch_plan: CatchPlan,
+    args: argparse.Namespace,
+) -> dict[str, int]:
+    current_j6_pose = read_current_j6_pose(controller)
+    first_stage_z_mm = min(
+        current_j6_pose.z_mm + args.stage_height_mm,
+        max(current_j6_pose.z_mm, catch_plan.approach_j6_pose.z_mm),
+        controller.config.z_limit_mm.max_value,
+    )
+    target_stage_z_mm = max(first_stage_z_mm, catch_plan.approach_j6_pose.z_mm)
+    target_stage_z_mm = min(target_stage_z_mm, controller.config.z_limit_mm.max_value)
+    stage_lift_pose = replace(current_j6_pose, z_mm=first_stage_z_mm)
+    stage_xy_pose = EndPose(
+        catch_plan.approach_j6_pose.x_mm,
+        catch_plan.approach_j6_pose.y_mm,
+        first_stage_z_mm,
+        current_j6_pose.rx_deg,
+        current_j6_pose.ry_deg,
+        current_j6_pose.rz_deg,
+    )
+    stage_target_lift_pose = replace(stage_xy_pose, z_mm=target_stage_z_mm)
+    stage_orient_pose = EndPose(
+        catch_plan.approach_j6_pose.x_mm,
+        catch_plan.approach_j6_pose.y_mm,
+        target_stage_z_mm,
+        catch_plan.approach_j6_pose.rx_deg,
+        catch_plan.approach_j6_pose.ry_deg,
+        catch_plan.approach_j6_pose.rz_deg,
+    )
+    staged_counts: dict[str, int] = {}
+    for label, pose, mode in (
+        ("stage_lift", stage_lift_pose, "P"),
+        ("stage_xy", stage_xy_pose, args.approach_mode),
+        ("stage_target_lift", stage_target_lift_pose, "P"),
+        ("stage_orient", stage_orient_pose, "P"),
+    ):
+        if poses_are_close(
+            current_j6_pose,
+            pose,
+            position_tolerance_mm=args.position_tolerance_mm,
+            orientation_tolerance_deg=args.orientation_tolerance_deg,
+        ):
+            staged_counts[label] = 0
+            continue
+        controller.validate_pose(pose)
+        staged_counts[label] = execute_waypoint(
+            controller,
+            label,
+            pose,
+            args.speed,
+            mode,
+            args,
+        )
+        current_j6_pose = pose
+    return staged_counts
+
+
 def wait_until_pose_reached(
     controller: PiperController,
     label: str,
@@ -386,7 +567,7 @@ def wait_until_pose_reached(
     raise RuntimeError(
         f"waypoint {label} not reached: target={format_pose(target)} "
         f"last={format_pose(last_pose)} pos_err={position_error:.3f} mm "
-        f"ori_err={orientation_error:.3f} deg"
+        f"ori_err={orientation_error:.3f} deg {format_status(controller)}"
     )
 
 
@@ -396,12 +577,37 @@ def pose_errors(target: EndPose, actual: EndPose) -> tuple[float, float]:
         + (actual.y_mm - target.y_mm) ** 2
         + (actual.z_mm - target.z_mm) ** 2
     )
-    orientation_error = max(
-        abs(actual.rx_deg - target.rx_deg),
-        abs(actual.ry_deg - target.ry_deg),
-        abs(actual.rz_deg - target.rz_deg),
-    )
+    orientation_error = rotation_angle_error_deg(target, actual)
     return position_error, orientation_error
+
+
+def rotation_angle_error_deg(target: EndPose, actual: EndPose) -> float:
+    target_rotation = rotation_matrix_xyz_deg(
+        target.rx_deg,
+        target.ry_deg,
+        target.rz_deg,
+    )
+    actual_rotation = rotation_matrix_xyz_deg(
+        actual.rx_deg,
+        actual.ry_deg,
+        actual.rz_deg,
+    )
+    relative_rotation = target_rotation.T @ actual_rotation
+    cosine = (float(relative_rotation.trace()) - 1.0) / 2.0
+    return math.degrees(math.acos(max(-1.0, min(1.0, cosine))))
+
+
+def poses_are_close(
+    target: EndPose,
+    actual: EndPose,
+    position_tolerance_mm: float,
+    orientation_tolerance_deg: float,
+) -> bool:
+    position_error, orientation_error = pose_errors(target, actual)
+    return (
+        position_error <= position_tolerance_mm
+        and orientation_error <= orientation_tolerance_deg
+    )
 
 
 def build_place_plan(
@@ -505,6 +711,9 @@ def execute_catch_plan(
             )
             time.sleep(args.gripper_settle_s)
 
+    if getattr(args, "staged_approach", False):
+        counts.update(execute_staged_approach(controller, catch_plan, args))
+
     counts["approach"] = execute_waypoint(
         controller,
         "approach",
@@ -594,29 +803,29 @@ def handle_message(
     hand_eye_camera_to_base: Any | None = None,
 ) -> dict[str, Any]:
     command = camera_point_from_message(message)
-    rx_deg = args.rx_deg
-    ry_deg = args.ry_deg
-    rz_deg = args.rz_deg
-    if args.use_current_orientation:
-        if controller is None:
-            raise RuntimeError("--use-current-orientation requires a controller")
-        current_tcp_pose = tcp_pose_for_j6_pose(
-            read_current_j6_pose(controller),
-            tcp_offset_j6_mm,
-        )
-        rx_deg = current_tcp_pose.rx_deg
-        ry_deg = current_tcp_pose.ry_deg
-        rz_deg = current_tcp_pose.rz_deg
+    requested_orientation = requested_orientation_from_context(
+        args,
+        mapping_config,
+        hand_eye_camera_to_base,
+    )
+    target_orientation = resolve_target_orientation(
+        requested_orientation,
+        args,
+        controller,
+        tcp_offset_j6_mm,
+        execute,
+    )
 
     if hand_eye_camera_to_base is None:
         target_tcp_pose = camera_xyz_to_simulated_robot_pose(
             command.x_m,
             command.y_m,
             command.z_m,
-            (
-                replace(mapping_config, rx_deg=rx_deg, ry_deg=ry_deg, rz_deg=rz_deg)
-                if args.use_current_orientation
-                else mapping_config
+            replace(
+                mapping_config,
+                rx_deg=target_orientation.rx_deg,
+                ry_deg=target_orientation.ry_deg,
+                rz_deg=target_orientation.rz_deg,
             ),
         )
         mapping_source = "simulated"
@@ -626,9 +835,9 @@ def handle_message(
             command.y_m,
             command.z_m,
             hand_eye_camera_to_base,
-            rx_deg=rx_deg,
-            ry_deg=ry_deg,
-            rz_deg=rz_deg,
+            rx_deg=target_orientation.rx_deg,
+            ry_deg=target_orientation.ry_deg,
+            rz_deg=target_orientation.rz_deg,
         )
         mapping_source = "hand_eye"
     plan = build_catch_plan(
@@ -656,6 +865,7 @@ def handle_message(
         "camera_xyz="
         f"({command.x_m:.4f}, {command.y_m:.4f}, {command.z_m:.4f}) m -> "
         f"mapping={mapping_source} "
+        f"orientation={target_orientation.source} "
         f"target_tcp={format_pose(plan.target_tcp_pose)} "
         f"grasp_j6={format_pose(plan.grasp_j6_pose)}",
         flush=True,
@@ -680,6 +890,7 @@ def handle_message(
                 "z_mm": float(tcp_offset_j6_mm[2]),
             },
             "mapping_source": mapping_source,
+            "orientation_source": target_orientation.source,
             "catch": {
                 "send_counts": send_counts,
                 "open_command_mm": args.open_command_mm,
@@ -789,6 +1000,42 @@ def pose_delta(before: EndPose | None, after: EndPose | None) -> str:
         f"dry={after.ry_deg - before.ry_deg:.3f} "
         f"drz={after.rz_deg - before.rz_deg:.3f}"
     )
+
+
+def format_status(controller: PiperController) -> str:
+    feedback = controller.get_status()
+    status = getattr(feedback, "arm_status", None)
+    if status is None:
+        return "status=unavailable"
+    err_status = getattr(status, "err_status", None)
+    fields = (
+        f"status_hz={float(getattr(feedback, 'Hz', 0.0)):.1f}",
+        f"ctrl_mode={getattr(status, 'ctrl_mode', None)}",
+        f"arm_status={getattr(status, 'arm_status', None)}",
+        f"mode_feed={getattr(status, 'mode_feed', None)}",
+        f"teach_status={getattr(status, 'teach_status', None)}",
+        f"motion_status={getattr(status, 'motion_status', None)}",
+        f"err_code={getattr(status, 'err_code', None)}",
+    )
+    problems = []
+    if err_status is not None:
+        for name in (
+            "joint_1_angle_limit",
+            "joint_2_angle_limit",
+            "joint_3_angle_limit",
+            "joint_4_angle_limit",
+            "joint_5_angle_limit",
+            "joint_6_angle_limit",
+            "communication_status_joint_1",
+            "communication_status_joint_2",
+            "communication_status_joint_3",
+            "communication_status_joint_4",
+            "communication_status_joint_5",
+            "communication_status_joint_6",
+        ):
+            if getattr(err_status, name, False):
+                problems.append(name)
+    return " ".join(fields) + f" err_flags={','.join(problems) if problems else 'none'}"
 
 
 def main() -> None:
