@@ -144,27 +144,53 @@ python3 -m robot_control.linux.catch.set_gripper_zero --can can0 --yes --verify
 python3 -m robot_control.linux.catch.scripted_catch_demo \
   --can can0 \
   --speed 5 \
-  --approach-height-mm 40 \
+  --approach-height-mm 50 \
   --descend-mm 15 \
-  --lift-height-mm 50 \
-  --place-dy-mm 30 \
+  --lift-height-mm 60 \
+  --place-dy-mm 40 \
   --place-z-mm 80 \
+  --stage-height-mm 60 \
   --continue-on-waypoint-error \
   --no-gripper \
   --print-feedback
 ```
 
-不加 `--execute` 时只连接读取当前位姿并打印所有目标 J6。确认目标都在安全范围内后再加：
+不加 `--execute` 时只连接读取当前位姿，打印抓取 TCP、放置 TCP 和所有目标 J6，并在发送命令前做
+XYZ、姿态、水平半径和可选保守高度/半径边界检查。确认目标都在安全范围内后再加：
 
 ```bash
 --execute
 ```
 
-默认抓取点会从当前 J6 附近推导：保持当前 J6 的 X/Y，只把目标姿态切成垂直向下，并小幅下降
-`--descend-mm`；随后上方 approach、下降、闭合、抬升、移动到附近放置点、松开、撤离。这个脚本不使用
-Windows 点击、相机深度或 `hand_eye_result.json`，适合先验证“机械臂能否完整跑完路径”。路径确认后去掉
-`--no-gripper`，再验证夹爪闭合和松开。不要一开始指定很远的 `--place-x-mm/--place-y-mm`，先用默认
-`--place-dy-mm 30` 在当前位置附近完成流程。
+默认抓取 TCP 使用固定安全测试点 `x=300 mm, y=0 mm, z=80 mm`，姿态默认保持当前 J6 的
+`rx/ry/rz`；随后执行 approach、下降、闭合、抬升、移动到附近放置点、松开、撤离、恢复起始姿态并回到起始
+J6。这个脚本不使用 Windows 点击、相机深度或 `hand_eye_result.json`，适合先验证“机械臂能否完整跑完路径”。
+路径确认后去掉 `--no-gripper`，再验证夹爪闭合和松开。不要一开始指定很远的 `--place-x-mm/--place-y-mm`，
+先用默认 `--place-dy-mm 40` 在当前位置附近完成流程。
+
+如果你已经量到一组明确可达的基座坐标，可以直接输入抓取/放置 TCP。建议仍然先 dry-run：
+
+```bash
+python3 -m robot_control.linux.catch.scripted_catch_demo \
+  --can can0 \
+  --speed 5 \
+  --target-x-mm 180 \
+  --target-y-mm 0 \
+  --target-z-mm 40 \
+  --place-x-mm 180 \
+  --place-y-mm 40 \
+  --place-z-mm 80 \
+  --approach-height-mm 50 \
+  --lift-height-mm 60 \
+  --no-gripper \
+  --print-feedback
+```
+
+若现场某些区域虽然在官方半径内但 IK 经常失败，可以加更保守的边界，例如：
+
+```bash
+--min-horizontal-radius-mm 80 --max-horizontal-radius-mm 500 --min-j6-z-mm 80 --max-j6-z-mm 500
+```
 
 如果某个 waypoint 已经接近但仍因为 8mm/8deg 阈值失败，`--continue-on-waypoint-error` 会打印警告并继续，
 用于先验证完整流程。等流程能跑完后再去掉这个参数，逐步收紧精度。

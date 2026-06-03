@@ -157,6 +157,35 @@ class TestTcpOffset(unittest.TestCase):
             atol=1e-9,
         )
 
+    def test_tcp_offset_helpers_default_none_angles_to_zero(self):
+        tcp_pose = EndPose(200.0, 10.0, 120.0, None, None, None)
+
+        j6_pose = j6_pose_for_tcp_pose(tcp_pose, (0.0, 0.0, 145.0))
+        round_trip = tcp_pose_for_j6_pose(
+            EndPose(200.0, 10.0, 120.0, None, None, None),
+            (0.0, 0.0, 145.0),
+        )
+        plan = build_catch_plan(
+            tcp_pose,
+            offset_j6_tcp_mm=(0.0, 0.0, 145.0),
+            approach_height_mm=40.0,
+            lift_height_mm=60.0,
+        )
+
+        self.assertEqual((j6_pose.rx_deg, j6_pose.ry_deg, j6_pose.rz_deg), (0.0, 0.0, 0.0))
+        self.assertEqual(
+            (round_trip.rx_deg, round_trip.ry_deg, round_trip.rz_deg),
+            (0.0, 0.0, 0.0),
+        )
+        self.assertEqual(
+            (
+                plan.target_tcp_pose.rx_deg,
+                plan.approach_tcp_pose.ry_deg,
+                plan.grasp_j6_pose.rz_deg,
+            ),
+            (0.0, 0.0, 0.0),
+        )
+
     def test_build_catch_plan_offsets_tcp_waypoints(self):
         target = EndPose(220.0, 0.0, 200.0, 0.0, 0.0, 0.0)
 
