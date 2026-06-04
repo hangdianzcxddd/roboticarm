@@ -8,6 +8,8 @@ from typing import Any, Optional, Tuple
 
 import numpy as np
 
+from robot_control.windows.vision.d435i_intrinsics import PinholeIntrinsics
+
 
 @dataclass(frozen=True)
 class CameraPoint:
@@ -109,6 +111,7 @@ def deproject_pixel_to_camera_xyz(
     u: int,
     v: int,
     sample_radius: int = 0,
+    intrinsics: PinholeIntrinsics | None = None,
 ) -> CameraPoint:
     """Convert an aligned RGB pixel to RealSense camera-frame XYZ in meters."""
 
@@ -123,13 +126,24 @@ def deproject_pixel_to_camera_xyz(
     if depth_m <= 0.0 or not np.isfinite(depth_m):
         raise ValueError(f"invalid depth at pixel ({u}, {v}): {depth_m:.6f} m")
 
-    intrinsics = depth_frame.profile.as_video_stream_profile().intrinsics
-    rs = _require_realsense()
-    x_m, y_m, z_m = rs.rs2_deproject_pixel_to_point(
-        intrinsics,
-        [float(u), float(v)],
-        float(depth_m),
-    )
+    if intrinsics is None:
+        rs_intrinsics = depth_frame.profile.as_video_stream_profile().intrinsics
+        rs = _require_realsense()
+        x_m, y_m, z_m = rs.rs2_deproject_pixel_to_point(
+            rs_intrinsics,
+            [float(u), float(v)],
+            float(depth_m),
+        )
+    else:
+        if intrinsics.width != width or intrinsics.height != height:
+            raise ValueError(
+                "intrinsics resolution "
+                f"{intrinsics.width}x{intrinsics.height} does not match depth frame "
+                f"{width}x{height}"
+            )
+        x_m = (float(u) - intrinsics.ppx) / intrinsics.fx * depth_m
+        y_m = (float(v) - intrinsics.ppy) / intrinsics.fy * depth_m
+        z_m = depth_m
     return CameraPoint(
         u=u,
         v=v,

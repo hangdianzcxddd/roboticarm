@@ -11,6 +11,7 @@ Left-click the aligned RGB image to send the camera XYZ point to the Linux-side
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 from typing import Any, Optional, Tuple
 
 import cv2
@@ -23,6 +24,12 @@ from robot_control.windows.vision.depth import (
     deproject_pixel_to_camera_xyz,
     format_camera_point,
     wait_for_aligned_rgb_depth,
+)
+from robot_control.windows.vision.d435i_intrinsics import (
+    DEFAULT_D435I_PARA,
+    PinholeIntrinsics,
+    find_d435i_intrinsics,
+    format_intrinsics,
 )
 
 
@@ -37,11 +44,13 @@ class ClickTcpSender:
         port: int,
         sample_radius: int,
         timeout_s: float,
+        intrinsics: PinholeIntrinsics | None,
     ) -> None:
         self.host = host
         self.port = port
         self.sample_radius = sample_radius
         self.timeout_s = timeout_s
+        self.intrinsics = intrinsics
         self.depth_frame: Optional[Any] = None
         self.last_point: Optional[CameraPoint] = None
         self.last_error: Optional[str] = None
@@ -67,6 +76,7 @@ class ClickTcpSender:
                 u,
                 v,
                 sample_radius=self.sample_radius,
+                intrinsics=self.intrinsics,
             )
             response = send_camera_point(
                 self.host,
@@ -114,6 +124,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--fps", type=int, default=30)
+    parser.add_argument(
+        "--intrinsics-json",
+        type=Path,
+        default=DEFAULT_D435I_PARA,
+        help="D435i parameter JSON used to select rectified fx/fy/ppx/ppy by width/height",
+    )
+    parser.add_argument(
+        "--use-realsense-intrinsics",
+        action="store_true",
+        help="ignore --intrinsics-json and use intrinsics reported by the RealSense frame",
+    )
     parser.add_argument("--frame-timeout-ms", type=int, default=10000)
     parser.add_argument("--sample-radius", type=int, default=3)
     parser.add_argument("--max-depth-m", type=float, default=1.5)
@@ -183,6 +204,17 @@ def draw_status(image: Any, sender: ClickTcpSender) -> None:
 
 def main() -> None:
     args = build_parser().parse_args()
+    intrinsics = None
+    if not args.use_realsense_intrinsics:
+        intrinsics = find_d435i_intrinsics(
+            args.width,
+            args.height,
+            args.intrinsics_json,
+        )
+        print(f"Using D435i rectified intrinsics: {format_intrinsics(intrinsics)}", flush=True)
+    else:
+        print("Using RealSense frame-reported intrinsics.", flush=True)
+
     pipeline, align = create_aligned_rgb_depth_stream(
         width=args.width,
         height=args.height,
@@ -193,6 +225,7 @@ def main() -> None:
         port=args.port,
         sample_radius=args.sample_radius,
         timeout_s=args.timeout_s,
+        intrinsics=intrinsics,
     )
 
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
