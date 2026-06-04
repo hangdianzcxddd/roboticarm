@@ -28,7 +28,8 @@ J6 -> gripper TCP: x=0 mm, y=0 mm, z=145 mm
 - 不加 `--hand-eye-result` 时，仍使用 `shared/simulated_mapping.py` 的临时映射。
 - `--use-current-pose-as-base` 只适用于临时映射，不能和 `--hand-eye-result` 同时使用。
 - 默认假设你已经把“完全张开 100 mm”的物理位置设为了夹爪零点；此时 `0 mm` 命令表示完全张开，`-100 mm` 命令表示向闭合方向运动。
-- 默认放置 TCP 点为 `x=0 mm, y=150 mm, z=150 mm`，即机器人基座左侧 15 cm、高 15 cm。若现场坐标方向相反，把 `--place-y-mm` 改成 `-150`。
+- 执行时如果没有传 `--rx-deg/--ry-deg/--rz-deg`，目标 TCP 姿态默认沿用当前反馈姿态，避免大角度翻转。
+- 默认放置 TCP 点为点击目标的 `x + 0 mm, y - 100 mm, z=80 mm`。若现场坐标方向相反，改 `--place-dy-mm` 或显式传 `--place-x-mm/--place-y-mm/--place-z-mm`。
 - 第一次执行前请用很低速度、小位移、空场景测试。
 
 ## Linux 侧命令：使用手眼标定结果
@@ -47,24 +48,18 @@ python3 -m robot_control.linux.catch.catch_server \
   --command-duration-s 1.0 \
   --command-period-s 0.02 \
   --print-feedback \
-  --rx-deg 180 \
-  --ry-deg 0 \
-  --rz-deg 0 \
-  --target-z-offset-mm 20 \
-  --approach-height-mm 60 \
-  --lift-height-mm 60 \
+  --target-z-offset-mm 40 \
+  --approach-height-mm 40 \
+  --lift-height-mm 40 \
   --open-command-mm 0 \
   --grasp-command-mm -100 \
   --release-command-mm 0 \
-  --grasp-effort-nm 1.5 \
-  --place-x-mm 0 \
-  --place-y-mm 150 \
-  --place-z-mm 150
+  --grasp-effort-nm 1.5
 ```
 
 确认目标点正确后，再加 `--execute`。初次实抓建议保留
-`--target-z-offset-mm 20`，让夹爪先抓目标上方 20 mm 附近，确认 XY 方向正确后
-逐步调到 `0` 或负值：
+`--target-z-offset-mm 40`，让夹爪先抓目标上方 40 mm 附近，确认 XY 方向正确后
+逐步调小：
 
 ```bash
 python3 -m robot_control.linux.catch.catch_server \
@@ -77,19 +72,13 @@ python3 -m robot_control.linux.catch.catch_server \
   --command-duration-s 1.5 \
   --command-period-s 0.02 \
   --print-feedback \
-  --rx-deg 180 \
-  --ry-deg 0 \
-  --rz-deg 0 \
-  --target-z-offset-mm 20 \
-  --approach-height-mm 60 \
-  --lift-height-mm 60 \
+  --target-z-offset-mm 40 \
+  --approach-height-mm 40 \
+  --lift-height-mm 40 \
   --open-command-mm 0 \
   --grasp-command-mm -100 \
   --release-command-mm 0 \
-  --grasp-effort-nm 1.5 \
-  --place-x-mm 0 \
-  --place-y-mm 150 \
-  --place-z-mm 150
+  --grasp-effort-nm 1.5
 ```
 
 ## Linux 侧命令：旧临时映射
@@ -103,7 +92,7 @@ python3 -m robot_control.linux.catch.catch_server \
   --host 0.0.0.0 \
   --port 5005 \
   --execute \
-  --speed 10 \
+  --speed 5 \
   --use-current-pose-as-base \
   --max-delta-x-mm 20 \
   --max-delta-y-mm 20 \
@@ -114,10 +103,7 @@ python3 -m robot_control.linux.catch.catch_server \
   --open-command-mm 0 \
   --grasp-command-mm -100 \
   --release-command-mm 0 \
-  --grasp-effort-nm 1.5 \
-  --place-x-mm 0 \
-  --place-y-mm 150 \
-  --place-z-mm 150
+  --grasp-effort-nm 1.5
 ```
 
 ## 单独设置夹爪零点
@@ -203,19 +189,21 @@ python3 -m robot_control.linux.catch.scripted_catch_demo \
 
 - `--hand-eye-result robot_control/linux/hand_eye/hand_eye_result.json`：使用手眼标定 `camera -> base` 变换。
 - `--tcp-offset-z-mm 145`：官方夹爪默认值，等于 `0.145 m`。
-- `--approach-height-mm 50`：先移动到目标 TCP 上方多少毫米。
-- `--lift-height-mm 50`：抓取后抬升多少毫米。
-- `--rx-deg 180 --ry-deg 0 --rz-deg 0`：默认 Top-Down 抓取姿态，工具 Z 轴指向机器人基座 `-Z`，即夹爪垂直向下。执行时默认会自动保留当前 `rz` 分支，例如当前反馈 `rz=180` 时会使用等价的 `rx=180 ry=0 rz=180`，避免第一步因为欧拉角分支大跳变而不动。
+- `--approach-height-mm 40`：先移动到目标 TCP 上方多少毫米。
+- `--lift-height-mm 40`：抓取后抬升多少毫米。
+- 不传 `--rx-deg/--ry-deg/--rz-deg`：执行时默认沿用当前 TCP 姿态，适合手眼抓取初调，避免机械臂姿态翻转过大。
+- `--rx-deg 180 --ry-deg 0 --rz-deg 0`：显式 Top-Down 抓取姿态，工具 Z 轴指向机器人基座 `-Z`，即夹爪垂直向下。执行时默认会自动保留当前 `rz` 分支，例如当前反馈 `rz=180` 时会使用等价的 `rx=180 ry=0 rz=180`。
 - `--no-auto-top-down-yaw`：关闭上面的自动 `rz` 分支选择，严格使用命令行给出的 `--rx-deg/--ry-deg/--rz-deg`。
-- `--stage-height-mm 80`：执行抓取前先用当前姿态抬高并移动到目标上方，再切换到抓取姿态。默认开启；如果要恢复直接去 approach，可加 `--no-staged-approach`。
-- `--target-z-offset-mm 0`：对点击点做额外 Z 修正。负数表示更低。
+- `--max-orientation-jump-deg 45`：拒绝相邻 J6 waypoint 之间超过 45 度的姿态跳变；显式 top-down 调试时可临时放宽。
+- `--stage-height-mm 60`：执行抓取前先用当前姿态抬高并移动到目标上方，再切换到抓取姿态。默认开启；如果要恢复直接去 approach，可加 `--no-staged-approach`。
+- `--target-z-offset-mm 40`：对点击点做额外 Z 修正。值越小，抓取 TCP 越接近点击点。
 - `--open-command-mm 0`：张开命令。完全张开设零后，`0 mm` 表示张开。
 - `--grasp-command-mm -100`：抓取闭合命令。完全张开设零后，`-100 mm` 表示向闭合方向走 100 mm。
 - `--release-command-mm 0`：放置时松开命令。
 - `--effort-nm 1.0`：默认夹爪力矩。
 - `--grasp-effort-nm 1.5`：抓取闭合力矩，可单独覆盖。
 - `--release-effort-nm 0.4`：松开力矩，可单独覆盖。
-- `--place-x-mm 0 --place-y-mm 150 --place-z-mm 150`：放置 TCP 点。
+- `--place-dx-mm 0 --place-dy-mm -100 --place-z-mm 80`：默认相对目标的放置 TCP 点；也可用 `--place-x-mm/--place-y-mm` 固定到绝对基座坐标。
 - `--place-approach-height-mm 50`：放置点上方的进退高度。
 - `--clear-gripper-error`：抓取前先发夹爪清错。
 - `--no-gripper`：只移动机械臂，不执行夹爪张合。
@@ -270,10 +258,10 @@ pos_err=217.509 mm ori_err=0.000 deg
 `Before catch J6` 完全一样，说明机械臂没有朝第一个目标移动。此时优先排查运动控制状态、
 目标是否可达、Y 方向是否超出当前姿态可达范围，而不是排查 Windows 是否连接成功。
 
-注意：如果启动时带了 `--use-current-orientation`，抓取目标会使用当前反馈姿态，覆盖
-`--rx-deg/--ry-deg/--rz-deg`。例如 `Catch args` 中即使显示 `rx_deg=180.0 ry_deg=0.0 rz_deg=0.0`，
-只要 `use_current_orientation=True`，实际 waypoint 仍会使用 `Before catch J6` 对应的当前姿态。
-如果要测试默认 Top-Down 垂直向下抓取，去掉 `--use-current-orientation`。
+注意：执行时如果没有传 `--rx-deg/--ry-deg/--rz-deg`，抓取目标会默认使用当前反馈 TCP 姿态，
+日志中会显示 `orientation=current_default`。如果要测试 Top-Down 垂直向下抓取，显式传
+`--rx-deg 180 --ry-deg 0 --rz-deg 0`；若姿态跳变超过默认 45 度，需要确认安全后再放宽
+`--max-orientation-jump-deg`。
 
 默认 Top-Down 执行还会打印 `orientation=auto_top_down_yaw`。这表示目标仍然是垂直向下，但 `rz`
 会贴近当前反馈分支。以你的日志 `rx=180 ry=66 rz=180` 为例，旧目标 `rx=180 ry=0 rz=0`
@@ -283,10 +271,29 @@ pos_err=217.509 mm ori_err=0.000 deg
 
 - `Client connected` 没出现：先排查 Windows 到 Linux 的 IP、端口、防火墙。
 - `target` 明显离谱，比如几千 mm 或负高度：优先排查手眼标定、深度值、m/mm 单位。
-- `ori_err` 很大，`pos_err` 也不变：目标姿态可能不可达，先用 `--use-current-orientation` 做小范围运动测试。
+- `ori_err` 很大，`pos_err` 也不变：目标姿态可能不可达，先不传 `--rx-deg/--ry-deg/--rz-deg`，用当前姿态做小范围运动测试。
 - `ori_err=0` 但 `pos_err` 很大，`last` 不变：姿态没问题，但机械臂没有移动到目标位置，优先看机械臂状态、急停/示教/报错、目标位置可达性。
 - `pos_err` 逐渐变小但超时：可以适当增大 `--motion-timeout-s` 或降低目标距离，确认速度和轨迹是否合理。
 - 只想验证目标计算，不想运动：去掉 `--execute`，点击后看 `target_tcp` 和 `grasp_j6` 是否合理。
+
+定位手眼映射问题时，Linux server 启动加 `--debug-plan`。每次点击会在运动前打印：
+
+```text
+camera xyz -> base_from_hand_eye -> target_tcp/grasp_tcp/place_tcp -> each J6 waypoint
+```
+
+如果不想连接机械臂，可以把 Windows 侧打印的 `X/Y/Z` 复制到离线脚本：
+
+```bash
+python3 -m robot_control.linux.catch.debug_hand_eye_point \
+  --x-m 0.10 \
+  --y-m -0.05 \
+  --z-m 0.30 \
+  --hand-eye-result robot_control/linux/hand_eye/hand_eye_result.json
+```
+
+当前 `hand_eye_result.json` 启动时也会打印质量摘要。如果看到 `rotation RMS is high`
+或 `translation RMS is high`，优先重新采集/求解手眼标定。
 
 ## Windows 侧命令
 

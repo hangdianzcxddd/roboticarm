@@ -151,7 +151,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="place TCP Y in base frame; defaults to target Y plus --place-dy-mm",
     )
     parser.add_argument("--place-dx-mm", type=float, default=0.0)
-    parser.add_argument("--place-dy-mm", type=float, default=-80.0)
+    parser.add_argument("--place-dy-mm", type=float, default=-100.0)
     parser.add_argument("--place-z-mm", type=float, default=80.0)
     parser.add_argument("--place-rx-deg", type=float)
     parser.add_argument("--place-ry-deg", type=float)
@@ -355,7 +355,7 @@ def target_pose_from_args(
 
     default_x_mm = 300.0
     default_y_mm = 0.0
-    default_z_mm = 60.0
+    default_z_mm = 40.0
 
     target_x_mm = (
         default_x_mm

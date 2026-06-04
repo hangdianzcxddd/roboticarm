@@ -19,6 +19,7 @@ from robot_control.windows.hand_eye.chessboard import (
     draw_detection,
     estimate_chessboard_pose,
     intrinsics_from_profile,
+    intrinsics_from_realsense_profile,
     make_intrinsics,
     put_status_text,
 )
@@ -44,7 +45,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--intrinsic-profile",
         choices=tuple(sorted(DEFAULT_INTRINSICS)),
-        default="640x480",
+        default=None,
         help="preloaded RealSense rectified color intrinsics profile",
     )
     parser.add_argument("--fx", type=float, help="override camera fx")
@@ -56,6 +57,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         nargs="+",
         help="OpenCV distortion coefficients; omitted means zero distortion",
+    )
+    parser.add_argument(
+        "--use-live-distortion",
+        action="store_true",
+        help="use distortion coefficients reported by the active RealSense color profile",
     )
     parser.add_argument("--corners-cols", type=int, default=11)
     parser.add_argument("--corners-rows", type=int, default=8)
@@ -84,7 +90,6 @@ def main() -> None:
     except ImportError as exc:
         raise RuntimeError("pyrealsense2 is required for RealSense capture.") from exc
 
-    intrinsics = build_intrinsics(args)
     board_config = ChessboardConfig(
         corners_cols=args.corners_cols,
         corners_rows=args.corners_rows,
@@ -105,7 +110,9 @@ def main() -> None:
 
     sample_count = 0
     last_message = "Press c to capture, Esc to exit."
-    pipeline.start(config)
+    profile = pipeline.start(config)
+    intrinsics = build_intrinsics(args, profile, rs.stream.color)
+    print(format_intrinsics(intrinsics), flush=True)
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
     try:
         while True:
@@ -177,7 +184,7 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--checker-size-mm must be > 0")
 
 
-def build_intrinsics(args: argparse.Namespace):
+def build_intrinsics(args: argparse.Namespace, pipeline_profile=None, color_stream=None):
     dist_coeffs = tuple(args.dist_coeffs) if args.dist_coeffs is not None else None
     if any(value is not None for value in (args.fx, args.fy, args.cx, args.cy)):
         if any(value is None for value in (args.fx, args.fy, args.cx, args.cy)):
@@ -191,14 +198,44 @@ def build_intrinsics(args: argparse.Namespace):
             cy=args.cy,
             dist_coeffs=dist_coeffs,
         )
-    intrinsics = intrinsics_from_profile(args.intrinsic_profile, dist_coeffs=dist_coeffs)
+    if args.intrinsic_profile is not None:
+        intrinsics = intrinsics_from_profile(args.intrinsic_profile, dist_coeffs=dist_coeffs)
+        if intrinsics.width != args.width or intrinsics.height != args.height:
+            raise SystemExit(
+                f"--intrinsic-profile {args.intrinsic_profile} is "
+                f"{intrinsics.width}x{intrinsics.height}; match --width/--height "
+                "or provide --fx --fy --cx --cy."
+            )
+        return intrinsics
+
+    if pipeline_profile is None:
+        raise SystemExit("live RealSense intrinsics require an active pipeline profile")
+    if color_stream is None:
+        raise SystemExit("live RealSense intrinsics require rs.stream.color")
+    color_profile = pipeline_profile.get_stream(color_stream).as_video_stream_profile()
+    intrinsics = intrinsics_from_realsense_profile(
+        color_profile,
+        dist_coeffs=dist_coeffs,
+        use_live_distortion=args.use_live_distortion,
+    )
     if intrinsics.width != args.width or intrinsics.height != args.height:
         raise SystemExit(
-            f"--intrinsic-profile {args.intrinsic_profile} is "
-            f"{intrinsics.width}x{intrinsics.height}; match --width/--height "
-            "or provide --fx --fy --cx --cy."
+            f"live RealSense color intrinsics are {intrinsics.width}x{intrinsics.height}; "
+            "match --width/--height or provide --fx --fy --cx --cy."
         )
     return intrinsics
+
+
+def format_intrinsics(intrinsics) -> str:
+    matrix = intrinsics.camera_matrix
+    coeffs = ", ".join(f"{float(value):.6g}" for value in intrinsics.dist_coeffs.reshape(-1))
+    return (
+        "Using camera intrinsics: "
+        f"{intrinsics.width}x{intrinsics.height} "
+        f"fx={matrix[0, 0]:.6f} fy={matrix[1, 1]:.6f} "
+        f"cx={matrix[0, 2]:.6f} cy={matrix[1, 2]:.6f} "
+        f"dist=[{coeffs}]"
+    )
 
 
 def save_image(args: argparse.Namespace, frame: np.ndarray, sample_count: int) -> Path | None:

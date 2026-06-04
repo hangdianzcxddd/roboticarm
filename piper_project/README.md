@@ -73,13 +73,13 @@ python3 -m robot_control.linux.server.tcp_server --host 0.0.0.0 --port 5005
 
 实机执行前再加 `--execute`，并先确认机械臂工作空间安全。
 
-点击抓取 server，使用官方夹爪 `J6 -> TCP` 的 `145 mm` 偏移：
+点击抓取 server，使用手眼标定 `camera -> base` 和官方夹爪 `J6 -> TCP` 的 `145 mm` 偏移：
 
 ```bash
-python3 -m robot_control.linux.catch.catch_server --host 0.0.0.0 --port 5005 --execute --speed 10 --use-current-pose-as-base
+python3 -m robot_control.linux.catch.catch_server --host 0.0.0.0 --port 5005 --execute --speed 5 --hand-eye-result
 ```
 
-详细参数见 `robot_control/linux/catch/README.md`。当前点击抓取仍使用临时相机到机器人小范围映射，不是手眼标定。
+详细参数见 `robot_control/linux/catch/README.md`。不传 `--rx-deg/--ry-deg/--rz-deg` 时，执行会沿用当前 TCP 姿态以减少姿态翻转。
 
 ## Windows 侧命令
 

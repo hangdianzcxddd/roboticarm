@@ -7,8 +7,23 @@ import numpy as np
 from robot_control.windows.hand_eye.chessboard import (
     ChessboardConfig,
     intrinsics_from_profile,
+    intrinsics_from_realsense_profile,
     make_object_points,
 )
+
+
+class FakeRsIntrinsics:
+    width = 848
+    height = 480
+    fx = 431.9
+    fy = 432.1
+    ppx = 423.0
+    ppy = 245.2
+    coeffs = [0.1, 0.2, 0.3, 0.4, 0.5]
+
+
+class FakeVideoProfile:
+    intrinsics = FakeRsIntrinsics()
 
 
 class TestChessboard(unittest.TestCase):
@@ -38,6 +53,28 @@ class TestChessboard(unittest.TestCase):
             ),
         )
         np.testing.assert_allclose(intrinsics.dist_coeffs, np.zeros((5, 1)))
+
+    def test_realsense_profile_intrinsics_use_live_values(self):
+        intrinsics = intrinsics_from_realsense_profile(
+            FakeVideoProfile(),
+            use_live_distortion=True,
+        )
+
+        self.assertEqual((intrinsics.width, intrinsics.height), (848, 480))
+        np.testing.assert_allclose(
+            intrinsics.camera_matrix,
+            np.array(
+                [
+                    [431.9, 0.0, 423.0],
+                    [0.0, 432.1, 245.2],
+                    [0.0, 0.0, 1.0],
+                ]
+            ),
+        )
+        np.testing.assert_allclose(
+            intrinsics.dist_coeffs.reshape(-1),
+            [0.1, 0.2, 0.3, 0.4, 0.5],
+        )
 
 
 if __name__ == "__main__":

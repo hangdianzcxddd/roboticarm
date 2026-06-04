@@ -131,7 +131,7 @@ class TestScriptedCatchDemo(unittest.TestCase):
 
         self.assertEqual(target_tcp_pose.x_mm, 300.0)
         self.assertEqual(target_tcp_pose.y_mm, 0.0)
-        self.assertEqual(target_tcp_pose.z_mm, 80.0)
+        self.assertEqual(target_tcp_pose.z_mm, 40.0)
         self.assertEqual(target_tcp_pose.rx_deg, current_j6_pose.rx_deg)
         self.assertEqual(target_tcp_pose.ry_deg, current_j6_pose.ry_deg)
         self.assertEqual(target_tcp_pose.rz_deg, current_j6_pose.rz_deg)

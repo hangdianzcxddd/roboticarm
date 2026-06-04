@@ -93,6 +93,37 @@ def intrinsics_from_profile(
     )
 
 
+def intrinsics_from_realsense_profile(
+    video_profile: Any,
+    *,
+    dist_coeffs: tuple[float, ...] | None = None,
+    use_live_distortion: bool = False,
+) -> CameraIntrinsics:
+    """Build OpenCV intrinsics from the active RealSense video profile."""
+
+    rs_intrinsics = getattr(video_profile, "intrinsics", None)
+    if rs_intrinsics is None and hasattr(video_profile, "get_intrinsics"):
+        rs_intrinsics = video_profile.get_intrinsics()
+    if rs_intrinsics is None:
+        raise ValueError("RealSense video profile does not expose intrinsics")
+
+    live_dist_coeffs = dist_coeffs
+    if live_dist_coeffs is None and use_live_distortion:
+        coeffs = getattr(rs_intrinsics, "coeffs", None)
+        if coeffs is not None:
+            live_dist_coeffs = tuple(float(value) for value in coeffs)
+
+    return make_intrinsics(
+        width=int(rs_intrinsics.width),
+        height=int(rs_intrinsics.height),
+        fx=float(rs_intrinsics.fx),
+        fy=float(rs_intrinsics.fy),
+        cx=float(rs_intrinsics.ppx),
+        cy=float(rs_intrinsics.ppy),
+        dist_coeffs=live_dist_coeffs,
+    )
+
+
 def make_intrinsics(
     *,
     width: int,
