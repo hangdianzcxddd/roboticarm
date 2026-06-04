@@ -178,6 +178,12 @@ python3 -m robot_control.linux.catch.scripted_catch_demo \
 --min-horizontal-radius-mm 80 --max-horizontal-radius-mm 500 --min-j6-z-mm 80 --max-j6-z-mm 500
 ```
 
+`catch_server` 默认已经启用一组保守抓取边界：`--stage-max-j6-z-mm 450`、
+`--max-j6-z-mm 500`、`--min-j6-x-mm 80`、`--min-target-x-mm 150`、
+`--min-target-y-mm -250`、`--max-target-y-mm 250`。这些边界用于初调阶段提前拒绝
+`J6 x≈0~50 mm`、`target y≈300 mm` 或 `stage_lift z>450 mm` 这类 Piper SDK
+经常直接报 `TARGET_POS_EXCEEDS_LIMIT` 的目标。确认现场确实可达后再逐项放宽。
+
 如果某个 waypoint 已经接近但仍因为 8mm/8deg 阈值失败，`--continue-on-waypoint-error` 会打印警告并继续，
 用于先验证完整流程。等流程能跑完后再去掉这个参数，逐步收紧精度。
 
@@ -196,6 +202,9 @@ python3 -m robot_control.linux.catch.scripted_catch_demo \
 - `--no-auto-top-down-yaw`：关闭上面的自动 `rz` 分支选择，严格使用命令行给出的 `--rx-deg/--ry-deg/--rz-deg`。
 - `--max-orientation-jump-deg 45`：拒绝相邻 J6 waypoint 之间超过 45 度的姿态跳变；显式 top-down 调试时可临时放宽。
 - `--stage-height-mm 60`：执行抓取前先用当前姿态抬高并移动到目标上方，再切换到抓取姿态。默认开启；如果要恢复直接去 approach，可加 `--no-staged-approach`。
+- `--stage-max-j6-z-mm 450`：限制 staged approach 的预抬升高度，避免从当前 `z≈449` 继续抬到 `z≈509` 后被 SDK 拒绝。
+- `--min-j6-x-mm 80`：拒绝目标 waypoint 中 J6 太靠近基座的规划。当前姿态 `ry≈66°` 时，145mm TCP 偏移会把 TCP 的 X 往回拉约 130mm，容易生成 `J6 x≈0~50 mm`。
+- `--min-target-x-mm/--min-target-y-mm/--max-target-y-mm`：对手眼映射后的目标 TCP 做保守过滤；如果点击明显可达物体却被这些条件拦住，优先检查手眼矩阵和相机深度。
 - `--target-z-offset-mm 40`：对点击点做额外 Z 修正。值越小，抓取 TCP 越接近点击点。
 - `--open-command-mm 0`：张开命令。完全张开设零后，`0 mm` 表示张开。
 - `--grasp-command-mm -100`：抓取闭合命令。完全张开设零后，`-100 mm` 表示向闭合方向走 100 mm。
@@ -302,3 +311,43 @@ python -m robot_control.windows.client.click_send_tcp --host <linux-vm-ip> --por
 ```
 
 点击 RGB 图像后，Windows 会发送相机 XYZ；Linux 会打印目标 TCP、反算后的 J6 抓取位姿和执行状态。
+
+## Windows 侧 OpenCV 自动视觉抓取
+
+先在 Linux 侧启动带手眼矩阵的抓取服务：
+
+```bash
+python3 -m robot_control.linux.catch.catch_server \
+  --host 0.0.0.0 \
+  --port 5005 \
+  --can can0 \
+  --execute \
+  --hand-eye-result \
+  --speed 5 \
+  --debug-plan
+```
+
+Windows 侧可以用 OpenCV 背景减除检测物体框，并把检测中心的相机 XYZ 按和点击脚本相同的协议发送给
+`catch_server`：
+
+```bash
+python -m robot_control.windows.client.opencv_grasp_send_tcp \
+  --host <linux-vm-ip> \
+  --port 5005 \
+  --algorithm background \
+  --target-policy largest
+```
+
+默认流程会先学习背景，物体不要放进画面；学习结束后把物体放入画面。检测稳定后按 `g` 发送当前目标。
+如果想让脚本稳定后自动发送，加 `--auto-send`；初调时建议先用 `--dry-run` 或先不加 `--auto-send`，
+确认 Linux `--debug-plan` 中的 `base_from_hand_eye`、`target_tcp`、`tcp_offset_base` 和各 J6 waypoint 合理。
+
+如果物体有明显颜色，也可以用 HSV 阈值：
+
+```bash
+python -m robot_control.windows.client.opencv_grasp_send_tcp \
+  --host <linux-vm-ip> \
+  --algorithm color \
+  --lower-hsv 35 60 60 \
+  --upper-hsv 85 255 255
+```

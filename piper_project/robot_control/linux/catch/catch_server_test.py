@@ -10,7 +10,12 @@ import unittest
 
 import numpy as np
 
-from robot_control.linux.catch.catch_server import handle_message
+from robot_control.linux.catch.catch_server import (
+    build_place_plan,
+    build_staged_approach_waypoints,
+    handle_message,
+    validate_plan,
+)
 from robot_control.linux.catch.hand_eye_mapping import (
     hand_eye_quality_summary,
     load_camera_to_base_transform,
@@ -101,11 +106,20 @@ def make_args(**overrides: object) -> argparse.Namespace:
         "auto_top_down_yaw": True,
         "staged_approach": False,
         "stage_height_mm": 60.0,
+        "stage_max_j6_z_mm": 450.0,
         "max_orientation_jump_deg": 45.0,
         "min_horizontal_radius_mm": 0.0,
         "max_horizontal_radius_mm": None,
+        "min_j6_x_mm": 80.0,
+        "max_j6_x_mm": None,
         "min_j6_z_mm": None,
-        "max_j6_z_mm": None,
+        "max_j6_z_mm": 500.0,
+        "min_target_x_mm": 150.0,
+        "max_target_x_mm": None,
+        "min_target_y_mm": -250.0,
+        "max_target_y_mm": 250.0,
+        "min_target_z_mm": None,
+        "max_target_z_mm": None,
         "warn_margin_mm": 0.0,
     }
     values.update(overrides)
@@ -405,6 +419,58 @@ class TestCatchServer(unittest.TestCase):
         self.assertEqual(response["payload"]["base_xyz_m"]["x_m"], 0.30000000000000004)
         self.assertIn("Click debug plan:", output.getvalue())
         self.assertIn("base_from_hand_eye: x=300.000 y=50.000 z=300.000 mm", output.getvalue())
+        self.assertIn("tcp_offset_base: dx=145.000", output.getvalue())
+
+    def test_staged_lift_uses_conservative_z_cap(self):
+        current_j6_pose = EndPose(48.517, 0.0, 449.168, 180.0, 66.461, 180.0)
+        target_tcp_pose = EndPose(178.717, 120.0, 245.9, 180.0, 66.461, 180.0)
+        catch_plan = build_catch_plan(
+            target_tcp_pose,
+            offset_j6_tcp_mm=(0.0, 0.0, 145.0),
+            approach_height_mm=40.0,
+            lift_height_mm=40.0,
+            target_z_offset_mm=40.0,
+        )
+
+        waypoints = build_staged_approach_waypoints(
+            current_j6_pose,
+            catch_plan,
+            make_args(staged_approach=True),
+            RobotConfig(),
+        )
+
+        self.assertEqual(waypoints[0][0], "stage_lift")
+        self.assertAlmostEqual(waypoints[0][1].z_mm, 450.0)
+        self.assertLess(waypoints[0][1].z_mm, 509.0)
+
+    def test_validate_plan_rejects_target_j6_x_too_close_to_base(self):
+        controller = PiperController(
+            config=RobotConfig(command_interval_s=0, connect_timeout_s=0.1),
+            sdk=FakePiperSdk(),
+        )
+        current_j6_pose = EndPose(48.517, 0.0, 449.168, 180.0, 66.461, 180.0)
+        target_tcp_pose = EndPose(178.717, 120.0, 245.9, 180.0, 66.461, 180.0)
+        catch_plan = build_catch_plan(
+            target_tcp_pose,
+            offset_j6_tcp_mm=(0.0, 0.0, 145.0),
+            approach_height_mm=40.0,
+            lift_height_mm=40.0,
+            target_z_offset_mm=40.0,
+        )
+        place_plan = build_place_plan(
+            target_tcp_pose,
+            (0.0, 0.0, 145.0),
+            make_args(staged_approach=True, place_y_mm=80.0),
+        )
+
+        with self.assertRaisesRegex(ValueError, "J6 x .*below conservative"):
+            validate_plan(
+                controller,
+                catch_plan,
+                place_plan,
+                make_args(staged_approach=True),
+                current_pose=current_j6_pose,
+            )
 
     def test_execute_uses_open_zero_gripper_sequence_and_place_motion(self):
         message = make_camera_point_message(
@@ -442,6 +508,7 @@ class TestCatchServer(unittest.TestCase):
                     place_x_mm=0.0,
                     place_y_mm=150.0,
                     place_z_mm=150.0,
+                    min_j6_x_mm=None,
                 ),
             )
 

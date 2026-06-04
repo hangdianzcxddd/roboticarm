@@ -46,6 +46,12 @@ from robot_control.shared.simulated_mapping import (
 DEFAULT_HAND_EYE_RESULT = (
     Path(__file__).resolve().parents[1] / "hand_eye" / "hand_eye_result.json"
 )
+DEFAULT_STAGE_MAX_J6_Z_MM = 450.0
+DEFAULT_MAX_J6_Z_MM = 500.0
+DEFAULT_MIN_TARGET_X_MM = 150.0
+DEFAULT_MIN_TARGET_Y_MM = -250.0
+DEFAULT_MAX_TARGET_Y_MM = 250.0
+DEFAULT_MIN_J6_X_MM = 80.0
 
 
 @dataclass(frozen=True)
@@ -270,6 +276,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="minimum J6 lift before the auto staged approach XY alignment",
     )
     parser.add_argument(
+        "--stage-max-j6-z-mm",
+        type=float,
+        default=DEFAULT_STAGE_MAX_J6_Z_MM,
+        help=(
+            "conservative J6 Z cap for staged lift/XY waypoints. This prevents "
+            "the pre-grasp lift from commanding high poses that Piper SDK often "
+            "rejects before the actual catch starts."
+        ),
+    )
+    parser.add_argument(
         "--max-orientation-jump-deg",
         type=float,
         default=45.0,
@@ -287,6 +303,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="optional conservative upper bound for commanded J6 radius",
     )
     parser.add_argument(
+        "--min-j6-x-mm",
+        type=float,
+        default=DEFAULT_MIN_J6_X_MM,
+        help=(
+            "conservative lower bound for target/place J6 X. The current home "
+            "pose may be below this, so staged lift at the current XY is exempt."
+        ),
+    )
+    parser.add_argument(
+        "--max-j6-x-mm",
+        type=float,
+        help="optional conservative upper bound for target/place J6 X",
+    )
+    parser.add_argument(
         "--min-j6-z-mm",
         type=float,
         help="optional conservative lower bound for commanded J6 Z",
@@ -294,7 +324,41 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-j6-z-mm",
         type=float,
+        default=DEFAULT_MAX_J6_Z_MM,
         help="optional conservative upper bound for commanded J6 Z",
+    )
+    parser.add_argument(
+        "--min-target-x-mm",
+        type=float,
+        default=DEFAULT_MIN_TARGET_X_MM,
+        help="reject clicked TCP targets behind this conservative base-frame X",
+    )
+    parser.add_argument(
+        "--max-target-x-mm",
+        type=float,
+        help="optional conservative upper bound for clicked TCP target X",
+    )
+    parser.add_argument(
+        "--min-target-y-mm",
+        type=float,
+        default=DEFAULT_MIN_TARGET_Y_MM,
+        help="reject clicked TCP targets left of this base-frame Y",
+    )
+    parser.add_argument(
+        "--max-target-y-mm",
+        type=float,
+        default=DEFAULT_MAX_TARGET_Y_MM,
+        help="reject clicked TCP targets right of this base-frame Y",
+    )
+    parser.add_argument(
+        "--min-target-z-mm",
+        type=float,
+        help="optional conservative lower bound for clicked TCP target Z",
+    )
+    parser.add_argument(
+        "--max-target-z-mm",
+        type=float,
+        help="optional conservative upper bound for clicked TCP target Z",
     )
     parser.add_argument(
         "--warn-margin-mm",
@@ -356,6 +420,7 @@ def validate_args(args: argparse.Namespace) -> None:
         "lift_height_mm",
         "place_approach_height_mm",
         "stage_height_mm",
+        "stage_max_j6_z_mm",
         "min_horizontal_radius_mm",
         "max_orientation_jump_deg",
         "warn_margin_mm",
@@ -371,11 +436,35 @@ def validate_args(args: argparse.Namespace) -> None:
     ):
         raise ValueError("--min-horizontal-radius-mm must be <= --max-horizontal-radius-mm")
     if (
+        args.min_j6_x_mm is not None
+        and args.max_j6_x_mm is not None
+        and args.min_j6_x_mm > args.max_j6_x_mm
+    ):
+        raise ValueError("--min-j6-x-mm must be <= --max-j6-x-mm")
+    if (
         args.min_j6_z_mm is not None
         and args.max_j6_z_mm is not None
         and args.min_j6_z_mm > args.max_j6_z_mm
     ):
         raise ValueError("--min-j6-z-mm must be <= --max-j6-z-mm")
+    if (
+        args.min_target_x_mm is not None
+        and args.max_target_x_mm is not None
+        and args.min_target_x_mm > args.max_target_x_mm
+    ):
+        raise ValueError("--min-target-x-mm must be <= --max-target-x-mm")
+    if (
+        args.min_target_y_mm is not None
+        and args.max_target_y_mm is not None
+        and args.min_target_y_mm > args.max_target_y_mm
+    ):
+        raise ValueError("--min-target-y-mm must be <= --max-target-y-mm")
+    if (
+        args.min_target_z_mm is not None
+        and args.max_target_z_mm is not None
+        and args.min_target_z_mm > args.max_target_z_mm
+    ):
+        raise ValueError("--min-target-z-mm must be <= --max-target-z-mm")
     for option_name, value in (
         ("--open-command-mm", args.open_command_mm),
         ("--grasp-command-mm", args.grasp_command_mm),
@@ -590,47 +679,13 @@ def execute_staged_approach(
     args: argparse.Namespace,
 ) -> dict[str, int]:
     current_j6_pose = read_current_j6_pose(controller)
-    first_stage_z_mm = min(
-        max(
-            current_j6_pose.z_mm + args.stage_height_mm,
-            current_j6_pose.z_mm,
-            catch_plan.approach_j6_pose.z_mm,
-        ),
-        controller.config.z_limit_mm.max_value,
-    )
-    target_stage_z_mm = max(first_stage_z_mm, catch_plan.approach_j6_pose.z_mm)
-    target_stage_z_mm = min(target_stage_z_mm, controller.config.z_limit_mm.max_value)
-    stage_lift_pose = replace(current_j6_pose, z_mm=first_stage_z_mm)
-    stage_xy_pose = EndPose(
-        catch_plan.approach_j6_pose.x_mm,
-        catch_plan.approach_j6_pose.y_mm,
-        first_stage_z_mm,
-        current_j6_pose.rx_deg,
-        current_j6_pose.ry_deg,
-        current_j6_pose.rz_deg,
-    )
-    stage_target_lift_pose = replace(stage_xy_pose, z_mm=target_stage_z_mm)
-    stage_orient_pose = EndPose(
-        catch_plan.approach_j6_pose.x_mm,
-        catch_plan.approach_j6_pose.y_mm,
-        target_stage_z_mm,
-        catch_plan.approach_j6_pose.rx_deg,
-        catch_plan.approach_j6_pose.ry_deg,
-        catch_plan.approach_j6_pose.rz_deg,
-    )
     staged_counts: dict[str, int] = {}
-    waypoints = [
-        ("stage_lift", stage_lift_pose, "P"),
-        ("stage_xy", stage_xy_pose, args.approach_mode),
-        ("stage_target_lift", stage_target_lift_pose, "P"),
-    ]
-    if not poses_are_close(
-        stage_target_lift_pose,
-        stage_orient_pose,
-        position_tolerance_mm=args.position_tolerance_mm,
-        orientation_tolerance_deg=args.orientation_tolerance_deg,
-    ):
-        waypoints.append(("stage_orient", stage_orient_pose, "P"))
+    waypoints = build_staged_approach_waypoints(
+        current_j6_pose,
+        catch_plan,
+        args,
+        controller.config,
+    )
 
     for label, pose, mode in waypoints:
         if poses_are_close(
@@ -652,6 +707,69 @@ def execute_staged_approach(
         )
         current_j6_pose = pose
     return staged_counts
+
+
+def staged_z_cap_mm(config: Any, args: argparse.Namespace) -> float:
+    limits = [float(config.z_limit_mm.max_value)]
+    max_j6_z_mm = getattr(args, "max_j6_z_mm", None)
+    stage_max_j6_z_mm = getattr(args, "stage_max_j6_z_mm", None)
+    if max_j6_z_mm is not None:
+        limits.append(float(max_j6_z_mm))
+    if stage_max_j6_z_mm is not None:
+        limits.append(float(stage_max_j6_z_mm))
+    return min(limits)
+
+
+def build_staged_approach_waypoints(
+    current_j6_pose: EndPose,
+    catch_plan: CatchPlan,
+    args: argparse.Namespace,
+    config: Any,
+) -> tuple[tuple[str, EndPose, str], ...]:
+    stage_z_cap = staged_z_cap_mm(config, args)
+    first_stage_z_mm = min(
+        max(
+            current_j6_pose.z_mm + args.stage_height_mm,
+            current_j6_pose.z_mm,
+            catch_plan.approach_j6_pose.z_mm,
+        ),
+        stage_z_cap,
+    )
+    target_stage_z_mm = min(
+        max(first_stage_z_mm, catch_plan.approach_j6_pose.z_mm),
+        stage_z_cap,
+    )
+    stage_lift_pose = replace(current_j6_pose, z_mm=first_stage_z_mm)
+    stage_xy_pose = EndPose(
+        catch_plan.approach_j6_pose.x_mm,
+        catch_plan.approach_j6_pose.y_mm,
+        first_stage_z_mm,
+        current_j6_pose.rx_deg,
+        current_j6_pose.ry_deg,
+        current_j6_pose.rz_deg,
+    )
+    stage_target_lift_pose = replace(stage_xy_pose, z_mm=target_stage_z_mm)
+    stage_orient_pose = EndPose(
+        catch_plan.approach_j6_pose.x_mm,
+        catch_plan.approach_j6_pose.y_mm,
+        target_stage_z_mm,
+        catch_plan.approach_j6_pose.rx_deg,
+        catch_plan.approach_j6_pose.ry_deg,
+        catch_plan.approach_j6_pose.rz_deg,
+    )
+    waypoints: list[tuple[str, EndPose, str]] = [
+        ("stage_lift", stage_lift_pose, "P"),
+        ("stage_xy", stage_xy_pose, args.approach_mode),
+        ("stage_target_lift", stage_target_lift_pose, "P"),
+    ]
+    if not poses_are_close(
+        stage_target_lift_pose,
+        stage_orient_pose,
+        position_tolerance_mm=args.position_tolerance_mm,
+        orientation_tolerance_deg=args.orientation_tolerance_deg,
+    ):
+        waypoints.append(("stage_orient", stage_orient_pose, "P"))
+    return tuple(waypoints)
 
 
 def wait_until_pose_reached(
@@ -773,6 +891,45 @@ def build_catch_j6_pose(
     return j6_pose_for_tcp_pose(tcp_pose, offset_j6_tcp_mm)
 
 
+def validate_target_tcp_pose(
+    target_tcp_pose: EndPose,
+    args: argparse.Namespace,
+) -> None:
+    checks = (
+        (
+            "x",
+            target_tcp_pose.x_mm,
+            getattr(args, "min_target_x_mm", None),
+            getattr(args, "max_target_x_mm", None),
+        ),
+        (
+            "y",
+            target_tcp_pose.y_mm,
+            getattr(args, "min_target_y_mm", None),
+            getattr(args, "max_target_y_mm", None),
+        ),
+        (
+            "z",
+            target_tcp_pose.z_mm,
+            getattr(args, "min_target_z_mm", None),
+            getattr(args, "max_target_z_mm", None),
+        ),
+    )
+    for axis, value, min_value, max_value in checks:
+        if min_value is not None and value < min_value:
+            raise SafetyError(
+                f"target_tcp {axis}={value:.3f} mm is below conservative "
+                f"--min-target-{axis}-mm {min_value:.3f}. Check hand-eye mapping "
+                "or relax the limit only after confirming the point is reachable."
+            )
+        if max_value is not None and value > max_value:
+            raise SafetyError(
+                f"target_tcp {axis}={value:.3f} mm exceeds conservative "
+                f"--max-target-{axis}-mm {max_value:.3f}. Check hand-eye mapping "
+                "or relax the limit only after confirming the point is reachable."
+            )
+
+
 def validate_plan(
     controller: PiperController,
     catch_plan: CatchPlan,
@@ -781,6 +938,16 @@ def validate_plan(
     current_pose: EndPose | None = None,
 ) -> None:
     previous_pose = current_pose
+    if current_pose is not None and getattr(args, "staged_approach", False):
+        for label, pose, _mode in build_staged_approach_waypoints(
+            current_pose,
+            catch_plan,
+            args,
+            controller.config,
+        ):
+            validate_j6_waypoint(controller, args, label, pose, previous_pose)
+            previous_pose = pose
+
     for label, pose in planned_j6_waypoints(catch_plan, place_plan):
         validate_j6_waypoint(controller, args, label, pose, previous_pose)
         previous_pose = pose
@@ -846,6 +1013,19 @@ def validate_j6_waypoint(
             f"{label}: J6 horizontal radius {radius_mm:.3f} mm exceeds "
             f"max radius {max_radius_mm:.3f}"
         )
+    min_x_mm = conservative_min_j6_x_mm(args, label)
+    max_x_mm = conservative_max_j6_x_mm(args, label)
+    if min_x_mm is not None and pose.x_mm < min_x_mm:
+        raise SafetyError(
+            f"{label}: J6 x {pose.x_mm:.3f} mm is below conservative "
+            f"--min-j6-x-mm {min_x_mm:.3f}. With the current TCP orientation, "
+            "the gripper offset may be pulling J6 too close to the base."
+        )
+    if max_x_mm is not None and pose.x_mm > max_x_mm:
+        raise SafetyError(
+            f"{label}: J6 x {pose.x_mm:.3f} mm exceeds conservative "
+            f"--max-j6-x-mm {max_x_mm:.3f}"
+        )
     if pose.z_mm < min_z_mm:
         raise SafetyError(
             f"{label}: J6 z {pose.z_mm:.3f} mm is below min z {min_z_mm:.3f}"
@@ -862,12 +1042,34 @@ def validate_j6_waypoint(
             warnings.append(f"radius is {radius_mm - min_radius_mm:.1f} mm above min")
         if max_radius_mm - radius_mm <= margin:
             warnings.append(f"radius is {max_radius_mm - radius_mm:.1f} mm below max")
+        if min_x_mm is not None and pose.x_mm - min_x_mm <= margin:
+            warnings.append(f"x is {pose.x_mm - min_x_mm:.1f} mm above min")
+        if max_x_mm is not None and max_x_mm - pose.x_mm <= margin:
+            warnings.append(f"x is {max_x_mm - pose.x_mm:.1f} mm below max")
         if pose.z_mm - min_z_mm <= margin:
             warnings.append(f"z is {pose.z_mm - min_z_mm:.1f} mm above min")
         if max_z_mm - pose.z_mm <= margin:
             warnings.append(f"z is {max_z_mm - pose.z_mm:.1f} mm below max")
     if warnings:
         print(f"  Warning {label}: {'; '.join(warnings)}", flush=True)
+
+
+def conservative_min_j6_x_mm(
+    args: argparse.Namespace,
+    label: str,
+) -> float | None:
+    if label == "stage_lift":
+        return None
+    return getattr(args, "min_j6_x_mm", None)
+
+
+def conservative_max_j6_x_mm(
+    args: argparse.Namespace,
+    label: str,
+) -> float | None:
+    if label == "stage_lift":
+        return None
+    return getattr(args, "max_j6_x_mm", None)
 
 
 def maybe_set_open_zero(controller: PiperController, args: argparse.Namespace) -> None:
@@ -1002,6 +1204,7 @@ def print_debug_plan(
     command: Any,
     mapping_source: str,
     base_xyz_m: tuple[float, float, float] | None,
+    tcp_offset_j6_mm: Sequence[float],
     target_orientation: TargetOrientation,
     current_j6_pose: EndPose | None,
     catch_plan: CatchPlan,
@@ -1032,10 +1235,37 @@ def print_debug_plan(
         f"place_tcp={format_pose(place_plan.place_tcp_pose)}",
         flush=True,
     )
+    offset_base = offset_in_base_mm(catch_plan.target_tcp_pose, tcp_offset_j6_mm)
+    print(
+        "  tcp_offset_base: "
+        f"dx={offset_base[0]:.3f} dy={offset_base[1]:.3f} dz={offset_base[2]:.3f} mm "
+        "(J6 = TCP - offset_base)",
+        flush=True,
+    )
     if current_j6_pose is not None:
         print(f"  current_j6={format_pose(current_j6_pose)}", flush=True)
 
     previous_pose = current_j6_pose
+    if current_j6_pose is not None and getattr(args, "staged_approach", False):
+        for label, pose, _mode in build_staged_approach_waypoints(
+            current_j6_pose,
+            catch_plan,
+            args,
+            ROBOT_CONFIG,
+        ):
+            extra = ""
+            if previous_pose is not None:
+                position_error, orientation_error = pose_errors(pose, previous_pose)
+                extra = f" from_prev={position_error:.1f}mm/{orientation_error:.1f}deg"
+            print(
+                "  staged "
+                f"{label}: {format_pose(pose)} "
+                f"radius={math.hypot(pose.x_mm, pose.y_mm):.1f}mm"
+                f"{extra}",
+                flush=True,
+            )
+            previous_pose = pose
+
     for label, pose in planned_j6_waypoints(catch_plan, place_plan):
         extra = ""
         if previous_pose is not None:
@@ -1053,9 +1283,28 @@ def print_debug_plan(
         "  limits: "
         f"max_orientation_jump={args.max_orientation_jump_deg:.1f}deg "
         f"min_radius={args.min_horizontal_radius_mm:.1f}mm "
-        f"max_radius={args.max_horizontal_radius_mm}",
+        f"max_radius={args.max_horizontal_radius_mm} "
+        f"min_j6_x={getattr(args, 'min_j6_x_mm', None)} "
+        f"max_j6_z={args.max_j6_z_mm} "
+        f"stage_max_j6_z={getattr(args, 'stage_max_j6_z_mm', None)} "
+        f"target_x=[{getattr(args, 'min_target_x_mm', None)}, "
+        f"{getattr(args, 'max_target_x_mm', None)}] "
+        f"target_y=[{getattr(args, 'min_target_y_mm', None)}, "
+        f"{getattr(args, 'max_target_y_mm', None)}]",
         flush=True,
     )
+
+
+def offset_in_base_mm(
+    pose: EndPose,
+    offset_j6_tcp_mm: Sequence[float],
+) -> tuple[float, float, float]:
+    offset_base = rotation_matrix_xyz_deg(
+        pose.rx_deg,
+        pose.ry_deg,
+        pose.rz_deg,
+    ) @ offset_j6_tcp_mm
+    return (float(offset_base[0]), float(offset_base[1]), float(offset_base[2]))
 
 
 def handle_message(
@@ -1112,6 +1361,7 @@ def handle_message(
             rz_deg=target_orientation.rz_deg,
         )
         mapping_source = "hand_eye"
+    validate_target_tcp_pose(target_tcp_pose, args)
     plan = build_catch_plan(
         target_tcp_pose,
         offset_j6_tcp_mm=tcp_offset_j6_mm,
@@ -1132,6 +1382,7 @@ def handle_message(
             command=command,
             mapping_source=mapping_source,
             base_xyz_m=base_xyz_m,
+            tcp_offset_j6_mm=tcp_offset_j6_mm,
             target_orientation=target_orientation,
             current_j6_pose=current_j6_pose,
             catch_plan=plan,
