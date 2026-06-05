@@ -314,7 +314,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-orientation-jump-deg",
         type=float,
-        default=45.0,
+        default=80.0,
         help="reject adjacent planned J6 waypoints whose rotation differs by more than this",
     )
     parser.add_argument(

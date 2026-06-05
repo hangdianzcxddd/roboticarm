@@ -89,6 +89,16 @@ python3 -m robot_control.linux.catch.catch_server --host 0.0.0.0 --port 5005 --e
 python -m robot_control.windows.client.click_send_tcp --host <linux-vm-ip> --port 5005
 ```
 
+YOLO 检测后按深度编号，在终端输入编号发送目标到 Linux VM：
+
+```bash
+python -m robot_control.windows.client.yolo_grasp_send_tcp --host <linux-vm-ip> --port 5005
+```
+
+默认加载 `models/yolo26n.pt`，检测 bbox 中心偏上的点，并使用
+`robot_control/linux/hand_eye/hand_eye_result.json` 把目标沿机器人基座 Z 方向上抬
+`20 mm` 后再发送；可用 `--base-z-offset-mm` 调整。
+
 单机视觉调试：
 
 ```bash
