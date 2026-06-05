@@ -38,3 +38,30 @@ OpenCV 的 `--corners-rows/--corners-cols` 是内角点数量。如果你的 8 x
 ```bat
 --corners-rows 7 --corners-cols 10
 ```
+
+## 验证 hand_eye_result.json
+
+`eye_to_hand` 求解出的 `hand_eye_result.json` 是 `camera -> base`。验证时，
+需要点击一个“在机械臂 base 坐标系里坐标已知”的物理点：
+
+```bat
+python -m robot_control.windows.hand_eye.validate_hand_eye_click ^
+  --hand-eye-result robot_control\linux\hand_eye\hand_eye_result.json ^
+  --expected-base-mm 0 0 0
+```
+
+只有当你点击的点确实是机械臂 base 原点时，才使用 `0 0 0`。更稳妥的做法是
+在工作台上放一个坐标已知的小标记，或让 TCP 对准该点后读取它的 base 坐标，再
+把这个坐标传给 `--expected-base-mm X Y Z`。左键点击后脚本会打印：
+
+- 相机坐标 `camera XYZ`
+- 矩阵反推的机械臂基坐标 `base XYZ`
+- 和 `--expected-base-mm` 的误差
+
+如果不传 `--expected-base-mm`，脚本只输出每次点击映射出的 base 坐标：
+
+```bat
+python -m robot_control.windows.hand_eye.validate_hand_eye_click
+```
+
+按 `Esc` 退出。可加 `--log-jsonl hand_eye_click_validation.jsonl` 保存每次点击。

@@ -11,6 +11,9 @@ import unittest
 import numpy as np
 
 from robot_control.linux.catch.catch_server import (
+    DEFAULT_PLACE_X_MM,
+    DEFAULT_PLACE_Y_MM,
+    DEFAULT_PLACE_Z_MM,
     build_place_plan,
     build_staged_approach_waypoints,
     handle_message,
@@ -95,9 +98,9 @@ def make_args(**overrides: object) -> argparse.Namespace:
         "gripper_settle_s": 0.0,
         "place_x_mm": None,
         "place_y_mm": None,
-        "place_dx_mm": 0.0,
-        "place_dy_mm": -100.0,
-        "place_z_mm": 80.0,
+        "place_dx_mm": None,
+        "place_dy_mm": None,
+        "place_z_mm": DEFAULT_PLACE_Z_MM,
         "place_rx_deg": None,
         "place_ry_deg": None,
         "place_rz_deg": None,
@@ -256,7 +259,7 @@ class TestCatchServer(unittest.TestCase):
                 tcp_offset_j6_mm=(0.0, 0.0, 145.0),
                 execute=False,
                 controller=None,
-                args=make_args(target_z_offset_mm=0.0),
+                args=make_args(target_z_offset_mm=0.0, place_x_mm=230.0),
             )
 
         self.assertEqual(response["type"], "ack")
@@ -265,10 +268,36 @@ class TestCatchServer(unittest.TestCase):
         self.assertEqual(response["payload"]["target_tcp_pose"]["y_mm"], -10.0)
         self.assertAlmostEqual(response["payload"]["grasp_j6_pose"]["x_mm"], 165.0)
         self.assertEqual(response["payload"]["catch"]["gripper_enabled"], True)
-        self.assertEqual(response["payload"]["place_tcp_pose"]["y_mm"], -110.0)
-        self.assertEqual(response["payload"]["place_tcp_pose"]["z_mm"], 80.0)
+        self.assertEqual(response["payload"]["place_tcp_pose"]["x_mm"], 230.0)
+        self.assertEqual(response["payload"]["place_tcp_pose"]["y_mm"], DEFAULT_PLACE_Y_MM)
+        self.assertEqual(response["payload"]["place_tcp_pose"]["z_mm"], DEFAULT_PLACE_Z_MM)
         self.assertEqual(response["payload"]["catch"]["open_command_mm"], 0.0)
         self.assertEqual(response["payload"]["catch"]["grasp_command_mm"], -100.0)
+
+    def test_build_place_plan_defaults_to_base_frame_place_point(self):
+        target_tcp_pose = EndPose(310.0, -10.0, 220.0, 0.0, 90.0, 0.0)
+
+        place_plan = build_place_plan(
+            target_tcp_pose,
+            (0.0, 0.0, 145.0),
+            make_args(),
+        )
+
+        self.assertEqual(place_plan.place_tcp_pose.x_mm, DEFAULT_PLACE_X_MM)
+        self.assertEqual(place_plan.place_tcp_pose.y_mm, DEFAULT_PLACE_Y_MM)
+        self.assertEqual(place_plan.place_tcp_pose.z_mm, DEFAULT_PLACE_Z_MM)
+
+    def test_build_place_plan_can_still_use_legacy_target_relative_offsets(self):
+        target_tcp_pose = EndPose(310.0, -10.0, 220.0, 0.0, 90.0, 0.0)
+
+        place_plan = build_place_plan(
+            target_tcp_pose,
+            (0.0, 0.0, 145.0),
+            make_args(place_dx_mm=25.0, place_dy_mm=-100.0),
+        )
+
+        self.assertEqual(place_plan.place_tcp_pose.x_mm, 335.0)
+        self.assertEqual(place_plan.place_tcp_pose.y_mm, -110.0)
 
     def test_handle_message_can_use_hand_eye_camera_to_base_mapping(self):
         message = make_camera_point_message(
@@ -289,6 +318,7 @@ class TestCatchServer(unittest.TestCase):
                     rx_deg=0.0,
                     ry_deg=90.0,
                     rz_deg=0.0,
+                    place_x_mm=230.0,
                 ),
                 hand_eye_camera_to_base=camera_to_base,
             )
@@ -324,6 +354,7 @@ class TestCatchServer(unittest.TestCase):
                     no_gripper=True,
                     stop_after_lift=True,
                     no_wait_waypoints=True,
+                    place_x_mm=230.0,
                 ),
                 hand_eye_camera_to_base=camera_to_base,
             )
@@ -412,6 +443,7 @@ class TestCatchServer(unittest.TestCase):
                     rx_deg=0.0,
                     ry_deg=90.0,
                     rz_deg=0.0,
+                    place_x_mm=230.0,
                 ),
                 hand_eye_camera_to_base=camera_to_base,
             )
@@ -524,8 +556,20 @@ class TestCatchServer(unittest.TestCase):
         )
         self.assertEqual(len(end_pose_calls), 6)
         self.assertEqual(
+            [call for call in sdk.calls if call[0] == "JointCtrl"],
+            [("JointCtrl", (0, 0, 0, 0, 28648, 0))],
+        )
+        self.assertEqual(
             sorted(response["payload"]["catch"]["send_counts"]),
-            ["approach", "grasp", "lift", "place", "place_approach", "place_retreat"],
+            [
+                "approach",
+                "grasp",
+                "lift",
+                "place",
+                "place_approach",
+                "place_retreat",
+                "return_home",
+            ],
         )
 
     def test_execute_auto_top_down_yaw_keeps_current_reachable_rz_branch(self):

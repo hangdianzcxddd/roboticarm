@@ -52,6 +52,10 @@ DEFAULT_MIN_TARGET_X_MM = 150.0
 DEFAULT_MIN_TARGET_Y_MM = -250.0
 DEFAULT_MAX_TARGET_Y_MM = 250.0
 DEFAULT_MIN_J6_X_MM = 80.0
+DEFAULT_PLACE_X_MM = 150.0
+DEFAULT_PLACE_Y_MM = 150.0
+DEFAULT_PLACE_Z_MM = 80.0
+RETURN_HOME_JOINTS_RAD = (0.0, 0.0, 0.0, 0.0, 0.5, 0.0)
 
 
 @dataclass(frozen=True)
@@ -199,16 +203,38 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--place-x-mm",
         type=float,
-        help="place TCP X in base frame; defaults to target X plus --place-dx-mm",
+        help=(
+            "place TCP X in the robot base frame; defaults to "
+            f"{DEFAULT_PLACE_X_MM:.0f} mm"
+        ),
     )
     parser.add_argument(
         "--place-y-mm",
         type=float,
-        help="place TCP Y in base frame; defaults to target Y plus --place-dy-mm",
+        help=(
+            "place TCP Y in the robot base frame; defaults to "
+            f"{DEFAULT_PLACE_Y_MM:.0f} mm"
+        ),
     )
-    parser.add_argument("--place-dx-mm", type=float, default=0.0)
-    parser.add_argument("--place-dy-mm", type=float, default=-100.0)
-    parser.add_argument("--place-z-mm", type=float, default=80.0)
+    parser.add_argument(
+        "--place-dx-mm",
+        type=float,
+        help=(
+            "legacy relative place TCP X offset from the clicked target. If either "
+            "--place-dx-mm or --place-dy-mm is set, the place point is computed "
+            "relative to the target; omitted X offset defaults to 0 mm."
+        ),
+    )
+    parser.add_argument(
+        "--place-dy-mm",
+        type=float,
+        help=(
+            "legacy relative place TCP Y offset from the clicked target. If either "
+            "--place-dx-mm or --place-dy-mm is set, the place point is computed "
+            "relative to the target; omitted Y offset defaults to -100 mm."
+        ),
+    )
+    parser.add_argument("--place-z-mm", type=float, default=DEFAULT_PLACE_Z_MM)
     parser.add_argument("--place-rx-deg", type=float)
     parser.add_argument("--place-ry-deg", type=float)
     parser.add_argument("--place-rz-deg", type=float)
@@ -465,6 +491,15 @@ def validate_args(args: argparse.Namespace) -> None:
         and args.min_target_z_mm > args.max_target_z_mm
     ):
         raise ValueError("--min-target-z-mm must be <= --max-target-z-mm")
+    if (
+        args.place_dx_mm is not None or args.place_dy_mm is not None
+    ) and (
+        args.place_x_mm is not None or args.place_y_mm is not None
+    ):
+        raise ValueError(
+            "--place-x-mm/--place-y-mm cannot be combined with "
+            "--place-dx-mm/--place-dy-mm"
+        )
     for option_name, value in (
         ("--open-command-mm", args.open_command_mm),
         ("--grasp-command-mm", args.grasp_command_mm),
@@ -852,13 +887,23 @@ def build_place_plan(
     rx_deg = target_tcp_pose.rx_deg if args.place_rx_deg is None else args.place_rx_deg
     ry_deg = target_tcp_pose.ry_deg if args.place_ry_deg is None else args.place_ry_deg
     rz_deg = target_tcp_pose.rz_deg if args.place_rz_deg is None else args.place_rz_deg
+    if args.place_dx_mm is not None or args.place_dy_mm is not None:
+        place_x_mm = target_tcp_pose.x_mm + (
+            0.0 if args.place_dx_mm is None else args.place_dx_mm
+        )
+        place_y_mm = target_tcp_pose.y_mm + (
+            -100.0 if args.place_dy_mm is None else args.place_dy_mm
+        )
+    else:
+        place_x_mm = (
+            DEFAULT_PLACE_X_MM if args.place_x_mm is None else args.place_x_mm
+        )
+        place_y_mm = (
+            DEFAULT_PLACE_Y_MM if args.place_y_mm is None else args.place_y_mm
+        )
     place_tcp_pose = EndPose(
-        target_tcp_pose.x_mm + args.place_dx_mm
-        if args.place_x_mm is None
-        else args.place_x_mm,
-        target_tcp_pose.y_mm + args.place_dy_mm
-        if args.place_y_mm is None
-        else args.place_y_mm,
+        place_x_mm,
+        place_y_mm,
         args.place_z_mm,
         rx_deg,
         ry_deg,
@@ -1189,6 +1234,8 @@ def execute_catch_plan(
         args.lift_mode,
         args,
     )
+    controller.move_joints(list(RETURN_HOME_JOINTS_RAD), speed_percent=args.speed)
+    counts["return_home"] = 1
 
     if args.print_feedback:
         time.sleep(0.1)

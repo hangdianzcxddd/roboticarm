@@ -159,6 +159,31 @@ robot_control/linux/hand_eye/hand_eye_result.json
 `eye_to_hand` 下结果 `transform` 是 `camera -> base`。后续把相机坐标系下的点
 变换到机械臂基坐标系时使用这个矩阵。
 
+## 6. 验证矩阵
+
+矩阵准确性的直接验证方式是：在 Windows 相机画面里点击一个 base 坐标已知的
+物理点，用 `camera -> base` 反推它的机械臂基坐标，然后和真实坐标比较。
+
+Windows 项目根目录运行：
+
+```bat
+python -m robot_control.windows.hand_eye.validate_hand_eye_click ^
+  --hand-eye-result robot_control\linux\hand_eye\hand_eye_result.json ^
+  --expected-base-mm X Y Z
+```
+
+例如点击机械臂真实 base 原点时才使用：
+
+```bat
+--expected-base-mm 0 0 0
+```
+
+如果机械臂底座原点在画面中不可直接点击，建议在工作台上选一个小标记，先用
+机械臂 TCP 对准该点并读取它在 base 系下的坐标，再把这个坐标填入
+`--expected-base-mm`。脚本会打印点击点的相机坐标、反推 base 坐标，以及误差
+范数。多点几次看误差是否稳定；若误差方向和大小明显漂移，优先排查深度噪声、
+内参分辨率、相机是否移动、标定板固定是否松动。
+
 如果残差很大，优先检查：
 
 - 棋盘格尺寸是否用的是内角点数量。

@@ -7,6 +7,9 @@ from pathlib import Path
 
 from robot_control.linux.catch.catch_server import (
     DEFAULT_HAND_EYE_RESULT,
+    DEFAULT_PLACE_X_MM,
+    DEFAULT_PLACE_Y_MM,
+    DEFAULT_PLACE_Z_MM,
     build_place_plan,
     format_pose,
     planned_j6_waypoints,
@@ -47,11 +50,33 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--target-z-offset-mm", type=float, default=40.0)
     parser.add_argument("--approach-height-mm", type=float, default=40.0)
     parser.add_argument("--lift-height-mm", type=float, default=40.0)
-    parser.add_argument("--place-x-mm", type=float)
-    parser.add_argument("--place-y-mm", type=float)
-    parser.add_argument("--place-dx-mm", type=float, default=0.0)
-    parser.add_argument("--place-dy-mm", type=float, default=-100.0)
-    parser.add_argument("--place-z-mm", type=float, default=80.0)
+    parser.add_argument(
+        "--place-x-mm",
+        type=float,
+        help=f"place TCP X in base frame; defaults to {DEFAULT_PLACE_X_MM:.0f} mm",
+    )
+    parser.add_argument(
+        "--place-y-mm",
+        type=float,
+        help=f"place TCP Y in base frame; defaults to {DEFAULT_PLACE_Y_MM:.0f} mm",
+    )
+    parser.add_argument(
+        "--place-dx-mm",
+        type=float,
+        help=(
+            "legacy relative place TCP X offset from the clicked target; setting "
+            "either relative offset switches place planning to target-relative mode"
+        ),
+    )
+    parser.add_argument(
+        "--place-dy-mm",
+        type=float,
+        help=(
+            "legacy relative place TCP Y offset from the clicked target; setting "
+            "either relative offset switches place planning to target-relative mode"
+        ),
+    )
+    parser.add_argument("--place-z-mm", type=float, default=DEFAULT_PLACE_Z_MM)
     parser.add_argument("--place-rx-deg", type=float)
     parser.add_argument("--place-ry-deg", type=float)
     parser.add_argument("--place-rz-deg", type=float)

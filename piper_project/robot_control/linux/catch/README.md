@@ -29,7 +29,7 @@ J6 -> gripper TCP: x=0 mm, y=0 mm, z=145 mm
 - `--use-current-pose-as-base` 只适用于临时映射，不能和 `--hand-eye-result` 同时使用。
 - 默认假设你已经把“完全张开 100 mm”的物理位置设为了夹爪零点；此时 `0 mm` 命令表示完全张开，`-100 mm` 命令表示向闭合方向运动。
 - 执行时如果没有传 `--rx-deg/--ry-deg/--rz-deg`，目标 TCP 姿态默认沿用当前反馈姿态，避免大角度翻转。
-- 默认放置 TCP 点为点击目标的 `x + 0 mm, y - 100 mm, z=80 mm`。若现场坐标方向相反，改 `--place-dy-mm` 或显式传 `--place-x-mm/--place-y-mm/--place-z-mm`。
+- 默认放置 TCP 点为机械臂基座坐标 `x=150 mm, y=150 mm, z=80 mm`，也就是基座前方 150 mm、右侧 150 mm 附近；不再跟随点击抓取点移动。
 - 第一次执行前请用很低速度、小位移、空场景测试。
 
 ## Linux 侧命令：使用手眼标定结果
@@ -212,7 +212,7 @@ python3 -m robot_control.linux.catch.scripted_catch_demo \
 - `--effort-nm 1.0`：默认夹爪力矩。
 - `--grasp-effort-nm 1.5`：抓取闭合力矩，可单独覆盖。
 - `--release-effort-nm 0.4`：松开力矩，可单独覆盖。
-- `--place-dx-mm 0 --place-dy-mm -100 --place-z-mm 80`：默认相对目标的放置 TCP 点；也可用 `--place-x-mm/--place-y-mm` 固定到绝对基座坐标。
+- `--place-x-mm 150 --place-y-mm 150 --place-z-mm 80`：默认基座坐标系下的放置 TCP 点。若仍想沿用旧逻辑，可显式传 `--place-dx-mm/--place-dy-mm`，此时放置点按目标 TCP 加偏移计算。
 - `--place-approach-height-mm 50`：放置点上方的进退高度。
 - `--clear-gripper-error`：抓取前先发夹爪清错。
 - `--no-gripper`：只移动机械臂，不执行夹爪张合。
