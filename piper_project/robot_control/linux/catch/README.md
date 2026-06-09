@@ -148,11 +148,26 @@ XYZ、姿态、水平半径和可选保守高度/半径边界检查。确认目�
 --execute
 ```
 
-默认抓取 TCP 使用固定安全测试点 `x=300 mm, y=0 mm, z=80 mm`，姿态默认保持当前 J6 的
-`rx/ry/rz`；随后执行 approach、下降、闭合、抬升、移动到附近放置点、松开、撤离、恢复起始姿态并回到起始
-J6。这个脚本不使用 Windows 点击、相机深度或 `hand_eye_result.json`，适合先验证“机械臂能否完整跑完路径”。
+默认抓取点使用固定安全测试点：`--target-z-mm 40` 加默认 `--target-z-offset-mm 40`，
+所以实际抓取 TCP 为 `x=300 mm, y=0 mm, z=80 mm`。姿态默认保持当前 TCP 的 `rx/ry/rz`，
+也可以显式传 `--rx-deg/--ry-deg/--rz-deg`，例如 `--rx-deg 180 --ry-deg 0 --rz-deg 0`
+测试垂直向下抓取。脚本随后执行 approach、下降、闭合、抬升、移动到附近放置点、松开、撤离。
+默认 `--single` 会继续恢复起始姿态，并用关节 home 命令结束；连续抓取时加 `--multiple`，
+脚本会停在放置点上方的 `place_retreat`，不再复位，方便下一次抓取从该位置继续。如需旧的笛卡尔回到起始 J6，可加
+`--return-home-strategy cartesian`。这个脚本不使用 Windows 点击、相机深度或 `hand_eye_result.json`，
+适合先验证“机械臂能否完整跑完路径”。
 路径确认后去掉 `--no-gripper`，再验证夹爪闭合和松开。不要一开始指定很远的 `--place-x-mm/--place-y-mm`，
 先用默认 `--place-dy-mm 40` 在当前位置附近完成流程。
+
+固定坐标连续搬运可以使用 `run_pose_continuous_catch_sequence`。它默认会在第一次下降抓取
+`pick1_grasp` 前等待 5 秒，并在下降抓取 `place_pick_grasp` 前等待 3 秒；这两个等待时间可通过参数覆盖：
+
+```bash
+python3 -m robot_control.linux.catch.run_pose_continuous_catch_sequence \
+  --can can0 \
+  --initial-pick-delay-s 5 \
+  --place-pick-delay-s 3
+```
 
 如果你已经量到一组明确可达的基座坐标，可以直接输入抓取/放置 TCP。建议仍然先 dry-run：
 
@@ -214,6 +229,9 @@ python3 -m robot_control.linux.catch.scripted_catch_demo \
 - `--release-effort-nm 0.4`：松开力矩，可单独覆盖。
 - `--place-x-mm 150 --place-y-mm 150 --place-z-mm 80`：默认基座坐标系下的放置 TCP 点。若仍想沿用旧逻辑，可显式传 `--place-dx-mm/--place-dy-mm`，此时放置点按目标 TCP 加偏移计算。
 - `--place-approach-height-mm 50`：放置点上方的进退高度。
+- `--single`：默认模式，放置后恢复姿态并回 home。
+- `--multiple`：连续抓取模式，放置并松开后停在放置点上方，不执行复位。
+- `--return-joints-rad 0 0 -0.1 0 0.5 0`：覆盖 scripted demo 默认关节 home 点，单位是弧度；比直接改全局 `RETURN_HOME_JOINTS_RAD` 更安全。
 - `--clear-gripper-error`：抓取前先发夹爪清错。
 - `--no-gripper`：只移动机械臂，不执行夹爪张合。
 

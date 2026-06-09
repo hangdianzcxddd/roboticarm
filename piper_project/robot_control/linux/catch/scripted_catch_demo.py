@@ -14,17 +14,23 @@ from dataclasses import dataclass, replace
 from typing import Sequence
 
 from robot_control.linux.arm.piper_arm import PiperController
+from robot_control.linux.arm.piper_arm import RAD_TO_MILLI_DEG
 from robot_control.linux.arm.safety import SafetyError
 from robot_control.linux.catch.catch_server import (
+    RETURN_HOME_JOINTS_RAD,
+    TargetOrientation,
     execute_pose_for_duration,
     feedback_to_pose,
     format_pose,
     grasp_effort_nm,
     maybe_set_open_zero,
+    normalize_deg,
+    orientation_points_tool_z_down,
     pose_errors,
     read_current_j6_pose,
     release_command_mm,
     release_effort_nm,
+    rotation_angle_error_deg,
     tcp_offset_from_args,
     wait_until_pose_reached,
 )
@@ -73,8 +79,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--speed", type=int, default=5)
     parser.add_argument("--approach-mode", choices=("P", "L"), default="P")
-    parser.add_argument("--grasp-mode", choices=("P", "L"), default="L")
-    parser.add_argument("--lift-mode", choices=("P", "L"), default="L")
+    parser.add_argument("--grasp-mode", choices=("P", "L"), default="P")
+    parser.add_argument("--lift-mode", choices=("P", "L"), default="P")
     parser.add_argument("--return-mode", choices=("P", "L"), default="P")
     parser.add_argument("--command-duration-s", type=float, default=1.0)
     parser.add_argument("--command-period-s", type=float, default=0.02)
@@ -109,28 +115,51 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--target-z-mm",
         type=float,
-        help="grasp TCP Z in base frame; defaults to the safe test Z 80 mm",
+        help=(
+            "target TCP Z before --target-z-offset-mm; defaults to 40 mm, "
+            "so the default grasp TCP Z is 80 mm"
+        ),
     )
-    # 默认保持当前机械臂姿态
+    # 默认保持当前 TCP 姿态
     parser.add_argument(
         "--rx-deg",
         type=float,
-        help="target RX; defaults to current J6 RX",
+        help="target gripper TCP RX; defaults to current TCP RX",
     )
 
     parser.add_argument(
         "--ry-deg",
         type=float,
-        help="target RY; defaults to current J6 RY",
+        help="target gripper TCP RY; defaults to current TCP RY",
     )
 
     parser.add_argument(
         "--rz-deg",
         type=float,
-        help="target RZ; defaults to current J6 RZ",
+        help="target gripper TCP RZ; defaults to current TCP RZ",
     )
+    parser.add_argument(
+        "--use-current-orientation",
+        action="store_true",
+        help="use the current gripper TCP orientation unless an RX/RY/RZ value is explicitly set",
+    )
+    parser.add_argument(
+        "--no-auto-top-down-yaw",
+        dest="auto_top_down_yaw",
+        action="store_false",
+        help=(
+            "keep the exact --rx-deg/--ry-deg/--rz-deg values. By default, "
+            "explicit top-down poses keep the current reachable RZ branch."
+        ),
+    )
+    parser.set_defaults(auto_top_down_yaw=True)
 
-    parser.add_argument("--target-z-offset-mm", type=float, default=0.0)
+    parser.add_argument(
+        "--target-z-offset-mm",
+        type=float,
+        default=40.0,
+        help="extra Z added to target TCP when building the actual grasp TCP",
+    )
     parser.add_argument("--approach-height-mm", type=float, default=50.0)
     parser.add_argument(
         "--descend-mm",
@@ -163,13 +192,57 @@ def build_parser() -> argparse.ArgumentParser:
         default=60.0,
         help="initial lift above current J6 before rotating to top-down",
     )
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
+        "--single",
+        dest="trajectory_mode",
+        action="store_const",
+        const="single",
+        default="single",
+        help="single catch mode: return home after placing the object",
+    )
+    mode_group.add_argument(
+        "--multiple",
+        dest="trajectory_mode",
+        action="store_const",
+        const="multiple",
+        help=(
+            "continuous catch mode: stop at the place retreat pose above the "
+            "placed object instead of returning home"
+        ),
+    )
     parser.add_argument(
         "--no-return-home",
         dest="return_home",
         action="store_false",
-        help="stop after place retreat instead of restoring posture and returning home",
+        help="legacy alias for stopping after place retreat",
     )
     parser.set_defaults(return_home=True)
+    parser.add_argument(
+        "--return-home-strategy",
+        choices=("joints", "cartesian"),
+        default="joints",
+        help=(
+            "how to finish the return. 'joints' uses the known joint home command; "
+            "'cartesian' restores the exact startup J6 pose."
+        ),
+    )
+    parser.add_argument(
+        "--return-joints-rad",
+        nargs=6,
+        type=float,
+        metavar=("J1", "J2", "J3", "J4", "J5", "J6"),
+        help=(
+            "joint return target in radians, used with --return-home-strategy joints; "
+            f"defaults to {RETURN_HOME_JOINTS_RAD}"
+        ),
+    )
+    parser.add_argument(
+        "--return-joint-tolerance-rad",
+        type=float,
+        default=math.radians(2.0),
+        help="joint feedback tolerance for return-joints wait",
+    )
     parser.add_argument(
         "--return-height-mm",
         type=float,
@@ -203,6 +276,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=25.0,
         help="print a warning when a waypoint is this close to an envelope bound",
     )
+    parser.add_argument(
+        "--max-orientation-jump-deg",
+        type=float,
+        default=80.0,
+        help="reject adjacent J6 waypoints whose rotation differs by more than this",
+    )
     parser.add_argument("--open-command-mm", type=float, default=0.0)
     parser.add_argument("--grasp-command-mm", type=float, default=-100.0)
     parser.add_argument("--release-command-mm", type=float)
@@ -231,6 +310,13 @@ def validate_demo_args(args: argparse.Namespace) -> None:
         raise ValueError("--position-tolerance-mm must be >= 0")
     if args.orientation_tolerance_deg < 0:
         raise ValueError("--orientation-tolerance-deg must be >= 0")
+    if args.max_orientation_jump_deg < 0:
+        raise ValueError("--max-orientation-jump-deg must be >= 0")
+    if args.return_joint_tolerance_rad < 0:
+        raise ValueError("--return-joint-tolerance-rad must be >= 0")
+    return_joints = return_home_joints_rad_from_args(args)
+    if not all(math.isfinite(value) for value in return_joints):
+        raise ValueError("--return-joints-rad values must be finite")
     for name in (
         "target_z_offset_mm",
         "approach_height_mm",
@@ -275,79 +361,49 @@ def validate_demo_args(args: argparse.Namespace) -> None:
         raise ValueError("--min-j6-z-mm must be <= --max-j6-z-mm")
 
 
-# def target_pose_from_args(
-#     args: argparse.Namespace,
-#     current_j6_pose: EndPose,
-#     tcp_offset_j6_mm: Sequence[float],
-# ) -> EndPose:
+def return_home_joints_rad_from_args(args: argparse.Namespace) -> tuple[float, ...]:
+    if args.return_joints_rad is None:
+        return tuple(float(value) for value in RETURN_HOME_JOINTS_RAD)
+    return tuple(float(value) for value in args.return_joints_rad)
 
-#     rx_deg = (
-#         current_j6_pose.rx_deg
-#         if args.rx_deg is None
-#         else args.rx_deg
-#     )
 
-#     ry_deg = (
-#         current_j6_pose.ry_deg
-#         if args.ry_deg is None
-#         else args.ry_deg
-#     )
+def should_return_home(args: argparse.Namespace) -> bool:
+    return bool(args.return_home and getattr(args, "trajectory_mode", "single") == "single")
 
-#     rz_deg = (
-#         current_j6_pose.rz_deg
-#         if args.rz_deg is None
-#         else args.rz_deg
-#     )
 
-#     desired_grasp_j6_pose = EndPose(
-#         x_mm=current_j6_pose.x_mm,
-#         y_mm=current_j6_pose.y_mm,
-#         z_mm=current_j6_pose.z_mm - args.descend_mm,
-#         rx_deg=rx_deg,
-#         ry_deg=ry_deg,
-#         rz_deg=rz_deg,
-#     )
+def target_orientation_from_args(
+    args: argparse.Namespace,
+    current_tcp_pose: EndPose,
+) -> TargetOrientation:
+    rx_deg = current_tcp_pose.rx_deg if args.rx_deg is None else float(args.rx_deg)
+    ry_deg = current_tcp_pose.ry_deg if args.ry_deg is None else float(args.ry_deg)
+    rz_deg = current_tcp_pose.rz_deg if args.rz_deg is None else float(args.rz_deg)
+    source = "current" if args.use_current_orientation else "current_default"
 
-#     default_target_tcp = tcp_pose_for_j6_pose(
-#         desired_grasp_j6_pose,
-#         tcp_offset_j6_mm,
-#     )
-#     if default_target_tcp.z_mm < args.min_target_z_mm:
-#         desired_grasp_j6_pose = replace(
-#             desired_grasp_j6_pose,
-#             z_mm=desired_grasp_j6_pose.z_mm
-#             + args.min_target_z_mm
-#             - default_target_tcp.z_mm,
-#         )
-#         default_target_tcp = tcp_pose_for_j6_pose(
-#             desired_grasp_j6_pose,
-#             tcp_offset_j6_mm,
-#         )
-#     return EndPose(
-#         x_mm=default_target_tcp.x_mm if args.target_x_mm is None else args.target_x_mm,
-#         y_mm=default_target_tcp.y_mm if args.target_y_mm is None else args.target_y_mm,
-#         z_mm=default_target_tcp.z_mm if args.target_z_mm is None else args.target_z_mm,
-#         rx_deg=(
-#             current_j6_pose.rx_deg
-#             if args.rx_deg is None
-#             else args.rx_deg
-#         ),
-#         ry_deg=(
-#             current_j6_pose.ry_deg
-#             if args.ry_deg is None
-#             else args.ry_deg
-#         ),
-#         rz_deg=rz_deg,
-#     )
+    explicit_orientation = (
+        args.rx_deg is not None
+        and args.ry_deg is not None
+        and args.rz_deg is not None
+    )
+    if explicit_orientation:
+        requested = TargetOrientation(rx_deg, ry_deg, rz_deg, "args")
+        if args.auto_top_down_yaw and orientation_points_tool_z_down(requested):
+            return TargetOrientation(
+                180.0,
+                0.0,
+                normalize_deg(current_tcp_pose.rz_deg),
+                "auto_top_down_yaw",
+            )
+        return requested
+
+    return TargetOrientation(rx_deg, ry_deg, rz_deg, source)
+
+
 def target_pose_from_args(
     args: argparse.Namespace,
-    current_j6_pose: EndPose,
-    tcp_offset_j6_mm: Sequence[float],
+    current_tcp_pose: EndPose,
 ) -> EndPose:
-
-    rx_deg = current_j6_pose.rx_deg if args.rx_deg is None else args.rx_deg
-    ry_deg = current_j6_pose.ry_deg if args.ry_deg is None else args.ry_deg
-    rz_deg = current_j6_pose.rz_deg if args.rz_deg is None else args.rz_deg
+    orientation = target_orientation_from_args(args, current_tcp_pose)
 
     # ---------------------------------------------------
     # 默认测试点（安全区域）
@@ -379,9 +435,9 @@ def target_pose_from_args(
         x_mm=target_x_mm,
         y_mm=target_y_mm,
         z_mm=target_z_mm,
-        rx_deg=rx_deg,
-        ry_deg=ry_deg,
-        rz_deg=rz_deg,
+        rx_deg=orientation.rx_deg,
+        ry_deg=orientation.ry_deg,
+        rz_deg=orientation.rz_deg,
     )
 
 def place_pose_from_args(args: argparse.Namespace, target_tcp_pose: EndPose) -> EndPose:
@@ -413,13 +469,13 @@ def build_scripted_plan(
     config: RobotConfig = ROBOT_CONFIG,
 ) -> DemoPlan:
     current_tcp_pose = tcp_pose_for_j6_pose(current_j6_pose, tcp_offset_j6_mm)
-    target_tcp_pose = target_pose_from_args(args, current_j6_pose, tcp_offset_j6_mm)
+    target_tcp_pose = target_pose_from_args(args, current_tcp_pose)
     catch_plan = build_catch_plan(
         target_tcp_pose,
         offset_j6_tcp_mm=tcp_offset_j6_mm,
-        approach_height_mm=40.0,   # 抬高幅度
-        lift_height_mm=40.0,       # 抬高幅度
-        target_z_offset_mm=40.0,   # 抓取点不要贴地太低
+        approach_height_mm=args.approach_height_mm,
+        lift_height_mm=args.lift_height_mm,
+        target_z_offset_mm=args.target_z_offset_mm,
     )
     place_tcp_pose = place_pose_from_args(args, target_tcp_pose)
     place_approach_tcp_pose = replace(
@@ -432,14 +488,13 @@ def build_scripted_plan(
         tcp_offset_j6_mm,
     )
 
-    first_stage_z_mm = min(
-        max(
+    stage_lift_min_z_mm = max(current_j6_pose.z_mm, catch_plan.approach_j6_pose.z_mm)
+    if getattr(args, "trajectory_mode", "single") == "single":
+        stage_lift_min_z_mm = max(
+            stage_lift_min_z_mm,
             current_j6_pose.z_mm + args.stage_height_mm,
-            current_j6_pose.z_mm,
-            catch_plan.approach_j6_pose.z_mm,
-        ),
-        config.z_limit_mm.max_value,
-    )
+        )
+    first_stage_z_mm = min(stage_lift_min_z_mm, config.z_limit_mm.max_value)
     stage_lift_pose = replace(current_j6_pose, z_mm=first_stage_z_mm)
     orient_top_down_pose = EndPose(
         current_j6_pose.x_mm,
@@ -450,25 +505,14 @@ def build_scripted_plan(
         target_tcp_pose.rz_deg,
     )
 
-    # waypoints = [
-    #     DemoWaypoint("stage_lift", stage_lift_pose, "P"),
-    #     DemoWaypoint("orient_top_down", orient_top_down_pose, "P"),
-    #     DemoWaypoint("approach", catch_plan.approach_j6_pose, args.approach_mode),
-    #     DemoWaypoint("grasp", catch_plan.grasp_j6_pose, args.grasp_mode),
-    #     DemoWaypoint("lift", catch_plan.lift_j6_pose, args.lift_mode),
-    #     DemoWaypoint("place_approach", place_approach_j6_pose, args.approach_mode),
-    #     DemoWaypoint("place", place_j6_pose, args.grasp_mode),
-    #     DemoWaypoint("place_retreat", place_approach_j6_pose, args.lift_mode),
-    # ]
-
     waypoints = [
         DemoWaypoint("stage_lift", stage_lift_pose, "P"),
     ]
 
-    orientation_changed = (
-        args.rx_deg is not None
-        or args.ry_deg is not None
-        or args.rz_deg is not None
+    orientation_changed = not poses_are_close_orientation(
+        stage_lift_pose,
+        orient_top_down_pose,
+        args.orientation_tolerance_deg,
     )
 
     if orientation_changed:
@@ -515,7 +559,7 @@ def build_scripted_plan(
         ]
     )
 
-    if args.return_home:
+    if should_return_home(args):
         return_z_mm = min(
             max(
                 current_j6_pose.z_mm + args.return_height_mm,
@@ -548,9 +592,10 @@ def build_scripted_plan(
                     restore_orientation_pose,
                     args.return_mode,
                 ),
-                DemoWaypoint("return_home", current_j6_pose, args.return_mode),
             ]
         )
+        if args.return_home_strategy == "cartesian":
+            waypoints.append(DemoWaypoint("return_home", current_j6_pose, args.return_mode))
 
     return DemoPlan(
         current_j6_pose=current_j6_pose,
@@ -585,6 +630,13 @@ def validate_plan(
 
         previous_pose = pose
         print(f"  {label}: {format_pose(pose)}", flush=True)
+    if should_return_home(args) and args.return_home_strategy == "joints":
+        return_joints = return_home_joints_rad_from_args(args)
+        try:
+            controller.validate_joints(return_joints)
+        except SafetyError as exc:
+            raise SafetyError(f"return_home_joints: {exc}") from exc
+        print(f"  return_home_joints_rad: {return_joints}", flush=True)
 
 
 def validate_j6_waypoint(
@@ -597,17 +649,11 @@ def validate_j6_waypoint(
     try:
         controller.validate_pose(pose)
         if current_pose is not None:
-
-            ori_delta = max(
-                abs(pose.rx_deg - current_pose.rx_deg),
-                abs(pose.ry_deg - current_pose.ry_deg),
-                abs(pose.rz_deg - current_pose.rz_deg),
-            )
-
-            if ori_delta > 45.0:
+            orientation_jump = rotation_angle_error_deg(pose, current_pose)
+            if orientation_jump > args.max_orientation_jump_deg:
                 raise SafetyError(
-                    f"{label}: orientation jump "
-                    f"{ori_delta:.1f} deg exceeds 45 deg"
+                    f"orientation jump {orientation_jump:.1f} deg exceeds "
+                    f"{args.max_orientation_jump_deg:.1f} deg"
                 )
     except SafetyError as exc:
         raise SafetyError(f"{label}: {exc}") from exc
@@ -663,6 +709,14 @@ def validate_j6_waypoint(
         print(f"  Warning {label}: {'; '.join(warnings)}", flush=True)
 
 
+def poses_are_close_orientation(
+    target: EndPose,
+    actual: EndPose,
+    orientation_tolerance_deg: float,
+) -> bool:
+    return rotation_angle_error_deg(target, actual) <= orientation_tolerance_deg
+
+
 def execute_demo_waypoint(
     controller: PiperController,
     waypoint: DemoWaypoint,
@@ -702,6 +756,110 @@ def execute_demo_waypoint(
             f"is set (pos_err={position_error:.3f} mm, "
             f"ori_err={orientation_error:.3f} deg)",
             flush=True,
+        )
+    return send_count
+
+
+def execute_joints_for_duration(
+    controller: PiperController,
+    joints_rad: tuple[float, ...],
+    speed: int,
+    duration_s: float,
+    period_s: float,
+) -> int:
+    deadline = time.monotonic() + duration_s
+    send_count = 0
+    while send_count == 0 or time.monotonic() < deadline:
+        controller.move_joints(list(joints_rad), speed_percent=speed)
+        send_count += 1
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(period_s)
+    return send_count
+
+
+def wait_until_joints_reached(
+    controller: PiperController,
+    target_joints_rad: tuple[float, ...],
+    timeout_s: float,
+    tolerance_rad: float,
+) -> tuple[float, ...] | None:
+    deadline = time.monotonic() + timeout_s
+    last_joints: tuple[float, ...] | None = None
+    while timeout_s == 0 or time.monotonic() < deadline:
+        joints = joint_feedback_to_rad(controller.get_joint_state())
+        if joints is not None:
+            last_joints = joints
+            if joints_are_close(target_joints_rad, joints, tolerance_rad):
+                return joints
+        if timeout_s == 0:
+            break
+        time.sleep(0.05)
+    raise RuntimeError(
+        "return_home joints not reached: "
+        f"target={format_joints_rad(target_joints_rad)} "
+        f"last={format_joints_rad(last_joints)} "
+        f"max_err={max_joint_error_rad(target_joints_rad, last_joints):.4f} rad"
+    )
+
+
+def joint_feedback_to_rad(joint_feedback: object) -> tuple[float, ...] | None:
+    joint_state = getattr(joint_feedback, "joint_state", None)
+    if joint_state is None:
+        return None
+    values = [getattr(joint_state, f"joint_{index}", None) for index in range(1, 7)]
+    if any(value is None for value in values):
+        return None
+    return tuple(float(value) / RAD_TO_MILLI_DEG for value in values)
+
+
+def joints_are_close(
+    target_joints_rad: tuple[float, ...],
+    actual_joints_rad: tuple[float, ...],
+    tolerance_rad: float,
+) -> bool:
+    return all(
+        abs(target - actual) <= tolerance_rad
+        for target, actual in zip(target_joints_rad, actual_joints_rad)
+    )
+
+
+def max_joint_error_rad(
+    target_joints_rad: tuple[float, ...],
+    actual_joints_rad: tuple[float, ...] | None,
+) -> float:
+    if actual_joints_rad is None:
+        return float("inf")
+    return max(
+        abs(target - actual)
+        for target, actual in zip(target_joints_rad, actual_joints_rad)
+    )
+
+
+def format_joints_rad(joints_rad: tuple[float, ...] | None) -> str:
+    if joints_rad is None:
+        return "unavailable"
+    return "(" + ", ".join(f"{value:.4f}" for value in joints_rad) + ")"
+
+
+def execute_return_home_joints(
+    controller: PiperController,
+    args: argparse.Namespace,
+) -> int:
+    target_joints = return_home_joints_rad_from_args(args)
+    send_count = execute_joints_for_duration(
+        controller,
+        target_joints,
+        args.speed,
+        args.command_duration_s,
+        args.command_period_s,
+    )
+    if not args.no_wait_waypoints:
+        wait_until_joints_reached(
+            controller,
+            target_joints,
+            timeout_s=args.motion_timeout_s,
+            tolerance_rad=args.return_joint_tolerance_rad,
         )
     return send_count
 
@@ -754,6 +912,9 @@ def execute_demo(
                 enable=True,
             )
             time.sleep(args.gripper_settle_s)
+
+    if should_return_home(args) and args.return_home_strategy == "joints":
+        counts["return_home"] = execute_return_home_joints(controller, args)
 
     if args.print_feedback:
         time.sleep(0.1)
