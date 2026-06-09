@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import unittest
 from unittest.mock import patch
 
@@ -13,6 +15,8 @@ from robot_control.windows.client.yolo_grasp_send_tcp import (
     detections_to_ranked_targets,
     grasp_pixel_from_detection,
     offset_camera_point,
+    parse_target_command,
+    process_terminal_command,
     validate_args,
 )
 from robot_control.windows.vision.depth import CameraPoint
@@ -159,7 +163,11 @@ class TestYoloGraspSendTcp(unittest.TestCase):
             ),
         )
 
-        command = camera_point_command_from_target(target, source="yolo_test")
+        command = camera_point_command_from_target(
+            target,
+            source="yolo_test",
+            task="in",
+        )
 
         self.assertEqual(command.u, 11)
         self.assertEqual(command.v, 22)
@@ -168,6 +176,17 @@ class TestYoloGraspSendTcp(unittest.TestCase):
         self.assertEqual(command.y_m, -0.02)
         self.assertEqual(command.z_m, 0.55)
         self.assertEqual(command.source, "yolo_test")
+        self.assertEqual(command.task, "in")
+        self.assertEqual(command.rank, 2)
+        self.assertEqual(command.label, "bottle")
+        self.assertEqual(command.bbox_xywh, (20.0, 30.0, 60.0, 80.0))
+
+    def test_parse_target_command_accepts_task_and_rank(self):
+        self.assertEqual(parse_target_command("out 1", "in"), ("out", 1))
+        self.assertEqual(parse_target_command("in 2", "out"), ("in", 2))
+        self.assertEqual(parse_target_command("3", "out"), ("out", 3))
+        self.assertIsNone(parse_target_command("sideways 1", "out"))
+        self.assertIsNone(parse_target_command("in two", "out"))
 
     def test_sender_dry_run_returns_payload_without_network(self):
         target = RankedTarget(
@@ -189,15 +208,60 @@ class TestYoloGraspSendTcp(unittest.TestCase):
             port=5005,
             timeout_s=1.0,
             dry_run=True,
+            task="in",
         )
 
         response = sender.send_target(target, source="yolo_test")
 
         self.assertEqual(response["type"], "dry_run")
         self.assertEqual(response["payload"]["rank"], 1)
+        self.assertEqual(response["payload"]["task"], "in")
         self.assertEqual(response["payload"]["label"], "cup")
         self.assertEqual(response["payload"]["u"], 10)
         self.assertEqual(response["payload"]["x_m"], 0.1)
+
+    def test_terminal_command_sends_task_from_command_prefix(self):
+        target = RankedTarget(
+            rank=2,
+            detection=detection(label="cup"),
+            pixel=(10, 20),
+            raw_point=camera_point(10, 20, 0.40),
+            send_point=CameraPoint(
+                u=10,
+                v=20,
+                depth_m=0.40,
+                x_m=0.1,
+                y_m=0.2,
+                z_m=0.4,
+            ),
+        )
+        sent: list[tuple[int, str]] = []
+
+        def fake_send(host, port, command, timeout_s):
+            del host, port, timeout_s
+            sent.append((command.rank, command.task))
+            return {"type": "ack", "payload": {}}
+
+        sender = YoloGraspSender(
+            host="127.0.0.1",
+            port=5005,
+            timeout_s=1.0,
+            dry_run=False,
+            task="out",
+            send_func=fake_send,
+        )
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            keep_running = process_terminal_command(
+                "in 2",
+                targets=[target],
+                errors={},
+                sender=sender,
+                source="yolo_test",
+            )
+
+        self.assertTrue(keep_running)
+        self.assertEqual(sent, [(2, "in")])
 
 
 if __name__ == "__main__":

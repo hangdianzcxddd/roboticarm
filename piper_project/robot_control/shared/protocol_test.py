@@ -24,6 +24,12 @@ class TestTcpProtocol(unittest.TestCase):
             depth_m=0.40,
             source="unit_test",
             command_id="cmd-1",
+            task="in",
+            rank=2,
+            label="cup",
+            confidence=0.82,
+            class_id=41,
+            bbox_xywh=(10.0, 20.0, 30.0, 40.0),
         )
 
         decoded = decode_message(encode_message(make_camera_point_message(command)))
@@ -35,6 +41,41 @@ class TestTcpProtocol(unittest.TestCase):
         self.assertAlmostEqual(parsed.z_m, 0.40)
         self.assertEqual((parsed.u, parsed.v), (320, 240))
         self.assertEqual(parsed.source, "unit_test")
+        self.assertEqual(parsed.task, "in")
+        self.assertEqual(parsed.rank, 2)
+        self.assertEqual(parsed.label, "cup")
+        self.assertAlmostEqual(parsed.confidence, 0.82)
+        self.assertEqual(parsed.class_id, 41)
+        self.assertEqual(parsed.bbox_xywh, (10.0, 20.0, 30.0, 40.0))
+
+    def test_camera_point_task_defaults_to_out(self):
+        message = make_camera_point_message(
+            CameraPointCommand(
+                x_m=0.10,
+                y_m=-0.05,
+                z_m=0.40,
+                command_id="cmd-1",
+            )
+        )
+        del message["payload"]["task"]
+
+        parsed = camera_point_from_message(message)
+
+        self.assertEqual(parsed.task, "out")
+
+    def test_camera_point_rejects_unknown_task(self):
+        message = make_camera_point_message(
+            CameraPointCommand(
+                x_m=0.10,
+                y_m=-0.05,
+                z_m=0.40,
+                command_id="cmd-1",
+            )
+        )
+        message["payload"]["task"] = "sideways"
+
+        with self.assertRaisesRegex(ValueError, "task"):
+            camera_point_from_message(message)
 
     def test_simulated_mapping_is_bounded(self):
         pose = camera_xyz_to_simulated_robot_pose(10.0, -10.0, 10.0)

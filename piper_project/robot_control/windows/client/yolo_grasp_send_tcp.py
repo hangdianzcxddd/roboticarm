@@ -25,7 +25,11 @@ import cv2
 import numpy as np
 
 from robot_control.linux.catch.hand_eye_mapping import load_camera_to_base_transform
-from robot_control.shared.protocol import CameraPointCommand, send_camera_point
+from robot_control.shared.protocol import (
+    CameraPointCommand,
+    CameraPointTask,
+    send_camera_point,
+)
 from robot_control.shared.paths import PROJECT_DIR
 from robot_control.windows.vision.d435i_intrinsics import (
     DEFAULT_D435I_PARA,
@@ -98,20 +102,33 @@ class YoloGraspSender:
         port: int,
         timeout_s: float,
         dry_run: bool = False,
+        task: CameraPointTask = "out",
         send_func: SendCameraPointFunc = send_camera_point,
     ) -> None:
         self.host = host
         self.port = int(port)
         self.timeout_s = float(timeout_s)
         self.dry_run = bool(dry_run)
+        self.task = task
         self._send_func = send_func
 
-    def send_target(self, target: RankedTarget, source: str) -> dict[str, Any]:
-        command = camera_point_command_from_target(target, source=source)
+    def send_target(
+        self,
+        target: RankedTarget,
+        source: str,
+        task: CameraPointTask | None = None,
+    ) -> dict[str, Any]:
+        task = self.task if task is None else task
+        command = camera_point_command_from_target(
+            target,
+            source=source,
+            task=task,
+        )
         if self.dry_run:
             return {
                 "type": "dry_run",
                 "payload": {
+                    "task": command.task,
                     "rank": target.rank,
                     "label": target.detection.label,
                     "source": command.source,
@@ -139,6 +156,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, default=5005)
     parser.add_argument("--timeout-s", type=float, default=3.0)
     parser.add_argument("--dry-run", action="store_true", help="print target XYZ without sending")
+    parser.add_argument(
+        "--task",
+        choices=("out", "in"),
+        dest="task_option",
+        help=(
+            "out: grasp detected bbox target and place it at the fixed place point; "
+            "in: grasp detected bbox target and release at the initial ready point. "
+            "This is only the default for bare rank commands; terminal commands "
+            "can override it with 'out 1' or 'in 2'."
+        ),
+    )
+    parser.set_defaults(task="out")
 
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL_PATH)
     parser.add_argument("--width", type=int, default=640)
@@ -240,6 +269,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def validate_args(args: argparse.Namespace) -> None:
+    task_option = getattr(args, "task_option", None)
+    if task_option is not None:
+        args.task = task_option
     if not args.dry_run and not args.host:
         raise ValueError("--host is required unless --dry-run is used")
     if args.timeout_s <= 0:
@@ -414,7 +446,9 @@ def detections_to_ranked_targets(
 def camera_point_command_from_target(
     target: RankedTarget,
     source: str,
+    task: CameraPointTask = "out",
 ) -> CameraPointCommand:
+    detection = target.detection
     return CameraPointCommand(
         x_m=target.send_point.x_m,
         y_m=target.send_point.y_m,
@@ -423,6 +457,17 @@ def camera_point_command_from_target(
         v=target.send_point.v,
         depth_m=target.raw_point.depth_m,
         source=source,
+        task=task,
+        rank=target.rank,
+        label=detection.label,
+        confidence=detection.confidence,
+        class_id=detection.class_id,
+        bbox_xywh=(
+            float(detection.x),
+            float(detection.y),
+            float(detection.width),
+            float(detection.height),
+        ),
     )
 
 
@@ -454,7 +499,10 @@ def print_target_table(targets: list[RankedTarget], errors: dict[int, str]) -> N
         print("\nCurrent YOLO targets ranked by depth:", flush=True)
         for target in targets:
             print("  " + format_target_line(target), flush=True)
-        print("Type a rank number to grasp, p to print again, q to quit.", flush=True)
+        print(
+            "Type 'out N' or 'in N' to send a target, p to print again, q to quit.",
+            flush=True,
+        )
     elif errors:
         print(f"\nNo valid depth target: {next(iter(errors.values()))}", flush=True)
     else:
@@ -557,11 +605,30 @@ def send_and_print(
     sender: YoloGraspSender,
     target: RankedTarget,
     source: str,
+    task: CameraPointTask,
 ) -> dict[str, Any]:
-    response = sender.send_target(target, source=source)
-    print(f"\nSent target rank {target.rank}: {format_target_line(target)}", flush=True)
+    response = sender.send_target(target, source=source, task=task)
+    print(
+        f"\nSent {task} target rank {target.rank}: {format_target_line(target)}",
+        flush=True,
+    )
     print(response, flush=True)
     return response
+
+
+def parse_target_command(command: str, default_task: CameraPointTask) -> tuple[CameraPointTask, int] | None:
+    parts = command.strip().lower().split()
+    if len(parts) == 1:
+        try:
+            return default_task, int(parts[0])
+        except ValueError:
+            return None
+    if len(parts) == 2 and parts[0] in ("out", "in"):
+        try:
+            return parts[0], int(parts[1])
+        except ValueError:
+            return None
+    return None
 
 
 def process_terminal_command(
@@ -581,11 +648,15 @@ def process_terminal_command(
     if command in {"p", "print", "ls", "list"}:
         print_target_table(targets, errors)
         return True
-    try:
-        rank = int(command)
-    except ValueError:
-        print(f"Unknown command: {command!r}. Type a rank number, p, or q.", flush=True)
+
+    parsed = parse_target_command(command, sender.task)
+    if parsed is None:
+        print(
+            f"Unknown command: {command!r}. Type 'out N', 'in N', p, or q.",
+            flush=True,
+        )
         return True
+    task, rank = parsed
 
     target = find_ranked_target(targets, rank)
     if target is None:
@@ -593,9 +664,9 @@ def process_terminal_command(
         print(f"Rank {rank} is not available in the latest frame. Valid ranks: {valid}", flush=True)
         return True
     try:
-        send_and_print(sender, target, source=source)
+        send_and_print(sender, target, source=source, task=task)
     except Exception as exc:  # noqa: BLE001 - manual hardware UI should print full failure
-        print(f"Send failed for rank {rank}: {exc}", flush=True)
+        print(f"Send failed for {task} rank {rank}: {exc}", flush=True)
     return True
 
 
@@ -638,6 +709,7 @@ def main() -> None:
         port=args.port,
         timeout_s=args.timeout_s,
         dry_run=args.dry_run,
+        task=args.task,
     )
     terminal = TerminalInput()
     terminal.start()
@@ -647,7 +719,7 @@ def main() -> None:
     latest_errors: dict[int, str] = {}
 
     print(
-        "Type a displayed rank number in this terminal to grasp. "
+        "Type 'out N' or 'in N' in this terminal to send a target. "
         "Type p to print targets, q to quit.",
         flush=True,
     )

@@ -6,11 +6,12 @@ import json
 import socket
 import time
 from dataclasses import asdict, dataclass
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 
 PROTOCOL_VERSION = 1
 MessageType = Literal["camera_point", "ack", "error"]
+CameraPointTask = Literal["out", "in"]
 
 
 @dataclass(frozen=True)
@@ -23,6 +24,12 @@ class CameraPointCommand:
     depth_m: float | None = None
     source: str = "manual_click"
     command_id: str | None = None
+    task: CameraPointTask = "out"
+    rank: int | None = None
+    label: str | None = None
+    confidence: float | None = None
+    class_id: int | None = None
+    bbox_xywh: tuple[float, float, float, float] | None = None
 
 
 def make_camera_point_message(command: CameraPointCommand) -> dict[str, Any]:
@@ -95,6 +102,10 @@ def camera_point_from_message(message: dict[str, Any]) -> CameraPointCommand:
     if not isinstance(payload, dict):
         raise ValueError("camera_point payload must be an object")
 
+    task = str(payload.get("task", "out")).lower()
+    if task not in ("out", "in"):
+        raise ValueError("camera point task must be 'out' or 'in'")
+
     try:
         return CameraPointCommand(
             x_m=float(payload["x_m"]),
@@ -113,9 +124,37 @@ def camera_point_from_message(message: dict[str, Any]) -> CameraPointCommand:
                 if payload.get("command_id") is not None
                 else str(message.get("command_id"))
             ),
+            task=cast(CameraPointTask, task),
+            rank=int(payload["rank"]) if payload.get("rank") is not None else None,
+            label=str(payload["label"]) if payload.get("label") is not None else None,
+            confidence=(
+                float(payload["confidence"])
+                if payload.get("confidence") is not None
+                else None
+            ),
+            class_id=(
+                int(payload["class_id"])
+                if payload.get("class_id") is not None
+                else None
+            ),
+            bbox_xywh=(
+                _tuple4_float(payload["bbox_xywh"], "bbox_xywh")
+                if payload.get("bbox_xywh") is not None
+                else None
+            ),
         )
     except KeyError as exc:
         raise ValueError(f"missing camera point field: {exc.args[0]}") from exc
+
+
+def _tuple4_float(value: Any, label: str) -> tuple[float, float, float, float]:
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        raise ValueError(f"{label} must contain exactly 4 numeric values")
+    try:
+        values = tuple(float(item) for item in value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must contain exactly 4 numeric values") from exc
+    return cast(tuple[float, float, float, float], values)
 
 
 def send_camera_point(
