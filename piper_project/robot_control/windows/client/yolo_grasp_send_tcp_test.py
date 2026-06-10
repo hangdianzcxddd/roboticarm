@@ -13,6 +13,8 @@ from robot_control.windows.client.yolo_grasp_send_tcp import (
     apply_base_z_offset,
     camera_point_command_from_target,
     detections_to_ranked_targets,
+    dynamic_arrival_time_s,
+    dynamic_candidate_from_target,
     grasp_pixel_from_detection,
     offset_camera_point,
     parse_target_command,
@@ -180,6 +182,92 @@ class TestYoloGraspSendTcp(unittest.TestCase):
         self.assertEqual(command.rank, 2)
         self.assertEqual(command.label, "bottle")
         self.assertEqual(command.bbox_xywh, (20.0, 30.0, 60.0, 80.0))
+
+    def test_dynamic_arrival_time_uses_y_distance_to_pick_line(self):
+        t_arrive, remaining = dynamic_arrival_time_s(
+            20.0,
+            pick_y_mm=-30.0,
+            conveyor_speed_mm_s=100.0,
+            conveyor_direction="negative-y",
+        )
+
+        self.assertAlmostEqual(remaining, 50.0)
+        self.assertAlmostEqual(t_arrive, 0.5)
+
+    def test_dynamic_candidate_accepts_configured_base_window(self):
+        target = RankedTarget(
+            rank=1,
+            detection=detection(label="cup"),
+            pixel=(10, 20),
+            raw_point=camera_point(10, 20, 0.40),
+            send_point=CameraPoint(
+                u=10,
+                v=20,
+                depth_m=0.40,
+                x_m=0.1,
+                y_m=0.2,
+                z_m=0.4,
+            ),
+        )
+        center_point = CameraPoint(
+            u=target.detection.u,
+            v=target.detection.v,
+            depth_m=0.40,
+            x_m=0.35,
+            y_m=0.02,
+            z_m=0.12,
+        )
+
+        candidate = dynamic_candidate_from_target(
+            target,
+            center_point,
+            camera_to_base=np.eye(4, dtype=float),
+            min_x_mm=300.0,
+            max_x_mm=400.0,
+            min_y_mm=-30.0,
+            max_y_mm=30.0,
+            pick_y_mm=-30.0,
+            conveyor_speed_mm_s=100.0,
+            conveyor_direction="negative-y",
+        )
+
+        self.assertIsNotNone(candidate)
+        assert candidate is not None
+        self.assertAlmostEqual(candidate.base_x_mm, 350.0)
+        self.assertAlmostEqual(candidate.base_y_mm, 20.0)
+        self.assertAlmostEqual(candidate.remaining_y_mm, 50.0)
+        self.assertAlmostEqual(candidate.t_arrive_s, 0.5)
+
+    def test_dynamic_candidate_rejects_outside_x_range(self):
+        target = RankedTarget(
+            rank=1,
+            detection=detection(label="cup"),
+            pixel=(10, 20),
+            raw_point=camera_point(10, 20, 0.40),
+            send_point=camera_point(10, 20, 0.40),
+        )
+
+        candidate = dynamic_candidate_from_target(
+            target,
+            CameraPoint(
+                u=50,
+                v=60,
+                depth_m=0.40,
+                x_m=0.25,
+                y_m=0.02,
+                z_m=0.12,
+            ),
+            camera_to_base=np.eye(4, dtype=float),
+            min_x_mm=300.0,
+            max_x_mm=400.0,
+            min_y_mm=-30.0,
+            max_y_mm=30.0,
+            pick_y_mm=-30.0,
+            conveyor_speed_mm_s=100.0,
+            conveyor_direction="negative-y",
+        )
+
+        self.assertIsNone(candidate)
 
     def test_parse_target_command_accepts_task_and_rank(self):
         self.assertEqual(parse_target_command("out 1", "in"), ("out", 1))

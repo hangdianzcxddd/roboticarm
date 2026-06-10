@@ -34,6 +34,7 @@ def make_args(**overrides: object) -> argparse.Namespace:
         "no_wait_waypoints": True,
         "print_feedback": False,
         "debug_plan": False,
+        "t_robot_s": 1.7,
         "no_start_ready": False,
         "ready_x_mm": 343.108,
         "ready_y_mm": 0.0,
@@ -281,6 +282,45 @@ class TestCatchServer1(unittest.TestCase):
         self.assertEqual(response["payload"]["yolo"]["rank"], 2)
         self.assertEqual(response["payload"]["yolo"]["label"], "placed_block")
         self.assertEqual(response["payload"]["yolo"]["bbox_format"], "xywh")
+
+    def test_handle_dynamic_message_uses_fixed_pick_point_and_reports_timing(self):
+        args = make_args(debug_plan=True, t_robot_s=0.30)
+        camera_to_base = np.eye(4, dtype=float)
+        camera_to_base[:3, 3] = np.array([0.20, 0.10, 0.0])
+        message = make_camera_point_message(
+            CameraPointCommand(
+                x_m=0.10,
+                y_m=-0.05,
+                z_m=0.30,
+                command_id="cmd-dynamic",
+                grasp_mode="dynamic",
+                t_arrive_s=0.80,
+                conveyor_speed_mm_s=100.0,
+                pick_x_mm=350.0,
+                pick_y_mm=-30.0,
+                detected_x_mm=330.0,
+                detected_y_mm=20.0,
+                detected_z_mm=120.0,
+            )
+        )
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            response = handle_message(
+                message,
+                args=args,
+                camera_to_base=camera_to_base,
+                validator=make_controller(),
+            )
+
+        self.assertEqual(response["type"], "ack")
+        self.assertEqual(response["payload"]["grasp_mode"], "dynamic")
+        self.assertAlmostEqual(response["payload"]["pick_x_mm"], 350.0)
+        self.assertAlmostEqual(response["payload"]["pick_y_mm"], -30.0)
+        self.assertAlmostEqual(response["payload"]["pose"]["x_mm"], 350.0)
+        self.assertAlmostEqual(response["payload"]["pose"]["y_mm"], -30.0)
+        self.assertAlmostEqual(response["payload"]["dynamic_timing"]["t_arrive_s"], 0.80)
+        self.assertAlmostEqual(response["payload"]["dynamic_timing"]["t_robot_s"], 0.30)
+        self.assertAlmostEqual(response["payload"]["dynamic_timing"]["t_wait_s"], 0.50)
 
     def test_execute_default_runs_out_only(self):
         args = make_args(execute=True, place_pick_delay_s=0.0)

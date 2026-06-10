@@ -17,14 +17,17 @@ import queue
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 import cv2
 import numpy as np
 
-from robot_control.linux.catch.hand_eye_mapping import load_camera_to_base_transform
+from robot_control.linux.catch.hand_eye_mapping import (
+    load_camera_to_base_transform,
+    map_camera_point_to_base_xyz_m,
+)
 from robot_control.shared.protocol import (
     CameraPointCommand,
     CameraPointTask,
@@ -54,6 +57,7 @@ DEFAULT_HAND_EYE_RESULT = (
     PROJECT_DIR / "robot_control" / "linux" / "hand_eye" / "hand_eye_result.json"
 )
 SendCameraPointFunc = Callable[[str, int, CameraPointCommand, float], dict[str, Any]]
+GraspRunMode = Literal["static", "dynamic"]
 
 
 @dataclass(frozen=True)
@@ -67,6 +71,28 @@ class RankedTarget:
     @property
     def depth_mm(self) -> float:
         return self.raw_point.depth_m * 1000.0
+
+
+@dataclass(frozen=True)
+class DynamicGraspCandidate:
+    target: RankedTarget
+    center_point: CameraPoint
+    base_xyz_m: tuple[float, float, float]
+    t_arrive_s: float
+    remaining_y_mm: float
+    distance_to_pick_y_mm: float
+
+    @property
+    def base_x_mm(self) -> float:
+        return self.base_xyz_m[0] * 1000.0
+
+    @property
+    def base_y_mm(self) -> float:
+        return self.base_xyz_m[1] * 1000.0
+
+    @property
+    def base_z_mm(self) -> float:
+        return self.base_xyz_m[2] * 1000.0
 
 
 class TerminalInput:
@@ -117,29 +143,27 @@ class YoloGraspSender:
         target: RankedTarget,
         source: str,
         task: CameraPointTask | None = None,
+        grasp_mode: GraspRunMode = "static",
+        t_arrive_s: float | None = None,
+        conveyor_speed_mm_s: float | None = None,
+        pick_x_mm: float | None = None,
+        pick_y_mm: float | None = None,
+        detected_xyz_mm: tuple[float, float, float] | None = None,
     ) -> dict[str, Any]:
         task = self.task if task is None else task
         command = camera_point_command_from_target(
             target,
             source=source,
             task=task,
+            grasp_mode=grasp_mode,
+            t_arrive_s=t_arrive_s,
+            conveyor_speed_mm_s=conveyor_speed_mm_s,
+            pick_x_mm=pick_x_mm,
+            pick_y_mm=pick_y_mm,
+            detected_xyz_mm=detected_xyz_mm,
         )
         if self.dry_run:
-            return {
-                "type": "dry_run",
-                "payload": {
-                    "task": command.task,
-                    "rank": target.rank,
-                    "label": target.detection.label,
-                    "source": command.source,
-                    "u": command.u,
-                    "v": command.v,
-                    "x_m": command.x_m,
-                    "y_m": command.y_m,
-                    "z_m": command.z_m,
-                    "depth_m": command.depth_m,
-                },
-            }
+            return {"type": "dry_run", "payload": command_payload(command)}
         if not self.host:
             raise ValueError("--host is required unless --dry-run is used")
         return self._send_func(self.host, self.port, command, self.timeout_s)
@@ -151,6 +175,17 @@ def build_parser() -> argparse.ArgumentParser:
             "Detect objects with models/yolo26n.pt, rank valid bboxes by depth, "
             "and send the selected camera XYZ to the Linux catch server."
         )
+    )
+    parser.add_argument(
+        "mode",
+        nargs="?",
+        choices=("static", "dynamic"),
+        default="static",
+        help=(
+            "static keeps the original manual rank-send workflow; dynamic "
+            "automatically sends one target when it reaches the configured "
+            "conveyor timing window."
+        ),
     )
     parser.add_argument("--host", help="Linux VM IP address running catch_server")
     parser.add_argument("--port", type=int, default=5005)
@@ -265,6 +300,62 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--print-interval", type=float, default=1.0)
     parser.add_argument("--hide-depth", action="store_true")
     parser.add_argument("--no-display", action="store_true")
+    parser.add_argument(
+        "--conveyor-speed-mm-s",
+        type=float,
+        default=100.0,
+        help="dynamic mode conveyor speed magnitude in mm/s",
+    )
+    parser.add_argument(
+        "--conveyor-direction",
+        choices=("negative-y", "positive-y"),
+        default="negative-y",
+        help=(
+            "dynamic mode object travel direction in robot base coordinates. "
+            "Default assumes objects move toward smaller base Y values."
+        ),
+    )
+    parser.add_argument(
+        "--dynamic-min-x-mm",
+        type=float,
+        default=300.0,
+        help="dynamic mode lower base-X bound for accepting a target center",
+    )
+    parser.add_argument(
+        "--dynamic-max-x-mm",
+        type=float,
+        default=400.0,
+        help="dynamic mode upper base-X bound for accepting a target center",
+    )
+    parser.add_argument(
+        "--dynamic-min-y-mm",
+        type=float,
+        default=-30.0,
+        help="dynamic mode lower base-Y bound for accepting a target center",
+    )
+    parser.add_argument(
+        "--dynamic-max-y-mm",
+        type=float,
+        default=30.0,
+        help="dynamic mode upper base-Y bound for accepting a target center",
+    )
+    parser.add_argument(
+        "--dynamic-pick-x-mm",
+        type=float,
+        default=350.0,
+        help="fixed robot base X for dynamic grasp execution",
+    )
+    parser.add_argument(
+        "--dynamic-pick-y-mm",
+        type=float,
+        default=-30.0,
+        help="fixed robot base Y line used to compute dynamic T_arrive",
+    )
+    parser.add_argument(
+        "--dynamic-keep-running",
+        action="store_true",
+        help="continue after a dynamic send instead of exiting after the first target",
+    )
     return parser
 
 
@@ -288,6 +379,15 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--print-interval must be >= 0")
     if args.base_z_offset_mm != 0.0 and args.hand_eye_result is None:
         raise ValueError("--base-z-offset-mm requires --hand-eye-result")
+    if args.mode == "dynamic":
+        if args.hand_eye_result is None:
+            raise ValueError("dynamic mode requires --hand-eye-result")
+        if args.conveyor_speed_mm_s <= 0.0:
+            raise ValueError("--conveyor-speed-mm-s must be > 0 in dynamic mode")
+        if args.dynamic_min_x_mm > args.dynamic_max_x_mm:
+            raise ValueError("--dynamic-min-x-mm must be <= --dynamic-max-x-mm")
+        if args.dynamic_min_y_mm > args.dynamic_max_y_mm:
+            raise ValueError("--dynamic-min-y-mm must be <= --dynamic-max-y-mm")
 
 
 def make_depth_colormap(depth_frame: Any, max_depth_m: float) -> Any:
@@ -365,6 +465,130 @@ def apply_base_z_offset(
         y_m=float(adjusted_camera[1]),
         z_m=float(adjusted_camera[2]),
     )
+
+
+def deproject_detection_center(
+    detection: Detection,
+    depth_frame: Any,
+    *,
+    sample_radius: int,
+    intrinsics: PinholeIntrinsics | None,
+) -> CameraPoint:
+    return deproject_pixel_to_camera_xyz(
+        depth_frame,
+        detection.u,
+        detection.v,
+        sample_radius=sample_radius,
+        intrinsics=intrinsics,
+    )
+
+
+def dynamic_arrival_time_s(
+    center_y_mm: float,
+    *,
+    pick_y_mm: float,
+    conveyor_speed_mm_s: float,
+    conveyor_direction: Literal["negative-y", "positive-y"],
+) -> tuple[float, float]:
+    if conveyor_speed_mm_s <= 0.0:
+        raise ValueError("conveyor speed must be > 0")
+    if conveyor_direction == "negative-y":
+        remaining_y_mm = center_y_mm - pick_y_mm
+    elif conveyor_direction == "positive-y":
+        remaining_y_mm = pick_y_mm - center_y_mm
+    else:
+        raise ValueError("conveyor_direction must be 'negative-y' or 'positive-y'")
+    return remaining_y_mm / conveyor_speed_mm_s, remaining_y_mm
+
+
+def dynamic_candidate_from_target(
+    target: RankedTarget,
+    center_point: CameraPoint,
+    *,
+    camera_to_base: np.ndarray,
+    min_x_mm: float,
+    max_x_mm: float,
+    min_y_mm: float,
+    max_y_mm: float,
+    pick_y_mm: float,
+    conveyor_speed_mm_s: float,
+    conveyor_direction: Literal["negative-y", "positive-y"],
+) -> DynamicGraspCandidate | None:
+    base_xyz_m = map_camera_point_to_base_xyz_m(
+        center_point.x_m,
+        center_point.y_m,
+        center_point.z_m,
+        camera_to_base,
+    )
+    center_x_mm = base_xyz_m[0] * 1000.0
+    center_y_mm = base_xyz_m[1] * 1000.0
+    if center_x_mm < min_x_mm or center_x_mm > max_x_mm:
+        return None
+    if center_y_mm < min_y_mm or center_y_mm > max_y_mm:
+        return None
+
+    t_arrive_s, remaining_y_mm = dynamic_arrival_time_s(
+        center_y_mm,
+        pick_y_mm=pick_y_mm,
+        conveyor_speed_mm_s=conveyor_speed_mm_s,
+        conveyor_direction=conveyor_direction,
+    )
+    if t_arrive_s < 0.0:
+        return None
+
+    return DynamicGraspCandidate(
+        target=target,
+        center_point=center_point,
+        base_xyz_m=base_xyz_m,
+        t_arrive_s=float(t_arrive_s),
+        remaining_y_mm=float(remaining_y_mm),
+        distance_to_pick_y_mm=abs(center_y_mm - pick_y_mm),
+    )
+
+
+def find_dynamic_candidate(
+    targets: list[RankedTarget],
+    depth_frame: Any,
+    *,
+    sample_radius: int,
+    intrinsics: PinholeIntrinsics | None,
+    camera_to_base: np.ndarray,
+    min_x_mm: float,
+    max_x_mm: float,
+    min_y_mm: float,
+    max_y_mm: float,
+    pick_y_mm: float,
+    conveyor_speed_mm_s: float,
+    conveyor_direction: Literal["negative-y", "positive-y"],
+) -> DynamicGraspCandidate | None:
+    candidates: list[DynamicGraspCandidate] = []
+    for target in targets:
+        try:
+            center_point = deproject_detection_center(
+                target.detection,
+                depth_frame,
+                sample_radius=sample_radius,
+                intrinsics=intrinsics,
+            )
+        except ValueError:
+            continue
+        candidate = dynamic_candidate_from_target(
+            target,
+            center_point,
+            camera_to_base=camera_to_base,
+            min_x_mm=min_x_mm,
+            max_x_mm=max_x_mm,
+            min_y_mm=min_y_mm,
+            max_y_mm=max_y_mm,
+            pick_y_mm=pick_y_mm,
+            conveyor_speed_mm_s=conveyor_speed_mm_s,
+            conveyor_direction=conveyor_direction,
+        )
+        if candidate is not None:
+            candidates.append(candidate)
+    if not candidates:
+        return None
+    return min(candidates, key=lambda item: (item.t_arrive_s, item.target.rank))
 
 
 def detections_to_ranked_targets(
@@ -447,8 +671,19 @@ def camera_point_command_from_target(
     target: RankedTarget,
     source: str,
     task: CameraPointTask = "out",
+    grasp_mode: GraspRunMode = "static",
+    t_arrive_s: float | None = None,
+    conveyor_speed_mm_s: float | None = None,
+    pick_x_mm: float | None = None,
+    pick_y_mm: float | None = None,
+    detected_xyz_mm: tuple[float, float, float] | None = None,
 ) -> CameraPointCommand:
     detection = target.detection
+    detected_x_mm = None
+    detected_y_mm = None
+    detected_z_mm = None
+    if detected_xyz_mm is not None:
+        detected_x_mm, detected_y_mm, detected_z_mm = detected_xyz_mm
     return CameraPointCommand(
         x_m=target.send_point.x_m,
         y_m=target.send_point.y_m,
@@ -468,7 +703,19 @@ def camera_point_command_from_target(
             float(detection.width),
             float(detection.height),
         ),
+        grasp_mode=grasp_mode,
+        t_arrive_s=t_arrive_s,
+        conveyor_speed_mm_s=conveyor_speed_mm_s,
+        pick_x_mm=pick_x_mm,
+        pick_y_mm=pick_y_mm,
+        detected_x_mm=detected_x_mm,
+        detected_y_mm=detected_y_mm,
+        detected_z_mm=detected_z_mm,
     )
+
+
+def command_payload(command: CameraPointCommand) -> dict[str, Any]:
+    return asdict(command)
 
 
 def find_ranked_target(
@@ -494,15 +741,21 @@ def format_target_line(target: RankedTarget) -> str:
     )
 
 
-def print_target_table(targets: list[RankedTarget], errors: dict[int, str]) -> None:
+def print_target_table(
+    targets: list[RankedTarget],
+    errors: dict[int, str],
+    *,
+    show_commands: bool = True,
+) -> None:
     if targets:
         print("\nCurrent YOLO targets ranked by depth:", flush=True)
         for target in targets:
             print("  " + format_target_line(target), flush=True)
-        print(
-            "Type 'out N' or 'in N' to send a target, p to print again, q to quit.",
-            flush=True,
-        )
+        if show_commands:
+            print(
+                "Type 'out N' or 'in N' to send a target, p to print again, q to quit.",
+                flush=True,
+            )
     elif errors:
         print(f"\nNo valid depth target: {next(iter(errors.values()))}", flush=True)
     else:
@@ -616,6 +869,57 @@ def send_and_print(
     return response
 
 
+def format_dynamic_candidate(
+    candidate: DynamicGraspCandidate,
+    *,
+    pick_y_mm: float | None = None,
+) -> str:
+    pick_y_text = "" if pick_y_mm is None else f"pick_y={pick_y_mm:.1f}mm "
+    return (
+        f"rank={candidate.target.rank} "
+        f"base=({candidate.base_x_mm:.1f},{candidate.base_y_mm:.1f},"
+        f"{candidate.base_z_mm:.1f})mm "
+        f"{pick_y_text}"
+        f"remain_y={candidate.remaining_y_mm:.1f}mm "
+        f"t_arrive={candidate.t_arrive_s:.3f}s"
+    )
+
+
+def send_dynamic_candidate(
+    sender: YoloGraspSender,
+    candidate: DynamicGraspCandidate,
+    *,
+    source: str,
+    task: CameraPointTask,
+    conveyor_speed_mm_s: float,
+    pick_x_mm: float,
+    pick_y_mm: float,
+) -> dict[str, Any]:
+    response = sender.send_target(
+        candidate.target,
+        source=source,
+        task=task,
+        grasp_mode="dynamic",
+        t_arrive_s=candidate.t_arrive_s,
+        conveyor_speed_mm_s=conveyor_speed_mm_s,
+        pick_x_mm=pick_x_mm,
+        pick_y_mm=pick_y_mm,
+        detected_xyz_mm=(
+            candidate.base_x_mm,
+            candidate.base_y_mm,
+            candidate.base_z_mm,
+        ),
+    )
+    print(
+        "\nSent dynamic "
+        f"{task} target: {format_dynamic_candidate(candidate, pick_y_mm=pick_y_mm)} "
+        f"fixed_pick=({pick_x_mm:.1f},{pick_y_mm:.1f})mm",
+        flush=True,
+    )
+    print(response, flush=True)
+    return response
+
+
 def parse_target_command(command: str, default_task: CameraPointTask) -> tuple[CameraPointTask, int] | None:
     parts = command.strip().lower().split()
     if len(parts) == 1:
@@ -712,17 +1016,35 @@ def main() -> None:
         task=args.task,
     )
     terminal = TerminalInput()
-    terminal.start()
-    source = "yolo_bbox_center_up"
+    if args.mode == "static":
+        terminal.start()
+    source = "yolo_bbox_center_up" if args.mode == "static" else "yolo_dynamic_timed"
     last_print_time = 0.0
     latest_targets: list[RankedTarget] = []
     latest_errors: dict[int, str] = {}
-
-    print(
-        "Type 'out N' or 'in N' in this terminal to send a target. "
-        "Type p to print targets, q to quit.",
-        flush=True,
+    dynamic_sent = False
+    dynamic_status = (
+        "Dynamic mode: waiting for target in "
+        f"X=[{args.dynamic_min_x_mm:.1f},{args.dynamic_max_x_mm:.1f}]mm, "
+        f"Y=[{args.dynamic_min_y_mm:.1f},{args.dynamic_max_y_mm:.1f}]mm."
     )
+
+    if args.mode == "static":
+        print(
+            "Type 'out N' or 'in N' in this terminal to send a target. "
+            "Type p to print targets, q to quit.",
+            flush=True,
+        )
+    else:
+        print(
+            "Dynamic mode enabled. "
+            f"speed={args.conveyor_speed_mm_s:.3f}mm/s "
+            f"direction={args.conveyor_direction} "
+            f"fixed_pick=({args.dynamic_pick_x_mm:.1f},"
+            f"{args.dynamic_pick_y_mm:.1f})mm. "
+            "Press Esc to exit.",
+            flush=True,
+        )
 
     if not args.no_display:
         cv2.namedWindow(RGB_WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
@@ -756,25 +1078,81 @@ def main() -> None:
 
             now = time.monotonic()
             if args.print_interval == 0.0 or now - last_print_time >= args.print_interval:
-                print_target_table(latest_targets, latest_errors)
+                print_target_table(
+                    latest_targets,
+                    latest_errors,
+                    show_commands=args.mode == "static",
+                )
+                if args.mode == "dynamic":
+                    print(dynamic_status, flush=True)
                 last_print_time = now
 
-            while True:
-                command = terminal.get_nowait()
-                if command is None:
-                    break
-                running = process_terminal_command(
-                    command,
-                    targets=latest_targets,
-                    errors=latest_errors,
-                    sender=sender,
-                    source=source,
+            if args.mode == "static":
+                while True:
+                    command = terminal.get_nowait()
+                    if command is None:
+                        break
+                    running = process_terminal_command(
+                        command,
+                        targets=latest_targets,
+                        errors=latest_errors,
+                        sender=sender,
+                        source=source,
+                    )
+                    if not running:
+                        break
+            elif not dynamic_sent or args.dynamic_keep_running:
+                if camera_to_base is None:
+                    raise ValueError("dynamic mode requires --hand-eye-result")
+                candidate = find_dynamic_candidate(
+                    latest_targets,
+                    depth_frame,
+                    sample_radius=args.sample_radius,
+                    intrinsics=intrinsics,
+                    camera_to_base=camera_to_base,
+                    min_x_mm=args.dynamic_min_x_mm,
+                    max_x_mm=args.dynamic_max_x_mm,
+                    min_y_mm=args.dynamic_min_y_mm,
+                    max_y_mm=args.dynamic_max_y_mm,
+                    pick_y_mm=args.dynamic_pick_y_mm,
+                    conveyor_speed_mm_s=args.conveyor_speed_mm_s,
+                    conveyor_direction=args.conveyor_direction,
                 )
-                if not running:
-                    break
+                if candidate is not None:
+                    dynamic_status = (
+                        "Dynamic candidate "
+                        + format_dynamic_candidate(
+                            candidate,
+                            pick_y_mm=args.dynamic_pick_y_mm,
+                        )
+                    )
+                    try:
+                        send_dynamic_candidate(
+                            sender,
+                            candidate,
+                            source=source,
+                            task=args.task,
+                            conveyor_speed_mm_s=args.conveyor_speed_mm_s,
+                            pick_x_mm=args.dynamic_pick_x_mm,
+                            pick_y_mm=args.dynamic_pick_y_mm,
+                        )
+                        dynamic_sent = True
+                        if not args.dynamic_keep_running:
+                            running = False
+                    except Exception as exc:  # noqa: BLE001 - hardware UI should keep context
+                        dynamic_status = f"Dynamic send failed: {exc}"
+                        print(dynamic_status, flush=True)
+                else:
+                    dynamic_status = (
+                        "Dynamic mode: no target inside configured base-coordinate "
+                        "window yet."
+                    )
 
             if not args.no_display:
-                status = "No YOLO target found. Type q in terminal or press Esc to exit."
+                if args.mode == "static":
+                    status = "No YOLO target found. Type q in terminal or press Esc to exit."
+                else:
+                    status = dynamic_status
                 display_image = color_image.copy()
                 draw_ranked_targets(
                     display_image,

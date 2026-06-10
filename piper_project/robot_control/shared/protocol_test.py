@@ -30,6 +30,14 @@ class TestTcpProtocol(unittest.TestCase):
             confidence=0.82,
             class_id=41,
             bbox_xywh=(10.0, 20.0, 30.0, 40.0),
+            grasp_mode="dynamic",
+            t_arrive_s=0.75,
+            conveyor_speed_mm_s=100.0,
+            pick_x_mm=350.0,
+            pick_y_mm=-30.0,
+            detected_x_mm=330.0,
+            detected_y_mm=15.0,
+            detected_z_mm=120.0,
         )
 
         decoded = decode_message(encode_message(make_camera_point_message(command)))
@@ -47,6 +55,14 @@ class TestTcpProtocol(unittest.TestCase):
         self.assertAlmostEqual(parsed.confidence, 0.82)
         self.assertEqual(parsed.class_id, 41)
         self.assertEqual(parsed.bbox_xywh, (10.0, 20.0, 30.0, 40.0))
+        self.assertEqual(parsed.grasp_mode, "dynamic")
+        self.assertAlmostEqual(parsed.t_arrive_s, 0.75)
+        self.assertAlmostEqual(parsed.conveyor_speed_mm_s, 100.0)
+        self.assertAlmostEqual(parsed.pick_x_mm, 350.0)
+        self.assertAlmostEqual(parsed.pick_y_mm, -30.0)
+        self.assertAlmostEqual(parsed.detected_x_mm, 330.0)
+        self.assertAlmostEqual(parsed.detected_y_mm, 15.0)
+        self.assertAlmostEqual(parsed.detected_z_mm, 120.0)
 
     def test_camera_point_task_defaults_to_out(self):
         message = make_camera_point_message(

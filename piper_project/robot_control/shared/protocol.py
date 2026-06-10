@@ -12,6 +12,7 @@ from typing import Any, Literal, cast
 PROTOCOL_VERSION = 1
 MessageType = Literal["camera_point", "ack", "error"]
 CameraPointTask = Literal["out", "in"]
+GraspMode = Literal["static", "dynamic"]
 
 
 @dataclass(frozen=True)
@@ -30,6 +31,14 @@ class CameraPointCommand:
     confidence: float | None = None
     class_id: int | None = None
     bbox_xywh: tuple[float, float, float, float] | None = None
+    grasp_mode: GraspMode = "static"
+    t_arrive_s: float | None = None
+    conveyor_speed_mm_s: float | None = None
+    pick_x_mm: float | None = None
+    pick_y_mm: float | None = None
+    detected_x_mm: float | None = None
+    detected_y_mm: float | None = None
+    detected_z_mm: float | None = None
 
 
 def make_camera_point_message(command: CameraPointCommand) -> dict[str, Any]:
@@ -105,6 +114,9 @@ def camera_point_from_message(message: dict[str, Any]) -> CameraPointCommand:
     task = str(payload.get("task", "out")).lower()
     if task not in ("out", "in"):
         raise ValueError("camera point task must be 'out' or 'in'")
+    grasp_mode = str(payload.get("grasp_mode", "static")).lower()
+    if grasp_mode not in ("static", "dynamic"):
+        raise ValueError("grasp mode must be 'static' or 'dynamic'")
 
     try:
         return CameraPointCommand(
@@ -142,6 +154,14 @@ def camera_point_from_message(message: dict[str, Any]) -> CameraPointCommand:
                 if payload.get("bbox_xywh") is not None
                 else None
             ),
+            grasp_mode=cast(GraspMode, grasp_mode),
+            t_arrive_s=_optional_float(payload, "t_arrive_s"),
+            conveyor_speed_mm_s=_optional_float(payload, "conveyor_speed_mm_s"),
+            pick_x_mm=_optional_float(payload, "pick_x_mm"),
+            pick_y_mm=_optional_float(payload, "pick_y_mm"),
+            detected_x_mm=_optional_float(payload, "detected_x_mm"),
+            detected_y_mm=_optional_float(payload, "detected_y_mm"),
+            detected_z_mm=_optional_float(payload, "detected_z_mm"),
         )
     except KeyError as exc:
         raise ValueError(f"missing camera point field: {exc.args[0]}") from exc
@@ -155,6 +175,12 @@ def _tuple4_float(value: Any, label: str) -> tuple[float, float, float, float]:
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{label} must contain exactly 4 numeric values") from exc
     return cast(tuple[float, float, float, float], values)
+
+
+def _optional_float(payload: dict[str, Any], key: str) -> float | None:
+    if payload.get(key) is None:
+        return None
+    return float(payload[key])
 
 
 def send_camera_point(

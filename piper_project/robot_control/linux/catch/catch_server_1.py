@@ -89,6 +89,13 @@ class YoloCatchPlan:
     steps: tuple[SequenceStep, ...]
 
 
+@dataclass(frozen=True)
+class DynamicTiming:
+    t_arrive_s: float
+    t_robot_s: float
+    t_wait_s: float
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -111,6 +118,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-wait-waypoints", action="store_true")
     parser.add_argument("--print-feedback", action="store_true")
     parser.add_argument("--debug-plan", action="store_true")
+    parser.add_argument(
+        "--t-robot-s",
+        type=float,
+        default=1.7,
+        help=(
+            "dynamic mode measured robot reaction time from grasp command to "
+            "gripper closed at the pick point"
+        ),
+    )
     parser.add_argument(
         "--no-start-ready",
         action="store_true",
@@ -220,6 +236,7 @@ def validate_args(args: argparse.Namespace) -> None:
         "motion_timeout_s",
         "position_tolerance_mm",
         "orientation_tolerance_deg",
+        "t_robot_s",
         "pick_delay_s",
         "place_pick_delay_s",
         "gripper_settle_s",
@@ -311,8 +328,14 @@ def target_from_command(
         command.z_m,
         camera_to_base,
     )
-    pick_x_mm = base_xyz_m[0] * 1000.0
-    pick_y_mm = base_xyz_m[1] * 1000.0
+    if command.grasp_mode == "dynamic":
+        if command.pick_x_mm is None or command.pick_y_mm is None:
+            raise ValueError("dynamic grasp command requires pick_x_mm and pick_y_mm")
+        pick_x_mm = float(command.pick_x_mm)
+        pick_y_mm = float(command.pick_y_mm)
+    else:
+        pick_x_mm = base_xyz_m[0] * 1000.0
+        pick_y_mm = base_xyz_m[1] * 1000.0
     if args.use_detected_z:
         grasp_z_mm = base_xyz_m[2] * 1000.0 + args.detected_z_offset_mm
     else:
@@ -428,6 +451,54 @@ def validate_steps(controller: PiperController, steps: tuple[SequenceStep, ...])
             raise SafetyError(f"{step.label}: {exc}") from exc
 
 
+def dynamic_timing_from_command(
+    command: CameraPointCommand,
+    args: argparse.Namespace,
+) -> DynamicTiming | None:
+    if command.grasp_mode != "dynamic":
+        return None
+    if command.t_arrive_s is None:
+        raise ValueError("dynamic grasp command requires t_arrive_s")
+    t_arrive_s = float(command.t_arrive_s)
+    t_robot_s = float(args.t_robot_s)
+    if not math.isfinite(t_arrive_s) or t_arrive_s < 0.0:
+        raise ValueError("dynamic t_arrive_s must be finite and >= 0")
+    if not math.isfinite(t_robot_s) or t_robot_s < 0.0:
+        raise ValueError("--t-robot-s must be finite and >= 0")
+    t_wait_s = t_arrive_s - t_robot_s
+    if t_wait_s < 0.0:
+        raise TimeoutError(
+            "dynamic target is too close to the pick line: "
+            f"t_arrive={t_arrive_s:.3f}s < t_robot={t_robot_s:.3f}s"
+        )
+    return DynamicTiming(
+        t_arrive_s=t_arrive_s,
+        t_robot_s=t_robot_s,
+        t_wait_s=t_wait_s,
+    )
+
+
+def wait_for_dynamic_timing(timing: DynamicTiming | None) -> None:
+    if timing is None:
+        return
+    if timing.t_wait_s <= 0.0:
+        print(
+            "Dynamic timing: start immediately "
+            f"(t_arrive={timing.t_arrive_s:.3f}s, "
+            f"t_robot={timing.t_robot_s:.3f}s)",
+            flush=True,
+        )
+        return
+    print(
+        "Dynamic timing: waiting "
+        f"{timing.t_wait_s:.3f}s before grasp "
+        f"(t_arrive={timing.t_arrive_s:.3f}s, "
+        f"t_robot={timing.t_robot_s:.3f}s)",
+        flush=True,
+    )
+    time.sleep(timing.t_wait_s)
+
+
 def yolo_metadata_from_message(message: dict[str, Any]) -> dict[str, Any]:
     payload = message.get("payload")
     if not isinstance(payload, dict):
@@ -490,7 +561,11 @@ def _tuple4_float(value: Any, label: str) -> tuple[float, float, float, float]:
     return values
 
 
-def print_plan(plan: YoloCatchPlan, metadata: dict[str, Any] | None = None) -> None:
+def print_plan(
+    plan: YoloCatchPlan,
+    metadata: dict[str, Any] | None = None,
+    timing: DynamicTiming | None = None,
+) -> None:
     command = plan.target.camera_command
     base = plan.target.base_xyz_m
     print("YOLO catch plan:", flush=True)
@@ -510,6 +585,14 @@ def print_plan(plan: YoloCatchPlan, metadata: dict[str, Any] | None = None) -> N
     )
     if metadata:
         print(f"  yolo: {metadata}", flush=True)
+    if timing is not None:
+        print(
+            "  dynamic_timing: "
+            f"t_arrive={timing.t_arrive_s:.3f}s "
+            f"t_robot={timing.t_robot_s:.3f}s "
+            f"t_wait={timing.t_wait_s:.3f}s",
+            flush=True,
+        )
     for index, step in enumerate(plan.steps, start=1):
         gripper = "" if step.gripper_after is None else f" gripper={step.gripper_after}"
         delay = "" if step.delay_before_s <= 0 else f" delay_before={step.delay_before_s:g}s"
@@ -619,6 +702,7 @@ def handle_message(
 ) -> dict[str, Any]:
     command = camera_point_from_message(message)
     metadata = yolo_metadata_from_message(message)
+    timing = dynamic_timing_from_command(command, args)
     target = target_from_command(
         command,
         camera_to_base,
@@ -632,16 +716,18 @@ def handle_message(
     validate_steps(controller or validator, plan.steps)
 
     if args.debug_plan or not args.execute:
-        print_plan(plan, metadata)
+        print_plan(plan, metadata, timing)
 
     send_counts: dict[str, int] = {}
     if args.execute:
         if controller is None:
             raise RuntimeError("execute=True requires a connected PiperController")
+        wait_for_dynamic_timing(timing)
         send_counts = execute_plan(controller, args, plan)
 
     print(
         f"task={plan.task} "
+        f"mode={command.grasp_mode} "
         "camera_xyz="
         f"({command.x_m:.4f}, {command.y_m:.4f}, {command.z_m:.4f}) m -> "
         f"base_xy=({target.pick_x_mm:.3f}, {target.pick_y_mm:.3f}) mm "
@@ -665,6 +751,7 @@ def handle_message(
     response["payload"].update(
         {
             "task": plan.task,
+            "grasp_mode": command.grasp_mode,
             "mapping_source": "hand_eye",
             "base_xyz_m": {
                 "x_m": target.base_xyz_m[0],
@@ -704,6 +791,18 @@ def handle_message(
             "gripper_enabled": not args.no_gripper,
         }
     )
+    if timing is not None:
+        response["payload"]["dynamic_timing"] = {
+            "t_arrive_s": timing.t_arrive_s,
+            "t_robot_s": timing.t_robot_s,
+            "t_wait_s": timing.t_wait_s,
+            "conveyor_speed_mm_s": command.conveyor_speed_mm_s,
+            "pick_x_mm": command.pick_x_mm,
+            "pick_y_mm": command.pick_y_mm,
+            "detected_x_mm": command.detected_x_mm,
+            "detected_y_mm": command.detected_y_mm,
+            "detected_z_mm": command.detected_z_mm,
+        }
     if metadata:
         response["payload"]["yolo"] = metadata
     return response
