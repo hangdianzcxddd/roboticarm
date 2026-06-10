@@ -1408,6 +1408,36 @@ def handle_message(
             rz_deg=target_orientation.rz_deg,
         )
         mapping_source = "hand_eye"
+    if command.grasp_mode == "probe":
+        print(
+            "camera_xyz probe="
+            f"({command.x_m:.4f}, {command.y_m:.4f}, {command.z_m:.4f}) m -> "
+            f"mapping={mapping_source} target_tcp={format_pose(target_tcp_pose)}",
+            flush=True,
+        )
+        response = make_ack_message(
+            command.command_id,
+            pose_to_dict(target_tcp_pose),
+            executed=False,
+        )
+        response["payload"].update(
+            {
+                "grasp_mode": command.grasp_mode,
+                "probe_only": True,
+                "mapping_source": mapping_source,
+                "target_tcp_pose": pose_to_dict(target_tcp_pose),
+                "base_xyz_m": (
+                    None
+                    if base_xyz_m is None
+                    else {
+                        "x_m": base_xyz_m[0],
+                        "y_m": base_xyz_m[1],
+                        "z_m": base_xyz_m[2],
+                    }
+                ),
+            }
+        )
+        return response
     validate_target_tcp_pose(target_tcp_pose, args)
     plan = build_catch_plan(
         target_tcp_pose,

@@ -11,14 +11,19 @@ from robot_control.windows.client.yolo_grasp_send_tcp import (
     RankedTarget,
     YoloGraspSender,
     apply_base_z_offset,
+    build_parser,
     camera_point_command_from_target,
     detections_to_ranked_targets,
     dynamic_arrival_time_s,
     dynamic_candidate_from_target,
+    dynamic_candidate_is_suppressed,
+    dynamic_skip_reason_from_response,
+    remember_suppressed_dynamic_target,
     grasp_pixel_from_detection,
     offset_camera_point,
     parse_target_command,
     process_terminal_command,
+    send_dynamic_probe,
     validate_args,
 )
 from robot_control.windows.vision.depth import CameraPoint
@@ -149,6 +154,12 @@ class TestYoloGraspSendTcp(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "--base-z-offset-mm requires"):
             validate_args(Args())
 
+    def test_dynamic_mode_requires_conveyor_speed_input(self):
+        args = build_parser().parse_args(["dynamic", "--dry-run"])
+
+        with self.assertRaisesRegex(ValueError, "--conveyor-speed-mm-s is required"):
+            validate_args(args)
+
     def test_target_converts_to_click_compatible_camera_point_command(self):
         target = RankedTarget(
             rank=2,
@@ -269,6 +280,64 @@ class TestYoloGraspSendTcp(unittest.TestCase):
 
         self.assertIsNone(candidate)
 
+    def test_dynamic_skip_response_can_suppress_repeated_candidate(self):
+        response = {
+            "type": "ack",
+            "payload": {
+                "skipped": True,
+                "dynamic_timing": {"skip_reason": "too close"},
+            },
+        }
+
+        reason = dynamic_skip_reason_from_response(response)
+
+        self.assertEqual(reason, "too close")
+
+    def test_dynamic_suppression_matches_nearby_base_xy(self):
+        target = RankedTarget(
+            rank=1,
+            detection=detection(label="cup"),
+            pixel=(10, 20),
+            raw_point=camera_point(10, 20, 0.40),
+            send_point=camera_point(10, 20, 0.40),
+        )
+        candidate = dynamic_candidate_from_target(
+            target,
+            CameraPoint(
+                u=50,
+                v=60,
+                depth_m=0.40,
+                x_m=0.35,
+                y_m=0.02,
+                z_m=0.12,
+            ),
+            camera_to_base=np.eye(4, dtype=float),
+            min_x_mm=300.0,
+            max_x_mm=400.0,
+            min_y_mm=-30.0,
+            max_y_mm=30.0,
+            pick_y_mm=-30.0,
+            conveyor_speed_mm_s=100.0,
+            conveyor_direction="negative-y",
+        )
+        self.assertIsNotNone(candidate)
+        assert candidate is not None
+
+        suppressed = remember_suppressed_dynamic_target(
+            [],
+            candidate,
+            now_s=10.0,
+            memory_s=5.0,
+        )
+
+        self.assertTrue(
+            dynamic_candidate_is_suppressed(
+                candidate,
+                suppressed,
+                radius_mm=80.0,
+            )
+        )
+
     def test_parse_target_command_accepts_task_and_rank(self):
         self.assertEqual(parse_target_command("out 1", "in"), ("out", 1))
         self.assertEqual(parse_target_command("in 2", "out"), ("in", 2))
@@ -307,6 +376,62 @@ class TestYoloGraspSendTcp(unittest.TestCase):
         self.assertEqual(response["payload"]["label"], "cup")
         self.assertEqual(response["payload"]["u"], 10)
         self.assertEqual(response["payload"]["x_m"], 0.1)
+
+    def test_dynamic_probe_sends_probe_grasp_mode(self):
+        target = RankedTarget(
+            rank=1,
+            detection=detection(label="cup"),
+            pixel=(10, 20),
+            raw_point=camera_point(10, 20, 0.40),
+            send_point=CameraPoint(
+                u=10,
+                v=20,
+                depth_m=0.40,
+                x_m=0.1,
+                y_m=0.2,
+                z_m=0.4,
+            ),
+        )
+        sent = []
+
+        def fake_send(host, port, command, timeout_s):
+            del host, port, timeout_s
+            sent.append(command)
+            return {"type": "ack", "payload": {"base_xyz_m": {}}}
+
+        sender = YoloGraspSender(
+            host="127.0.0.1",
+            port=5005,
+            timeout_s=1.0,
+            dry_run=False,
+            task="out",
+            send_func=fake_send,
+        )
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            response = send_dynamic_probe(
+                sender,
+                target,
+                source="yolo_dynamic_timed",
+                task="out",
+                center_point=CameraPoint(
+                    u=50,
+                    v=60,
+                    depth_m=0.42,
+                    x_m=0.3,
+                    y_m=-0.1,
+                    z_m=0.42,
+                ),
+            )
+
+        self.assertEqual(response["type"], "ack")
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0].grasp_mode, "probe")
+        self.assertEqual((sent[0].u, sent[0].v), (50, 60))
+        self.assertAlmostEqual(sent[0].x_m, 0.3)
+        self.assertAlmostEqual(sent[0].y_m, -0.1)
+        self.assertIsNone(sent[0].pick_x_mm)
+        self.assertIsNone(sent[0].pick_y_mm)
 
     def test_terminal_command_sends_task_from_command_prefix(self):
         target = RankedTarget(

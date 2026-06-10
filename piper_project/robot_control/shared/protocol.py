@@ -12,7 +12,7 @@ from typing import Any, Literal, cast
 PROTOCOL_VERSION = 1
 MessageType = Literal["camera_point", "ack", "error"]
 CameraPointTask = Literal["out", "in"]
-GraspMode = Literal["static", "dynamic"]
+GraspMode = Literal["static", "dynamic", "probe"]
 
 
 @dataclass(frozen=True)
@@ -115,8 +115,8 @@ def camera_point_from_message(message: dict[str, Any]) -> CameraPointCommand:
     if task not in ("out", "in"):
         raise ValueError("camera point task must be 'out' or 'in'")
     grasp_mode = str(payload.get("grasp_mode", "static")).lower()
-    if grasp_mode not in ("static", "dynamic"):
-        raise ValueError("grasp mode must be 'static' or 'dynamic'")
+    if grasp_mode not in ("static", "dynamic", "probe"):
+        raise ValueError("grasp mode must be 'static', 'dynamic', or 'probe'")
 
     try:
         return CameraPointCommand(

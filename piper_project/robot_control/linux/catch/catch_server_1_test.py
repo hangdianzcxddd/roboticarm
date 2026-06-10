@@ -322,6 +322,82 @@ class TestCatchServer1(unittest.TestCase):
         self.assertAlmostEqual(response["payload"]["dynamic_timing"]["t_robot_s"], 0.30)
         self.assertAlmostEqual(response["payload"]["dynamic_timing"]["t_wait_s"], 0.50)
 
+    def test_handle_probe_message_only_reports_base_coordinates(self):
+        args = make_args(execute=True)
+        camera_to_base = np.eye(4, dtype=float)
+        camera_to_base[:3, 3] = np.array([0.20, 0.10, 0.0])
+        message = make_camera_point_message(
+            CameraPointCommand(
+                x_m=0.10,
+                y_m=-0.05,
+                z_m=0.30,
+                u=1138,
+                v=287,
+                depth_m=0.521,
+                command_id="cmd-probe",
+                label="cup",
+                rank=1,
+                bbox_xywh=(1049.0, 218.0, 179.0, 198.0),
+                grasp_mode="probe",
+            )
+        )
+        controller = make_controller()
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            response = handle_message(
+                message,
+                args=args,
+                camera_to_base=camera_to_base,
+                validator=controller,
+                controller=controller,
+            )
+
+        self.assertEqual(response["type"], "ack")
+        self.assertFalse(response["payload"]["executed"])
+        self.assertTrue(response["payload"]["probe_only"])
+        self.assertEqual(response["payload"]["grasp_mode"], "probe")
+        self.assertAlmostEqual(response["payload"]["base_xyz_m"]["x_m"], 0.30)
+        self.assertAlmostEqual(response["payload"]["base_xyz_m"]["y_m"], 0.05)
+        self.assertAlmostEqual(response["payload"]["base_xyz_m"]["z_m"], 0.30)
+        self.assertEqual(response["payload"]["yolo"]["label"], "cup")
+        end_pose_calls = [call for call in controller.sdk.calls if call[0] == "EndPoseCtrl"]
+        self.assertEqual(end_pose_calls, [])
+
+    def test_handle_dynamic_message_skips_when_target_is_too_close(self):
+        args = make_args(execute=True, t_robot_s=0.30)
+        camera_to_base = np.eye(4, dtype=float)
+        message = make_camera_point_message(
+            CameraPointCommand(
+                x_m=0.35,
+                y_m=0.02,
+                z_m=0.30,
+                command_id="cmd-dynamic-late",
+                grasp_mode="dynamic",
+                t_arrive_s=0.10,
+                conveyor_speed_mm_s=100.0,
+                pick_x_mm=350.0,
+                pick_y_mm=-30.0,
+            )
+        )
+        controller = make_controller()
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            response = handle_message(
+                message,
+                args=args,
+                camera_to_base=camera_to_base,
+                validator=controller,
+                controller=controller,
+            )
+
+        self.assertEqual(response["type"], "ack")
+        self.assertFalse(response["payload"]["executed"])
+        self.assertTrue(response["payload"]["skipped"])
+        self.assertTrue(response["payload"]["dynamic_timing"]["skipped"])
+        self.assertLess(response["payload"]["dynamic_timing"]["t_wait_s"], 0.0)
+        end_pose_calls = [call for call in controller.sdk.calls if call[0] == "EndPoseCtrl"]
+        self.assertEqual(end_pose_calls, [])
+
     def test_execute_default_runs_out_only(self):
         args = make_args(execute=True, place_pick_delay_s=0.0)
         camera_to_base = np.eye(4, dtype=float)

@@ -271,6 +271,22 @@ def handle_message(
         command.z_m,
         mapping_config,
     )
+    if command.grasp_mode == "probe":
+        print(
+            "camera_xyz probe="
+            f"({command.x_m:.4f}, {command.y_m:.4f}, {command.z_m:.4f}) m -> "
+            f"pose={pose}",
+            flush=True,
+        )
+        response = make_ack_message(command.command_id, pose_to_dict(pose), executed=False)
+        response["payload"].update(
+            {
+                "grasp_mode": command.grasp_mode,
+                "probe_only": True,
+                "mapping_source": "simulated",
+            }
+        )
+        return response
     validate_or_execute_pose(
         pose,
         execute=execute,

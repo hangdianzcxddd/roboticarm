@@ -79,6 +79,21 @@ class TestTcpProtocol(unittest.TestCase):
 
         self.assertEqual(parsed.task, "out")
 
+    def test_camera_point_accepts_probe_grasp_mode(self):
+        message = make_camera_point_message(
+            CameraPointCommand(
+                x_m=0.10,
+                y_m=-0.05,
+                z_m=0.40,
+                command_id="cmd-probe",
+                grasp_mode="probe",
+            )
+        )
+
+        parsed = camera_point_from_message(message)
+
+        self.assertEqual(parsed.grasp_mode, "probe")
+
     def test_camera_point_rejects_unknown_task(self):
         message = make_camera_point_message(
             CameraPointCommand(

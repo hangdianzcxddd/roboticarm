@@ -57,7 +57,7 @@ DEFAULT_HAND_EYE_RESULT = (
     PROJECT_DIR / "robot_control" / "linux" / "hand_eye" / "hand_eye_result.json"
 )
 SendCameraPointFunc = Callable[[str, int, CameraPointCommand, float], dict[str, Any]]
-GraspRunMode = Literal["static", "dynamic"]
+GraspRunMode = Literal["static", "dynamic", "probe"]
 
 
 @dataclass(frozen=True)
@@ -93,6 +93,13 @@ class DynamicGraspCandidate:
     @property
     def base_z_mm(self) -> float:
         return self.base_xyz_m[2] * 1000.0
+
+
+@dataclass(frozen=True)
+class SuppressedDynamicTarget:
+    x_mm: float
+    y_mm: float
+    expires_at_s: float
 
 
 class TerminalInput:
@@ -303,8 +310,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--conveyor-speed-mm-s",
         type=float,
-        default=100.0,
-        help="dynamic mode conveyor speed magnitude in mm/s",
+        help="dynamic mode conveyor speed magnitude in mm/s; required for dynamic mode",
     )
     parser.add_argument(
         "--conveyor-direction",
@@ -356,6 +362,30 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="continue after a dynamic send instead of exiting after the first target",
     )
+    parser.add_argument(
+        "--dynamic-skip-memory-s",
+        type=float,
+        default=5.0,
+        help=(
+            "after a dynamic target is skipped, ignore nearby repeated detections "
+            "for this many seconds"
+        ),
+    )
+    parser.add_argument(
+        "--dynamic-skip-radius-mm",
+        type=float,
+        default=80.0,
+        help="base-XY radius used to match repeated skipped dynamic detections",
+    )
+    parser.add_argument(
+        "--dynamic-probe-interval-s",
+        type=float,
+        default=1.0,
+        help=(
+            "dynamic mode interval for sending rank-1 bbox center probe points "
+            "to Linux for camera->base coordinate logging; 0 disables probes"
+        ),
+    )
     return parser
 
 
@@ -382,12 +412,20 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.mode == "dynamic":
         if args.hand_eye_result is None:
             raise ValueError("dynamic mode requires --hand-eye-result")
+        if args.conveyor_speed_mm_s is None:
+            raise ValueError("--conveyor-speed-mm-s is required in dynamic mode")
         if args.conveyor_speed_mm_s <= 0.0:
             raise ValueError("--conveyor-speed-mm-s must be > 0 in dynamic mode")
         if args.dynamic_min_x_mm > args.dynamic_max_x_mm:
             raise ValueError("--dynamic-min-x-mm must be <= --dynamic-max-x-mm")
         if args.dynamic_min_y_mm > args.dynamic_max_y_mm:
             raise ValueError("--dynamic-min-y-mm must be <= --dynamic-max-y-mm")
+        if args.dynamic_skip_memory_s < 0.0:
+            raise ValueError("--dynamic-skip-memory-s must be >= 0")
+        if args.dynamic_skip_radius_mm <= 0.0:
+            raise ValueError("--dynamic-skip-radius-mm must be > 0")
+        if args.dynamic_probe_interval_s < 0.0:
+            raise ValueError("--dynamic-probe-interval-s must be >= 0")
 
 
 def make_depth_colormap(depth_frame: Any, max_depth_m: float) -> Any:
@@ -546,7 +584,7 @@ def dynamic_candidate_from_target(
     )
 
 
-def find_dynamic_candidate(
+def find_dynamic_candidates(
     targets: list[RankedTarget],
     depth_frame: Any,
     *,
@@ -560,7 +598,7 @@ def find_dynamic_candidate(
     pick_y_mm: float,
     conveyor_speed_mm_s: float,
     conveyor_direction: Literal["negative-y", "positive-y"],
-) -> DynamicGraspCandidate | None:
+) -> list[DynamicGraspCandidate]:
     candidates: list[DynamicGraspCandidate] = []
     for target in targets:
         try:
@@ -586,9 +624,39 @@ def find_dynamic_candidate(
         )
         if candidate is not None:
             candidates.append(candidate)
-    if not candidates:
-        return None
-    return min(candidates, key=lambda item: (item.t_arrive_s, item.target.rank))
+    return sorted(candidates, key=lambda item: (item.t_arrive_s, item.target.rank))
+
+
+def find_dynamic_candidate(
+    targets: list[RankedTarget],
+    depth_frame: Any,
+    *,
+    sample_radius: int,
+    intrinsics: PinholeIntrinsics | None,
+    camera_to_base: np.ndarray,
+    min_x_mm: float,
+    max_x_mm: float,
+    min_y_mm: float,
+    max_y_mm: float,
+    pick_y_mm: float,
+    conveyor_speed_mm_s: float,
+    conveyor_direction: Literal["negative-y", "positive-y"],
+) -> DynamicGraspCandidate | None:
+    candidates = find_dynamic_candidates(
+        targets,
+        depth_frame,
+        sample_radius=sample_radius,
+        intrinsics=intrinsics,
+        camera_to_base=camera_to_base,
+        min_x_mm=min_x_mm,
+        max_x_mm=max_x_mm,
+        min_y_mm=min_y_mm,
+        max_y_mm=max_y_mm,
+        pick_y_mm=pick_y_mm,
+        conveyor_speed_mm_s=conveyor_speed_mm_s,
+        conveyor_direction=conveyor_direction,
+    )
+    return candidates[0] if candidates else None
 
 
 def detections_to_ranked_targets(
@@ -920,6 +988,91 @@ def send_dynamic_candidate(
     return response
 
 
+def send_dynamic_probe(
+    sender: YoloGraspSender,
+    target: RankedTarget,
+    *,
+    source: str,
+    task: CameraPointTask,
+    center_point: CameraPoint,
+) -> dict[str, Any]:
+    probe_target = RankedTarget(
+        rank=target.rank,
+        detection=target.detection,
+        pixel=(center_point.u, center_point.v),
+        raw_point=center_point,
+        send_point=center_point,
+    )
+    response = sender.send_target(
+        probe_target,
+        source=source,
+        task=task,
+        grasp_mode="probe",
+    )
+    print(
+        "\nSent dynamic bbox-center probe "
+        f"{task} rank {probe_target.rank}: {format_target_line(probe_target)}",
+        flush=True,
+    )
+    print(response, flush=True)
+    return response
+
+
+def dynamic_skip_reason_from_response(response: dict[str, Any]) -> str | None:
+    payload = response.get("payload")
+    if isinstance(payload, dict) and payload.get("skipped") is True:
+        timing = payload.get("dynamic_timing")
+        if isinstance(timing, dict) and timing.get("skip_reason"):
+            return str(timing["skip_reason"])
+        return "dynamic target skipped by server"
+    if response.get("type") == "error" and isinstance(payload, dict):
+        error = str(payload.get("error", ""))
+        if "too close to the pick line" in error:
+            return error
+    return None
+
+
+def prune_suppressed_dynamic_targets(
+    suppressed: list[SuppressedDynamicTarget],
+    now_s: float,
+) -> list[SuppressedDynamicTarget]:
+    return [target for target in suppressed if target.expires_at_s > now_s]
+
+
+def dynamic_candidate_is_suppressed(
+    candidate: DynamicGraspCandidate,
+    suppressed: list[SuppressedDynamicTarget],
+    *,
+    radius_mm: float,
+) -> bool:
+    radius_sq = float(radius_mm) * float(radius_mm)
+    for target in suppressed:
+        dx = candidate.base_x_mm - target.x_mm
+        dy = candidate.base_y_mm - target.y_mm
+        if dx * dx + dy * dy <= radius_sq:
+            return True
+    return False
+
+
+def remember_suppressed_dynamic_target(
+    suppressed: list[SuppressedDynamicTarget],
+    candidate: DynamicGraspCandidate,
+    *,
+    now_s: float,
+    memory_s: float,
+) -> list[SuppressedDynamicTarget]:
+    if memory_s <= 0.0:
+        return suppressed
+    return [
+        *suppressed,
+        SuppressedDynamicTarget(
+            x_mm=candidate.base_x_mm,
+            y_mm=candidate.base_y_mm,
+            expires_at_s=now_s + memory_s,
+        ),
+    ]
+
+
 def parse_target_command(command: str, default_task: CameraPointTask) -> tuple[CameraPointTask, int] | None:
     parts = command.strip().lower().split()
     if len(parts) == 1:
@@ -1023,6 +1176,8 @@ def main() -> None:
     latest_targets: list[RankedTarget] = []
     latest_errors: dict[int, str] = {}
     dynamic_sent = False
+    suppressed_dynamic_targets: list[SuppressedDynamicTarget] = []
+    last_dynamic_probe_time = 0.0
     dynamic_status = (
         "Dynamic mode: waiting for target in "
         f"X=[{args.dynamic_min_x_mm:.1f},{args.dynamic_max_x_mm:.1f}]mm, "
@@ -1104,7 +1259,11 @@ def main() -> None:
             elif not dynamic_sent or args.dynamic_keep_running:
                 if camera_to_base is None:
                     raise ValueError("dynamic mode requires --hand-eye-result")
-                candidate = find_dynamic_candidate(
+                suppressed_dynamic_targets = prune_suppressed_dynamic_targets(
+                    suppressed_dynamic_targets,
+                    now,
+                )
+                candidates = find_dynamic_candidates(
                     latest_targets,
                     depth_frame,
                     sample_radius=args.sample_radius,
@@ -1118,6 +1277,18 @@ def main() -> None:
                     conveyor_speed_mm_s=args.conveyor_speed_mm_s,
                     conveyor_direction=args.conveyor_direction,
                 )
+                candidate = None
+                suppressed_count = 0
+                for item in candidates:
+                    if dynamic_candidate_is_suppressed(
+                        item,
+                        suppressed_dynamic_targets,
+                        radius_mm=args.dynamic_skip_radius_mm,
+                    ):
+                        suppressed_count += 1
+                        continue
+                    candidate = item
+                    break
                 if candidate is not None:
                     dynamic_status = (
                         "Dynamic candidate "
@@ -1127,7 +1298,7 @@ def main() -> None:
                         )
                     )
                     try:
-                        send_dynamic_candidate(
+                        response = send_dynamic_candidate(
                             sender,
                             candidate,
                             source=source,
@@ -1136,17 +1307,89 @@ def main() -> None:
                             pick_x_mm=args.dynamic_pick_x_mm,
                             pick_y_mm=args.dynamic_pick_y_mm,
                         )
-                        dynamic_sent = True
-                        if not args.dynamic_keep_running:
+                        skip_reason = dynamic_skip_reason_from_response(response)
+                        if skip_reason is not None:
+                            suppressed_dynamic_targets = remember_suppressed_dynamic_target(
+                                suppressed_dynamic_targets,
+                                candidate,
+                                now_s=now,
+                                memory_s=args.dynamic_skip_memory_s,
+                            )
+                            dynamic_status = (
+                                "Dynamic candidate skipped and remembered: "
+                                f"{skip_reason}"
+                            )
+                            print(dynamic_status, flush=True)
+                        elif response.get("type") == "error":
+                            dynamic_status = f"Dynamic send failed: {response}"
+                            print(dynamic_status, flush=True)
+                        else:
+                            dynamic_sent = True
+                            if args.dynamic_keep_running:
+                                suppressed_dynamic_targets = remember_suppressed_dynamic_target(
+                                    suppressed_dynamic_targets,
+                                    candidate,
+                                    now_s=now,
+                                    memory_s=args.dynamic_skip_memory_s,
+                                )
+                        if dynamic_sent and not args.dynamic_keep_running:
                             running = False
                     except Exception as exc:  # noqa: BLE001 - hardware UI should keep context
                         dynamic_status = f"Dynamic send failed: {exc}"
                         print(dynamic_status, flush=True)
+                elif suppressed_count > 0:
+                    dynamic_status = (
+                        "Dynamic mode: "
+                        f"{suppressed_count} repeated skipped target(s) ignored."
+                    )
                 else:
                     dynamic_status = (
                         "Dynamic mode: no target inside configured base-coordinate "
                         "window yet."
                     )
+                    if (
+                        args.dynamic_probe_interval_s > 0.0
+                        and latest_targets
+                        and (
+                            last_dynamic_probe_time == 0.0
+                            or now - last_dynamic_probe_time >= args.dynamic_probe_interval_s
+                        )
+                    ):
+                        try:
+                            probe_center = deproject_detection_center(
+                                latest_targets[0].detection,
+                                depth_frame,
+                                sample_radius=args.sample_radius,
+                                intrinsics=intrinsics,
+                            )
+                            response = send_dynamic_probe(
+                                sender,
+                                latest_targets[0],
+                                source=source,
+                                task=args.task,
+                                center_point=probe_center,
+                            )
+                            if response.get("type") == "ack":
+                                payload = response.get("payload", {})
+                                if isinstance(payload, dict):
+                                    base_xyz = payload.get("base_xyz_m")
+                                    if isinstance(base_xyz, dict) and all(
+                                        key in base_xyz for key in ("x_m", "y_m", "z_m")
+                                    ):
+                                        dynamic_status = (
+                                            "Dynamic probe base="
+                                            f"({float(base_xyz['x_m']) * 1000.0:.1f},"
+                                            f"{float(base_xyz['y_m']) * 1000.0:.1f},"
+                                            f"{float(base_xyz['z_m']) * 1000.0:.1f})mm"
+                                        )
+                            elif response.get("type") == "error":
+                                dynamic_status = f"Dynamic probe failed: {response}"
+                                print(dynamic_status, flush=True)
+                        except Exception as exc:  # noqa: BLE001 - hardware UI should keep context
+                            dynamic_status = f"Dynamic probe failed: {exc}"
+                            print(dynamic_status, flush=True)
+                        finally:
+                            last_dynamic_probe_time = now
 
             if not args.no_display:
                 if args.mode == "static":

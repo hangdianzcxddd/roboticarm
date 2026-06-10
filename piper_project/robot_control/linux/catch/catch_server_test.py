@@ -329,6 +329,49 @@ class TestCatchServer(unittest.TestCase):
         self.assertAlmostEqual(response["payload"]["target_tcp_pose"]["z_mm"], 300.0)
         self.assertAlmostEqual(response["payload"]["grasp_j6_pose"]["x_mm"], 155.0)
 
+    def test_probe_message_reports_hand_eye_mapping_without_executing(self):
+        message = make_camera_point_message(
+            CameraPointCommand(
+                x_m=0.10,
+                y_m=-0.05,
+                z_m=0.30,
+                command_id="cmd-probe",
+                grasp_mode="probe",
+            )
+        )
+        camera_to_base = np.eye(4, dtype=float)
+        camera_to_base[:3, 3] = np.array([0.20, 0.10, 0.00])
+        controller = PiperController(
+            config=RobotConfig(command_interval_s=0, connect_timeout_s=0.1),
+            sdk=FakePiperSdk(),
+        )
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            response = handle_message(
+                message,
+                SimulatedMappingConfig(),
+                tcp_offset_j6_mm=(0.0, 0.0, 145.0),
+                execute=True,
+                controller=controller,
+                args=make_args(
+                    rx_deg=0.0,
+                    ry_deg=90.0,
+                    rz_deg=0.0,
+                    place_x_mm=230.0,
+                ),
+                hand_eye_camera_to_base=camera_to_base,
+            )
+
+        self.assertEqual(response["type"], "ack")
+        self.assertFalse(response["payload"]["executed"])
+        self.assertTrue(response["payload"]["probe_only"])
+        self.assertEqual(response["payload"]["mapping_source"], "hand_eye")
+        self.assertAlmostEqual(response["payload"]["target_tcp_pose"]["x_mm"], 300.0)
+        self.assertAlmostEqual(response["payload"]["target_tcp_pose"]["y_mm"], 50.0)
+        self.assertAlmostEqual(response["payload"]["base_xyz_m"]["x_m"], 0.30)
+        end_pose_calls = [call for call in controller.sdk.calls if call[0] == "EndPoseCtrl"]
+        self.assertEqual(end_pose_calls, [])
+
     def test_execute_hand_eye_defaults_to_current_tcp_orientation(self):
         message = make_camera_point_message(
             CameraPointCommand(x_m=0.30, y_m=0.0, z_m=0.04, command_id="cmd-current")

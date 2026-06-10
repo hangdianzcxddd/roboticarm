@@ -94,6 +94,8 @@ class DynamicTiming:
     t_arrive_s: float
     t_robot_s: float
     t_wait_s: float
+    skipped: bool = False
+    skip_reason: str | None = None
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -467,9 +469,15 @@ def dynamic_timing_from_command(
         raise ValueError("--t-robot-s must be finite and >= 0")
     t_wait_s = t_arrive_s - t_robot_s
     if t_wait_s < 0.0:
-        raise TimeoutError(
-            "dynamic target is too close to the pick line: "
-            f"t_arrive={t_arrive_s:.3f}s < t_robot={t_robot_s:.3f}s"
+        return DynamicTiming(
+            t_arrive_s=t_arrive_s,
+            t_robot_s=t_robot_s,
+            t_wait_s=t_wait_s,
+            skipped=True,
+            skip_reason=(
+                "dynamic target is too close to the pick line: "
+                f"t_arrive={t_arrive_s:.3f}s < t_robot={t_robot_s:.3f}s"
+            ),
         )
     return DynamicTiming(
         t_arrive_s=t_arrive_s,
@@ -480,6 +488,9 @@ def dynamic_timing_from_command(
 
 def wait_for_dynamic_timing(timing: DynamicTiming | None) -> None:
     if timing is None:
+        return
+    if timing.skipped:
+        print(f"Dynamic timing: skipped: {timing.skip_reason}", flush=True)
         return
     if timing.t_wait_s <= 0.0:
         print(
@@ -590,7 +601,8 @@ def print_plan(
             "  dynamic_timing: "
             f"t_arrive={timing.t_arrive_s:.3f}s "
             f"t_robot={timing.t_robot_s:.3f}s "
-            f"t_wait={timing.t_wait_s:.3f}s",
+            f"t_wait={timing.t_wait_s:.3f}s "
+            f"skipped={timing.skipped}",
             flush=True,
         )
     for index, step in enumerate(plan.steps, start=1):
@@ -601,6 +613,71 @@ def print_plan(
             f"{format_pose(step.pose)}{delay}{gripper}",
             flush=True,
         )
+
+
+def handle_probe_message(
+    command: CameraPointCommand,
+    metadata: dict[str, Any],
+    *,
+    camera_to_base: Any,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    base_xyz_m = map_camera_point_to_base_xyz_m(
+        command.x_m,
+        command.y_m,
+        command.z_m,
+        camera_to_base,
+    )
+    probe_pose = EndPose(
+        x_mm=base_xyz_m[0] * 1000.0,
+        y_mm=base_xyz_m[1] * 1000.0,
+        z_mm=base_xyz_m[2] * 1000.0,
+        rx_deg=args.rx_deg,
+        ry_deg=args.ry_deg,
+        rz_deg=args.rz_deg,
+    )
+    label = metadata.get("label", command.label or "unknown")
+    rank = metadata.get("rank", command.rank)
+    bbox = metadata.get("bbox", command.bbox_xywh)
+    bbox_format = metadata.get("bbox_format", "xywh" if command.bbox_xywh else None)
+    print(
+        "YOLO probe only: "
+        f"rank={rank} label={label} "
+        f"camera_pixel=({command.u},{command.v}) "
+        "camera_xyz="
+        f"({command.x_m:.6f}, {command.y_m:.6f}, {command.z_m:.6f}) m -> "
+        "base_xyz="
+        f"({base_xyz_m[0] * 1000.0:.3f}, "
+        f"{base_xyz_m[1] * 1000.0:.3f}, "
+        f"{base_xyz_m[2] * 1000.0:.3f}) mm "
+        f"bbox={bbox} bbox_format={bbox_format}",
+        flush=True,
+    )
+    response = make_ack_message(
+        command.command_id,
+        pose_to_dict(probe_pose),
+        executed=False,
+    )
+    response["payload"].update(
+        {
+            "task": command.task,
+            "grasp_mode": command.grasp_mode,
+            "probe_only": True,
+            "mapping_source": "hand_eye",
+            "base_xyz_m": {
+                "x_m": base_xyz_m[0],
+                "y_m": base_xyz_m[1],
+                "z_m": base_xyz_m[2],
+            },
+            "pick_x_mm": None,
+            "pick_y_mm": None,
+            "grasp_z_mm": None,
+            "skipped": False,
+        }
+    )
+    if metadata:
+        response["payload"]["yolo"] = metadata
+    return response
 
 
 def send_gripper(controller: PiperController, args: argparse.Namespace, action: Action) -> None:
@@ -702,6 +779,13 @@ def handle_message(
 ) -> dict[str, Any]:
     command = camera_point_from_message(message)
     metadata = yolo_metadata_from_message(message)
+    if command.grasp_mode == "probe":
+        return handle_probe_message(
+            command,
+            metadata,
+            camera_to_base=camera_to_base,
+            args=args,
+        )
     timing = dynamic_timing_from_command(command, args)
     target = target_from_command(
         command,
@@ -719,7 +803,11 @@ def handle_message(
         print_plan(plan, metadata, timing)
 
     send_counts: dict[str, int] = {}
-    if args.execute:
+    skipped = bool(timing is not None and timing.skipped)
+    if skipped and timing is not None:
+        print(f"Dynamic target skipped: {timing.skip_reason}", flush=True)
+    did_execute = bool(args.execute and not skipped)
+    if did_execute:
         if controller is None:
             raise RuntimeError("execute=True requires a connected PiperController")
         wait_for_dynamic_timing(timing)
@@ -746,7 +834,7 @@ def handle_message(
     response = make_ack_message(
         command.command_id,
         pose_to_dict(plan.steps[2].pose),
-        executed=args.execute,
+        executed=did_execute,
     )
     response["payload"].update(
         {
@@ -789,6 +877,7 @@ def handle_message(
                 "pick_back_from_place": pick_from_place,
             },
             "gripper_enabled": not args.no_gripper,
+            "skipped": skipped,
         }
     )
     if timing is not None:
@@ -796,6 +885,8 @@ def handle_message(
             "t_arrive_s": timing.t_arrive_s,
             "t_robot_s": timing.t_robot_s,
             "t_wait_s": timing.t_wait_s,
+            "skipped": timing.skipped,
+            "skip_reason": timing.skip_reason,
             "conveyor_speed_mm_s": command.conveyor_speed_mm_s,
             "pick_x_mm": command.pick_x_mm,
             "pick_y_mm": command.pick_y_mm,
