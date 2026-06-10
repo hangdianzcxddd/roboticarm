@@ -352,6 +352,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="fixed robot base X for dynamic grasp execution",
     )
     parser.add_argument(
+        "--dynamic-pick-x-from-bbox-center",
+        action="store_true",
+        help=(
+            "use the detected bbox center base-X as dynamic grasp X instead of "
+            "--dynamic-pick-x-mm; dynamic Y still comes from --dynamic-pick-y-mm"
+        ),
+    )
+    parser.add_argument(
         "--dynamic-pick-y-mm",
         type=float,
         default=-30.0,
@@ -988,6 +996,17 @@ def send_dynamic_candidate(
     return response
 
 
+def dynamic_pick_x_mm_for_candidate(
+    candidate: DynamicGraspCandidate,
+    *,
+    fixed_pick_x_mm: float,
+    use_bbox_center_x: bool,
+) -> float:
+    if use_bbox_center_x:
+        return candidate.base_x_mm
+    return float(fixed_pick_x_mm)
+
+
 def send_dynamic_probe(
     sender: YoloGraspSender,
     target: RankedTarget,
@@ -1191,12 +1210,16 @@ def main() -> None:
             flush=True,
         )
     else:
+        pick_x_text = (
+            "bbox-center"
+            if args.dynamic_pick_x_from_bbox_center
+            else f"{args.dynamic_pick_x_mm:.1f}mm"
+        )
         print(
             "Dynamic mode enabled. "
             f"speed={args.conveyor_speed_mm_s:.3f}mm/s "
             f"direction={args.conveyor_direction} "
-            f"fixed_pick=({args.dynamic_pick_x_mm:.1f},"
-            f"{args.dynamic_pick_y_mm:.1f})mm. "
+            f"pick=(x={pick_x_text}, y={args.dynamic_pick_y_mm:.1f}mm). "
             "Press Esc to exit.",
             flush=True,
         )
@@ -1290,12 +1313,18 @@ def main() -> None:
                     candidate = item
                     break
                 if candidate is not None:
+                    pick_x_mm = dynamic_pick_x_mm_for_candidate(
+                        candidate,
+                        fixed_pick_x_mm=args.dynamic_pick_x_mm,
+                        use_bbox_center_x=args.dynamic_pick_x_from_bbox_center,
+                    )
                     dynamic_status = (
                         "Dynamic candidate "
                         + format_dynamic_candidate(
                             candidate,
                             pick_y_mm=args.dynamic_pick_y_mm,
                         )
+                        + f" pick_x={pick_x_mm:.1f}mm"
                     )
                     try:
                         response = send_dynamic_candidate(
@@ -1304,7 +1333,7 @@ def main() -> None:
                             source=source,
                             task=args.task,
                             conveyor_speed_mm_s=args.conveyor_speed_mm_s,
-                            pick_x_mm=args.dynamic_pick_x_mm,
+                            pick_x_mm=pick_x_mm,
                             pick_y_mm=args.dynamic_pick_y_mm,
                         )
                         skip_reason = dynamic_skip_reason_from_response(response)

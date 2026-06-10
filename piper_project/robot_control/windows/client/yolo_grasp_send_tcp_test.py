@@ -17,6 +17,7 @@ from robot_control.windows.client.yolo_grasp_send_tcp import (
     dynamic_arrival_time_s,
     dynamic_candidate_from_target,
     dynamic_candidate_is_suppressed,
+    dynamic_pick_x_mm_for_candidate,
     dynamic_skip_reason_from_response,
     remember_suppressed_dynamic_target,
     grasp_pixel_from_detection,
@@ -248,6 +249,53 @@ class TestYoloGraspSendTcp(unittest.TestCase):
         self.assertAlmostEqual(candidate.base_y_mm, 20.0)
         self.assertAlmostEqual(candidate.remaining_y_mm, 50.0)
         self.assertAlmostEqual(candidate.t_arrive_s, 0.5)
+
+    def test_dynamic_pick_x_can_use_bbox_center_base_x(self):
+        target = RankedTarget(
+            rank=1,
+            detection=detection(label="cup"),
+            pixel=(10, 20),
+            raw_point=camera_point(10, 20, 0.40),
+            send_point=camera_point(10, 20, 0.40),
+        )
+        candidate = dynamic_candidate_from_target(
+            target,
+            CameraPoint(
+                u=50,
+                v=60,
+                depth_m=0.40,
+                x_m=0.405,
+                y_m=-0.50,
+                z_m=0.12,
+            ),
+            camera_to_base=np.eye(4, dtype=float),
+            min_x_mm=300.0,
+            max_x_mm=500.0,
+            min_y_mm=-600.0,
+            max_y_mm=-400.0,
+            pick_y_mm=-30.0,
+            conveyor_speed_mm_s=223.0,
+            conveyor_direction="positive-y",
+        )
+        self.assertIsNotNone(candidate)
+        assert candidate is not None
+
+        self.assertAlmostEqual(
+            dynamic_pick_x_mm_for_candidate(
+                candidate,
+                fixed_pick_x_mm=350.0,
+                use_bbox_center_x=False,
+            ),
+            350.0,
+        )
+        self.assertAlmostEqual(
+            dynamic_pick_x_mm_for_candidate(
+                candidate,
+                fixed_pick_x_mm=350.0,
+                use_bbox_center_x=True,
+            ),
+            405.0,
+        )
 
     def test_dynamic_candidate_rejects_outside_x_range(self):
         target = RankedTarget(
