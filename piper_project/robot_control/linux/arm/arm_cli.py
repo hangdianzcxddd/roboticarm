@@ -6,6 +6,7 @@ import argparse
 import sys
 
 from robot_control.linux.config.robot_config import ROBOT_CONFIG
+from robot_control.linux.arm.kinematics import forward_kinematics_pose
 from robot_control.linux.arm.piper_arm import PiperController
 from robot_control.linux.arm.safety import SafetyError
 from robot_control.shared.geometry import EndPose
@@ -38,6 +39,13 @@ def build_parser() -> argparse.ArgumentParser:
     for index in range(1, 7):
         joints_parser.add_argument(f"j{index}", type=float)
     joints_parser.add_argument("--speed", type=int, default=ROBOT_CONFIG.default_speed_percent)
+
+    fk_parser = subparsers.add_parser(
+        "joints-to-pose",
+        help="print forward-kinematics J6 pose for joints in radians",
+    )
+    for index in range(1, 7):
+        fk_parser.add_argument(f"j{index}", type=float)
 
     return parser
 
@@ -78,6 +86,21 @@ def main() -> None:
                     joints,
                     speed_percent=args.speed,
                 )
+        elif args.command == "joints-to-pose":
+            joints = [args.j1, args.j2, args.j3, args.j4, args.j5, args.j6]
+            controller.validate_joints(joints)
+            pose = forward_kinematics_pose(joints)
+            print(
+                "x_mm={:.3f} y_mm={:.3f} z_mm={:.3f} "
+                "rx_deg={:.6f} ry_deg={:.6f} rz_deg={:.6f}".format(
+                    pose.x_mm,
+                    pose.y_mm,
+                    pose.z_mm,
+                    pose.rx_deg,
+                    pose.ry_deg,
+                    pose.rz_deg,
+                )
+            )
     except SafetyError as exc:
         controller.disconnect()
         print(str(exc), file=sys.stderr)
