@@ -39,6 +39,11 @@ class CameraPointCommand:
     detected_x_mm: float | None = None
     detected_y_mm: float | None = None
     detected_z_mm: float | None = None
+    mask_area_px: int | None = None
+    mask_centroid_u: float | None = None
+    mask_centroid_v: float | None = None
+    mask_depth_median_m: float | None = None
+    mask_depth_valid_count: int | None = None
 
 
 def make_camera_point_message(command: CameraPointCommand) -> dict[str, Any]:
@@ -154,6 +159,11 @@ def camera_point_from_message(message: dict[str, Any]) -> CameraPointCommand:
                 if payload.get("bbox_xywh") is not None
                 else None
             ),
+            mask_area_px=_optional_int(payload, "mask_area_px"),
+            mask_centroid_u=_optional_float(payload, "mask_centroid_u"),
+            mask_centroid_v=_optional_float(payload, "mask_centroid_v"),
+            mask_depth_median_m=_optional_float(payload, "mask_depth_median_m"),
+            mask_depth_valid_count=_optional_int(payload, "mask_depth_valid_count"),
             grasp_mode=cast(GraspMode, grasp_mode),
             t_arrive_s=_optional_float(payload, "t_arrive_s"),
             conveyor_speed_mm_s=_optional_float(payload, "conveyor_speed_mm_s"),
@@ -181,6 +191,12 @@ def _optional_float(payload: dict[str, Any], key: str) -> float | None:
     if payload.get(key) is None:
         return None
     return float(payload[key])
+
+
+def _optional_int(payload: dict[str, Any], key: str) -> int | None:
+    if payload.get(key) is None:
+        return None
+    return int(payload[key])
 
 
 def send_camera_point(

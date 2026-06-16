@@ -1248,6 +1248,16 @@ def yolo_metadata_from_message(message: dict[str, Any]) -> dict[str, Any]:
         metadata["rank"] = int(payload["rank"])
     if payload.get("task") is not None:
         metadata["task"] = str(payload["task"])
+    for key in (
+        "mask_area_px",
+        "mask_centroid_u",
+        "mask_centroid_v",
+        "mask_depth_median_m",
+        "mask_depth_valid_count",
+    ):
+        if payload.get(key) is not None:
+            value = payload[key]
+            metadata[key] = int(value) if key.endswith("_count") or key.endswith("_px") else float(value)
     return metadata
 
 

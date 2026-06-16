@@ -1435,6 +1435,27 @@ class TestCatchServer1(unittest.TestCase):
         self.assertEqual(metadata["bbox_format"], "xywh")
         self.assertEqual(metadata["label"], "cube")
 
+    def test_yolo_metadata_accepts_segmentation_mask_fields(self):
+        message = {
+            "payload": {
+                "label": "cup",
+                "mask_area_px": 1280,
+                "mask_centroid_u": 321.5,
+                "mask_centroid_v": 123.25,
+                "mask_depth_median_m": 0.456,
+                "mask_depth_valid_count": 976,
+            }
+        }
+
+        metadata = yolo_metadata_from_message(message)
+
+        self.assertEqual(metadata["label"], "cup")
+        self.assertEqual(metadata["mask_area_px"], 1280)
+        self.assertAlmostEqual(metadata["mask_centroid_u"], 321.5)
+        self.assertAlmostEqual(metadata["mask_centroid_v"], 123.25)
+        self.assertAlmostEqual(metadata["mask_depth_median_m"], 0.456)
+        self.assertEqual(metadata["mask_depth_valid_count"], 976)
+
     def test_use_detected_z_rejects_grasp_above_transfer_plane(self):
         args = make_args(use_detected_z=True, detected_z_offset_mm=0.0)
         camera_to_base = np.eye(4, dtype=float)
