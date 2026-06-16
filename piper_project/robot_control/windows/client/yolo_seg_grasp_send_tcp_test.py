@@ -13,6 +13,9 @@ from robot_control.windows.client.yolo_seg_grasp_send_tcp import (
     camera_point_command_from_target,
     clamp_pixel_from_centroid,
     deproject_pixel_with_depth,
+    dynamic_pick_x_mm_for_candidate,
+    dynamic_seg_candidate_from_target,
+    find_dynamic_seg_candidates,
     mask_centroid,
     mask_depth_median,
     segments_to_ranked_targets,
@@ -274,6 +277,7 @@ class TestYoloSegGraspSendTcp(unittest.TestCase):
 
     def test_base_z_offset_requires_hand_eye_transform(self):
         args = Namespace(
+            mode="static",
             dry_run=True,
             host=None,
             timeout_s=1.0,
@@ -289,10 +293,221 @@ class TestYoloSegGraspSendTcp(unittest.TestCase):
             base_z_offset_mm=20.0,
             hand_eye_result=None,
             task_option=None,
+            no_hand_eye_result=False,
         )
 
         with self.assertRaisesRegex(ValueError, "--base-z-offset-mm requires"):
             validate_args(args)
+
+    def test_dynamic_candidate_uses_mask_centroid_base_coordinates(self):
+        mask = np.zeros((4, 4), dtype=bool)
+        mask[1:3, 1:3] = True
+        target = RankedSegTarget(
+            rank=1,
+            segment=segment(mask),
+            raw_point=deproject_pixel_with_depth(
+                FakeDepthFrame(np.full((4, 4), 0.40, dtype=np.float32)),
+                2,
+                2,
+                0.40,
+                intrinsics=PinholeIntrinsics(
+                    width=4,
+                    height=4,
+                    fx=100.0,
+                    fy=100.0,
+                    ppx=2.0,
+                    ppy=2.0,
+                ),
+            ),
+            send_point=deproject_pixel_with_depth(
+                FakeDepthFrame(np.full((4, 4), 0.40, dtype=np.float32)),
+                2,
+                2,
+                0.40,
+                intrinsics=PinholeIntrinsics(
+                    width=4,
+                    height=4,
+                    fx=100.0,
+                    fy=100.0,
+                    ppx=2.0,
+                    ppy=2.0,
+                ),
+            ),
+            mask_depth_valid_count=4,
+        )
+        camera_to_base = np.eye(4, dtype=float)
+        camera_to_base[:3, 3] = np.array([0.35, -0.45, -0.10])
+
+        candidate = dynamic_seg_candidate_from_target(
+            target,
+            camera_to_base=camera_to_base,
+            min_x_mm=300.0,
+            max_x_mm=500.0,
+            min_y_mm=-600.0,
+            max_y_mm=-400.0,
+            pick_y_mm=0.0,
+            conveyor_speed_mm_s=225.0,
+            conveyor_direction="positive-y",
+        )
+
+        self.assertIsNotNone(candidate)
+        assert candidate is not None
+        self.assertAlmostEqual(candidate.base_x_mm, 350.0)
+        self.assertAlmostEqual(candidate.base_y_mm, -450.0)
+        self.assertAlmostEqual(candidate.base_z_mm, 300.0)
+        self.assertAlmostEqual(candidate.remaining_y_mm, 450.0)
+        self.assertAlmostEqual(candidate.t_arrive_s, 2.0)
+        self.assertAlmostEqual(
+            dynamic_pick_x_mm_for_candidate(
+                candidate,
+                fixed_pick_x_mm=360.0,
+                use_mask_centroid_x=True,
+            ),
+            350.0,
+        )
+
+    def test_dynamic_command_carries_timing_pick_and_mask_metadata(self):
+        mask = np.zeros((4, 4), dtype=bool)
+        mask[1:3, 1:3] = True
+        target = RankedSegTarget(
+            rank=1,
+            segment=segment(mask),
+            raw_point=deproject_pixel_with_depth(
+                FakeDepthFrame(np.full((4, 4), 0.40, dtype=np.float32)),
+                2,
+                2,
+                0.40,
+                intrinsics=PinholeIntrinsics(
+                    width=4,
+                    height=4,
+                    fx=100.0,
+                    fy=100.0,
+                    ppx=2.0,
+                    ppy=2.0,
+                ),
+            ),
+            send_point=deproject_pixel_with_depth(
+                FakeDepthFrame(np.full((4, 4), 0.40, dtype=np.float32)),
+                2,
+                2,
+                0.40,
+                intrinsics=PinholeIntrinsics(
+                    width=4,
+                    height=4,
+                    fx=100.0,
+                    fy=100.0,
+                    ppx=2.0,
+                    ppy=2.0,
+                ),
+            ),
+            mask_depth_valid_count=4,
+        )
+
+        command = camera_point_command_from_target(
+            target,
+            source="yolo_seg_dynamic_timed",
+            task="out",
+            grasp_mode="dynamic",
+            t_arrive_s=1.25,
+            conveyor_speed_mm_s=223.0,
+            pick_x_mm=350.0,
+            pick_y_mm=0.0,
+            detected_xyz_mm=(340.0, -420.0, 120.0),
+        )
+        parsed = camera_point_from_message(make_camera_point_message(command))
+
+        self.assertEqual(parsed.grasp_mode, "dynamic")
+        self.assertAlmostEqual(parsed.t_arrive_s, 1.25)
+        self.assertAlmostEqual(parsed.conveyor_speed_mm_s, 223.0)
+        self.assertAlmostEqual(parsed.pick_x_mm, 350.0)
+        self.assertAlmostEqual(parsed.pick_y_mm, 0.0)
+        self.assertAlmostEqual(parsed.detected_x_mm, 340.0)
+        self.assertAlmostEqual(parsed.detected_y_mm, -420.0)
+        self.assertAlmostEqual(parsed.detected_z_mm, 120.0)
+        self.assertEqual(parsed.mask_area_px, 4)
+        self.assertEqual(parsed.mask_depth_valid_count, 4)
+
+    def test_dynamic_mode_defaults_hand_eye_result_and_requires_speed(self):
+        args = Namespace(
+            mode="dynamic",
+            dry_run=True,
+            host=None,
+            timeout_s=1.0,
+            width=640,
+            height=480,
+            fps=30,
+            max_depth_m=1.5,
+            min_depth_valid_px=1,
+            mask_depth_erode_px=0,
+            max_results=1,
+            min_mask_area_px=1,
+            print_interval=1.0,
+            base_z_offset_mm=0.0,
+            hand_eye_result=None,
+            no_hand_eye_result=False,
+            conveyor_speed_mm_s=None,
+            dynamic_min_x_mm=300.0,
+            dynamic_max_x_mm=500.0,
+            dynamic_min_y_mm=-600.0,
+            dynamic_max_y_mm=-400.0,
+            dynamic_skip_memory_s=5.0,
+            dynamic_skip_radius_mm=80.0,
+            dynamic_probe_interval_s=1.0,
+            task_option=None,
+        )
+
+        with self.assertRaisesRegex(ValueError, "--conveyor-speed-mm-s"):
+            validate_args(args)
+
+        self.assertIsNotNone(args.hand_eye_result)
+
+    def test_dynamic_candidates_sort_by_arrival_then_rank(self):
+        def make_target(rank: int, y_m: float) -> RankedSegTarget:
+            mask = np.zeros((4, 4), dtype=bool)
+            mask[1:3, 1:3] = True
+            point = deproject_pixel_with_depth(
+                FakeDepthFrame(np.full((4, 4), 0.40, dtype=np.float32)),
+                2,
+                2,
+                0.40,
+                intrinsics=PinholeIntrinsics(
+                    width=4,
+                    height=4,
+                    fx=100.0,
+                    fy=100.0,
+                    ppx=2.0,
+                    ppy=2.0,
+                ),
+            )
+            point = type(point)(
+                u=point.u,
+                v=point.v,
+                depth_m=point.depth_m,
+                x_m=0.35,
+                y_m=y_m,
+                z_m=point.z_m,
+            )
+            return RankedSegTarget(
+                rank=rank,
+                segment=segment(mask),
+                raw_point=point,
+                send_point=point,
+                mask_depth_valid_count=4,
+            )
+
+        candidates = find_dynamic_seg_candidates(
+            [make_target(2, -0.40), make_target(1, -0.50)],
+            camera_to_base=np.eye(4, dtype=float),
+            min_x_mm=300.0,
+            max_x_mm=500.0,
+            min_y_mm=-600.0,
+            max_y_mm=-300.0,
+            pick_y_mm=0.0,
+            conveyor_speed_mm_s=100.0,
+            conveyor_direction="positive-y",
+        )
+
+        self.assertEqual([candidate.target.rank for candidate in candidates], [2, 1])
 
 
 if __name__ == "__main__":
