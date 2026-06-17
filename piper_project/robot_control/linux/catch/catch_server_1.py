@@ -29,7 +29,7 @@ import time
 from dataclasses import dataclass, replace
 from typing import Any, Literal
 
-from robot_control.linux.arm.piper_arm import PiperController
+from robot_control.linux.arm.piper_arm import RAD_TO_MILLI_DEG, PiperController
 from robot_control.linux.arm.safety import SafetyError
 from robot_control.linux.catch.catch_server import (
     execute_pose_for_duration,
@@ -71,6 +71,9 @@ class SequenceStep:
     mode: Literal["P", "L"]
     gripper_after: Action = None
     delay_before_s: float = 0.0
+    joint_pitch_before_pose: bool = False
+    joint_pitch_after_pose: bool = False
+    pitch_source_x_mm: float | None = None
 
 
 @dataclass(frozen=True)
@@ -80,6 +83,10 @@ class YoloCatchTarget:
     pick_x_mm: float
     pick_y_mm: float
     grasp_z_mm: float
+    raw_pick_x_mm: float | None = None
+    raw_pick_y_mm: float | None = None
+    pick_x_source: str = "mapped_command_x"
+    pick_y_source: str = "mapped_command_y"
     raw_grasp_z_mm: float | None = None
     grasp_z_source: str = "fixed_grasp_z"
 
@@ -131,6 +138,25 @@ class SafeGripperResult:
 
 
 @dataclass(frozen=True)
+class JointPitchAdjustmentResult:
+    step_label: str
+    phase: str
+    pick_x_mm: float
+    pitch_source_x_mm: float
+    raw_pitch_delta_deg: float
+    pitch_delta_deg: float
+    requested_pitch_delta_deg: float
+    clamped: bool
+    limit_clamped: bool
+    j2_delta_deg: float
+    j3_delta_deg: float
+    j5_delta_deg: float
+    start_joints_deg: tuple[float, float, float, float, float, float]
+    target_joints_deg: tuple[float, float, float, float, float, float]
+    send_count: int
+
+
+@dataclass(frozen=True)
 class DynamicExecutionResult:
     send_counts: dict[str, int]
     protected_abort: bool = False
@@ -145,6 +171,7 @@ class DynamicExecutionResult:
     final_action_late_s: float | None = None
     guarded_descent: GuardedDescentResult | None = None
     safe_gripper_results: tuple[SafeGripperResult, ...] = ()
+    joint_pitch_adjustments: tuple[JointPitchAdjustmentResult, ...] = ()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -304,7 +331,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_HAND_EYE_RESULT,
         help="eye_to_hand result whose transform is camera -> base",
     )
-    parser.add_argument("--ready-x-mm", type=float, default=343.108)
+    parser.add_argument("--ready-x-mm", type=float, default=350.0)
     parser.add_argument("--ready-y-mm", type=float, default=0.0)
     parser.add_argument("--transfer-z-mm", type=float, default=253.252)
     parser.add_argument(
@@ -329,9 +356,86 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.0,
         help="extra J6 Z offset when --use-detected-z is enabled",
     )
-    parser.add_argument("--rx-deg", type=float, default=180.0)
-    parser.add_argument("--ry-deg", type=float, default=14.795)
-    parser.add_argument("--rz-deg", type=float, default=180.0)
+    parser.add_argument("--rx-deg", type=float, default=-176.794223)
+    parser.add_argument("--ry-deg", type=float, default=0.889438)
+    parser.add_argument("--rz-deg", type=float, default=-105.490597)
+    parser.add_argument(
+        "--force-pick-x-mm",
+        type=float,
+        help=(
+            "force the Cartesian pick X coordinate while keeping the raw mapped "
+            "or dynamic-command X for dynamic joint pitch calculation"
+        ),
+    )
+    parser.add_argument(
+        "--force-pick-y-mm",
+        type=float,
+        help=(
+            "force the final pick line Y coordinate; use 0 for a y=0 catch line "
+            "while still using vision/dynamic timing for X"
+        ),
+    )
+    parser.add_argument(
+        "--dynamic-pitch-by-x",
+        action="store_true",
+        help=(
+            "after reaching pick waypoints, apply a joint-space pitch trim using "
+            "only J2/J3/J5; Cartesian RX/RY/RZ stay fixed"
+        ),
+    )
+    parser.add_argument(
+        "--pitch-x-ref-mm",
+        type=float,
+        default=350.0,
+        help="base X where dynamic joint pitch delta is zero",
+    )
+    parser.add_argument(
+        "--pitch-deg-per-mm",
+        type=float,
+        default=0.05,
+        help=(
+            "joint-space pitch degrees added per millimeter of pick_x_mm beyond "
+            "--pitch-x-ref-mm"
+        ),
+    )
+    parser.add_argument(
+        "--min-dynamic-pitch-deg",
+        "--min-dynamic-ry-deg",
+        dest="min_dynamic_pitch_deg",
+        type=float,
+        default=-20.0,
+    )
+    parser.add_argument(
+        "--max-dynamic-pitch-deg",
+        "--max-dynamic-ry-deg",
+        dest="max_dynamic_pitch_deg",
+        type=float,
+        default=20.0,
+    )
+    parser.add_argument(
+        "--dynamic-pitch-j2-ratio",
+        type=float,
+        default=0.0,
+        help="share of dynamic pitch delta applied to J2",
+    )
+    parser.add_argument(
+        "--dynamic-pitch-j3-ratio",
+        type=float,
+        default=0.0,
+        help="share of dynamic pitch delta applied to J3",
+    )
+    parser.add_argument(
+        "--dynamic-pitch-j5-ratio",
+        type=float,
+        default=1.0,
+        help="share of dynamic pitch delta applied to J5",
+    )
+    parser.add_argument(
+        "--dynamic-pitch-speed",
+        type=int,
+        default=20,
+        help="speed percent for the J2/J3/J5 dynamic pitch trim",
+    )
     parser.add_argument(
         "--pick-delay-s",
         type=float,
@@ -462,6 +566,11 @@ def validate_args(args: argparse.Namespace) -> None:
         or not 0 <= args.guarded_descent_speed <= 100
     ):
         raise ValueError("--guarded-descent-speed must be an integer in [0, 100]")
+    if (
+        not isinstance(args.dynamic_pitch_speed, int)
+        or not 0 <= args.dynamic_pitch_speed <= 100
+    ):
+        raise ValueError("--dynamic-pitch-speed must be an integer in [0, 100]")
     for name in (
         "dynamic_preposition_clearance_mm",
         "guarded_descent_zone_mm",
@@ -517,6 +626,15 @@ def validate_args(args: argparse.Namespace) -> None:
         "rx_deg",
         "ry_deg",
         "rz_deg",
+        "force_pick_x_mm",
+        "force_pick_y_mm",
+        "pitch_x_ref_mm",
+        "pitch_deg_per_mm",
+        "min_dynamic_pitch_deg",
+        "max_dynamic_pitch_deg",
+        "dynamic_pitch_j2_ratio",
+        "dynamic_pitch_j3_ratio",
+        "dynamic_pitch_j5_ratio",
         "min_target_x_mm",
         "max_target_x_mm",
         "min_target_y_mm",
@@ -530,6 +648,19 @@ def validate_args(args: argparse.Namespace) -> None:
         value = getattr(args, name)
         if value is not None and not math.isfinite(float(value)):
             raise ValueError(f"--{name.replace('_', '-')} must be finite")
+    if args.min_dynamic_pitch_deg > args.max_dynamic_pitch_deg:
+        raise ValueError(
+            "--min-dynamic-pitch-deg must be <= --max-dynamic-pitch-deg"
+        )
+    if (
+        args.dynamic_pitch_by_x
+        and args.dynamic_pitch_j2_ratio == 0.0
+        and args.dynamic_pitch_j3_ratio == 0.0
+        and args.dynamic_pitch_j5_ratio == 0.0
+    ):
+        raise ValueError(
+            "at least one dynamic pitch joint ratio among J2/J3/J5 must be non-zero"
+        )
     for lower_name, upper_name in (
         ("min_target_x_mm", "max_target_x_mm"),
         ("min_target_y_mm", "max_target_y_mm"),
@@ -555,6 +686,65 @@ def fixed_pose(args: argparse.Namespace, x_mm: float, y_mm: float, z_mm: float) 
     )
 
 
+def dynamic_pick_pitch_deg(args: argparse.Namespace, pick_x_mm: float) -> float:
+    if not args.dynamic_pitch_by_x:
+        return 0.0
+    raw_pitch_deg = (
+        (float(pick_x_mm) - float(args.pitch_x_ref_mm))
+        * float(args.pitch_deg_per_mm)
+    )
+    return min(
+        float(args.max_dynamic_pitch_deg),
+        max(float(args.min_dynamic_pitch_deg), raw_pitch_deg),
+    )
+
+
+def target_pose(
+    args: argparse.Namespace,
+    target: YoloCatchTarget,
+    z_mm: float,
+) -> EndPose:
+    return fixed_pose(args, target.pick_x_mm, target.pick_y_mm, z_mm)
+
+
+def dynamic_pitch_summary(
+    args: argparse.Namespace,
+    target: YoloCatchTarget,
+) -> dict[str, Any]:
+    pitch_x_mm = pitch_source_x_mm(target)
+    raw_pitch_deg = 0.0
+    if args.dynamic_pitch_by_x:
+        raw_pitch_deg = (
+            (pitch_x_mm - float(args.pitch_x_ref_mm))
+            * float(args.pitch_deg_per_mm)
+        )
+    pitch_deg = dynamic_pick_pitch_deg(args, pitch_x_mm)
+    return {
+        "enabled": bool(args.dynamic_pitch_by_x),
+        "method": "joint_space_j2_j3_j5",
+        "fixed_pose_ry_deg": float(args.ry_deg),
+        "pick_x_mm": float(target.pick_x_mm),
+        "raw_pick_x_mm": target.raw_pick_x_mm,
+        "pitch_source_x_mm": pitch_x_mm,
+        "x_ref_mm": float(args.pitch_x_ref_mm),
+        "deg_per_mm": float(args.pitch_deg_per_mm),
+        "raw_pitch_delta_deg": raw_pitch_deg,
+        "pitch_delta_deg": pitch_deg,
+        "min_pitch_delta_deg": float(args.min_dynamic_pitch_deg),
+        "max_pitch_delta_deg": float(args.max_dynamic_pitch_deg),
+        "j2_ratio": float(args.dynamic_pitch_j2_ratio),
+        "j3_ratio": float(args.dynamic_pitch_j3_ratio),
+        "j5_ratio": float(args.dynamic_pitch_j5_ratio),
+        "speed": int(args.dynamic_pitch_speed),
+        "clamped": not math.isclose(
+            raw_pitch_deg,
+            pitch_deg,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ),
+    }
+
+
 def ready_pose(args: argparse.Namespace) -> EndPose:
     return fixed_pose(args, args.ready_x_mm, args.ready_y_mm, args.transfer_z_mm)
 
@@ -564,6 +754,14 @@ def place_pick_pose(args: argparse.Namespace) -> EndPose:
     y_mm = args.place_y_mm if args.place_pick_y_mm is None else args.place_pick_y_mm
     z_mm = args.grasp_z_mm if args.place_pick_z_mm is None else args.place_pick_z_mm
     return fixed_pose(args, x_mm, y_mm, z_mm)
+
+
+def pitch_source_x_mm(target: YoloCatchTarget) -> float:
+    return (
+        float(target.raw_pick_x_mm)
+        if target.raw_pick_x_mm is not None
+        else float(target.pick_x_mm)
+    )
 
 
 def target_from_command(
@@ -584,9 +782,21 @@ def target_from_command(
             raise ValueError("dynamic grasp command requires pick_x_mm and pick_y_mm")
         pick_x_mm = float(command.pick_x_mm)
         pick_y_mm = float(command.pick_y_mm)
+        pick_x_source = "dynamic_command_x"
+        pick_y_source = "dynamic_command_y"
     else:
         pick_x_mm = base_xyz_m[0] * 1000.0
         pick_y_mm = base_xyz_m[1] * 1000.0
+        pick_x_source = "mapped_command_x"
+        pick_y_source = "mapped_command_y"
+    raw_pick_x_mm = float(pick_x_mm)
+    raw_pick_y_mm = float(pick_y_mm)
+    if args.force_pick_x_mm is not None:
+        pick_x_mm = float(args.force_pick_x_mm)
+        pick_x_source = "forced_pick_x"
+    if args.force_pick_y_mm is not None:
+        pick_y_mm = float(args.force_pick_y_mm)
+        pick_y_source = "forced_pick_y"
     raw_grasp_z_mm: float | None = None
     grasp_z_source = "fixed_grasp_z"
     if args.use_detected_z:
@@ -611,6 +821,10 @@ def target_from_command(
         pick_x_mm=float(pick_x_mm),
         pick_y_mm=float(pick_y_mm),
         grasp_z_mm=float(grasp_z_mm),
+        raw_pick_x_mm=raw_pick_x_mm,
+        raw_pick_y_mm=raw_pick_y_mm,
+        pick_x_source=pick_x_source,
+        pick_y_source=pick_y_source,
         raw_grasp_z_mm=raw_grasp_z_mm,
         grasp_z_source=grasp_z_source,
     )
@@ -642,21 +856,37 @@ def build_out_steps(
     target: YoloCatchTarget,
 ) -> tuple[SequenceStep, ...]:
     ready = ready_pose(args)
-    pick_above = fixed_pose(args, target.pick_x_mm, target.pick_y_mm, args.transfer_z_mm)
-    pick_grasp = fixed_pose(args, target.pick_x_mm, target.pick_y_mm, target.grasp_z_mm)
+    pick_above = target_pose(args, target, args.transfer_z_mm)
+    pick_grasp = target_pose(args, target, target.grasp_z_mm)
     place_above = fixed_pose(args, args.place_x_mm, args.place_y_mm, args.transfer_z_mm)
+    pitch_x_mm = pitch_source_x_mm(target)
 
     steps: list[SequenceStep] = [
         SequenceStep("ready_open", ready, args.transfer_mode, "open"),
-        SequenceStep("pick_above", pick_above, args.transfer_mode),
         SequenceStep(
-            "pick_grasp",
-            pick_grasp,
-            args.vertical_mode,
-            "close",
-            args.pick_delay_s,
+            "pick_above",
+            pick_above,
+            args.transfer_mode,
+            joint_pitch_before_pose=True,
+            joint_pitch_after_pose=True,
+            pitch_source_x_mm=pitch_x_mm,
         ),
-        SequenceStep("pick_lift", pick_above, args.vertical_mode),
+        SequenceStep(
+            label="pick_grasp",
+            pose=pick_grasp,
+            mode=args.vertical_mode,
+            gripper_after="close",
+            delay_before_s=args.pick_delay_s,
+            joint_pitch_after_pose=True,
+            pitch_source_x_mm=pitch_x_mm,
+        ),
+        SequenceStep(
+            "pick_lift",
+            pick_above,
+            args.vertical_mode,
+            joint_pitch_after_pose=True,
+            pitch_source_x_mm=pitch_x_mm,
+        ),
     ]
     if args.grasp_only:
         if not args.no_return_ready:
@@ -684,19 +914,35 @@ def build_in_steps(
         raise ValueError("--no-return-ready is incompatible with task 'in'")
 
     ready = ready_pose(args)
-    pick_above = fixed_pose(args, target.pick_x_mm, target.pick_y_mm, args.transfer_z_mm)
-    pick_grasp = fixed_pose(args, target.pick_x_mm, target.pick_y_mm, target.grasp_z_mm)
+    pick_above = target_pose(args, target, args.transfer_z_mm)
+    pick_grasp = target_pose(args, target, target.grasp_z_mm)
+    pitch_x_mm = pitch_source_x_mm(target)
     return (
         SequenceStep("ready_open", ready, args.transfer_mode, "open"),
         SequenceStep(
-            "return_pick_above",
-            pick_above,
-            args.transfer_mode,
-            None,
-            args.place_pick_delay_s,
+            label="return_pick_above",
+            pose=pick_above,
+            mode=args.transfer_mode,
+            delay_before_s=args.place_pick_delay_s,
+            joint_pitch_before_pose=True,
+            joint_pitch_after_pose=True,
+            pitch_source_x_mm=pitch_x_mm,
         ),
-        SequenceStep("return_pick_grasp", pick_grasp, args.vertical_mode, "close"),
-        SequenceStep("return_pick_lift", pick_above, args.vertical_mode),
+        SequenceStep(
+            label="return_pick_grasp",
+            pose=pick_grasp,
+            mode=args.vertical_mode,
+            gripper_after="close",
+            joint_pitch_after_pose=True,
+            pitch_source_x_mm=pitch_x_mm,
+        ),
+        SequenceStep(
+            "return_pick_lift",
+            pick_above,
+            args.vertical_mode,
+            joint_pitch_after_pose=True,
+            pitch_source_x_mm=pitch_x_mm,
+        ),
         SequenceStep("return_ready_above", ready, args.transfer_mode),
         SequenceStep("final_release", ready, args.transfer_mode, "open"),
     )
@@ -814,7 +1060,7 @@ def dynamic_preposition_pose(
     z_mm = min(float(args.transfer_z_mm), max(requested_z_mm, min_descent_z_mm))
     if z_mm != requested_z_mm:
         source = f"{source}_clamped"
-    return fixed_pose(args, target.pick_x_mm, target.pick_y_mm, z_mm), source
+    return target_pose(args, target, z_mm), source
 
 
 def guarded_start_pose_for_grasp(
@@ -901,6 +1147,7 @@ def execute_protected_abort_return(
     args: argparse.Namespace,
     counts: dict[str, int],
     gripper_results: list[SafeGripperResult],
+    joint_pitch_adjustments: list[JointPitchAdjustmentResult],
     abort_step: SequenceStep | None,
 ) -> tuple[str | None, str | None]:
     if abort_step is None:
@@ -910,6 +1157,7 @@ def execute_protected_abort_return(
         args,
         abort_step,
         gripper_results,
+        joint_pitch_adjustments,
     )
     abort_return = None
     if abort_step.label.startswith("protected_abort_return_"):
@@ -1305,6 +1553,38 @@ def print_plan(
             f"final={plan.target.grasp_z_mm:.3f}mm",
             flush=True,
         )
+    if (
+        plan.target.raw_pick_x_mm is not None
+        and (
+            plan.target.pick_x_source != "mapped_command_x"
+            or plan.target.pick_y_source != "mapped_command_y"
+        )
+    ):
+        print(
+            "  pick_line: "
+            f"raw=({plan.target.raw_pick_x_mm:.3f}, "
+            f"{plan.target.raw_pick_y_mm:.3f})mm "
+            f"final=({plan.target.pick_x_mm:.3f}, "
+            f"{plan.target.pick_y_mm:.3f})mm "
+            f"x_source={plan.target.pick_x_source} "
+            f"y_source={plan.target.pick_y_source}",
+            flush=True,
+        )
+    pitch = dynamic_pitch_summary(args, plan.target)
+    if pitch["enabled"]:
+        print(
+            "  dynamic_pitch: "
+            f"method={pitch['method']} "
+            f"x_ref={pitch['x_ref_mm']:.3f}mm "
+            f"k={pitch['deg_per_mm']:.6f}deg/mm "
+            f"raw_delta={pitch['raw_pitch_delta_deg']:.3f}deg "
+            f"delta={pitch['pitch_delta_deg']:.3f}deg "
+            f"j2={pitch['j2_ratio']:.3f} "
+            f"j3={pitch['j3_ratio']:.3f} "
+            f"j5={pitch['j5_ratio']:.3f} "
+            f"clamped={pitch['clamped']}",
+            flush=True,
+        )
     if metadata:
         print(f"  yolo: {metadata}", flush=True)
     if timing is not None:
@@ -1501,10 +1781,20 @@ def execute_step(
     step: SequenceStep,
     *,
     speed: int | None = None,
+    joint_pitch_adjustments: list[JointPitchAdjustmentResult] | None = None,
 ) -> tuple[int, SafeGripperResult | None]:
     if step.delay_before_s > 0:
         print(f"Waiting {step.delay_before_s:g}s before {step.label}", flush=True)
         time.sleep(step.delay_before_s)
+    if step.joint_pitch_before_pose:
+        pitch_adjustment = apply_joint_pitch_adjustment(
+            controller,
+            args,
+            step,
+            phase="before_pose",
+        )
+        if pitch_adjustment is not None and joint_pitch_adjustments is not None:
+            joint_pitch_adjustments.append(pitch_adjustment)
     print(f"Running {step.label}: {format_pose(step.pose)}", flush=True)
     send_count = execute_pose_for_duration(
         controller,
@@ -1523,6 +1813,15 @@ def execute_step(
             position_tolerance_mm=args.position_tolerance_mm,
             orientation_tolerance_deg=args.orientation_tolerance_deg,
         )
+    if step.joint_pitch_after_pose:
+        pitch_adjustment = apply_joint_pitch_adjustment(
+            controller,
+            args,
+            step,
+            phase="after_pose",
+        )
+        if pitch_adjustment is not None and joint_pitch_adjustments is not None:
+            joint_pitch_adjustments.append(pitch_adjustment)
     gripper_result = send_gripper(controller, args, step.gripper_after)
     return send_count, gripper_result
 
@@ -1551,13 +1850,201 @@ def safe_gripper_result_to_dict(result: SafeGripperResult) -> dict[str, Any]:
     }
 
 
+def joint_pitch_adjustment_to_dict(
+    result: JointPitchAdjustmentResult,
+) -> dict[str, Any]:
+    return {
+        "step_label": result.step_label,
+        "phase": result.phase,
+        "pick_x_mm": result.pick_x_mm,
+        "pitch_source_x_mm": result.pitch_source_x_mm,
+        "raw_pitch_delta_deg": result.raw_pitch_delta_deg,
+        "pitch_delta_deg": result.pitch_delta_deg,
+        "requested_pitch_delta_deg": result.requested_pitch_delta_deg,
+        "clamped": result.clamped,
+        "limit_clamped": result.limit_clamped,
+        "j2_delta_deg": result.j2_delta_deg,
+        "j3_delta_deg": result.j3_delta_deg,
+        "j5_delta_deg": result.j5_delta_deg,
+        "start_joints_deg": list(result.start_joints_deg),
+        "target_joints_deg": list(result.target_joints_deg),
+        "send_count": result.send_count,
+    }
+
+
+def joint_feedback_to_rad(joint_feedback: Any) -> tuple[float, ...] | None:
+    joint_state = getattr(joint_feedback, "joint_state", None)
+    if joint_state is None:
+        return None
+    values = [getattr(joint_state, f"joint_{index}", None) for index in range(1, 7)]
+    if any(value is None for value in values):
+        return None
+    return tuple(float(value) / RAD_TO_MILLI_DEG for value in values)
+
+
+def joints_rad_to_deg(joints_rad: tuple[float, ...] | list[float]) -> tuple[float, ...]:
+    return tuple(math.degrees(value) for value in joints_rad)
+
+
+def execute_joints_for_duration(
+    controller: PiperController,
+    joints_rad: tuple[float, ...] | list[float],
+    speed: int,
+    duration_s: float,
+    period_s: float,
+) -> int:
+    deadline = time.monotonic() + duration_s
+    send_count = 0
+    while send_count == 0 or time.monotonic() < deadline:
+        controller.move_joints(list(joints_rad), speed_percent=speed)
+        send_count += 1
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(period_s)
+    return send_count
+
+
+def clamp_pitch_delta_to_joint_limits(
+    controller: PiperController,
+    current_joints: tuple[float, ...],
+    requested_pitch_delta_deg: float,
+    args: argparse.Namespace,
+) -> float:
+    lower = -float("inf")
+    upper = float("inf")
+    ratios = (
+        (1, float(args.dynamic_pitch_j2_ratio)),
+        (2, float(args.dynamic_pitch_j3_ratio)),
+        (4, float(args.dynamic_pitch_j5_ratio)),
+    )
+    # Keep a small margin so rounding to SDK milli-degrees cannot land just outside limits.
+    margin_rad = math.radians(0.1)
+    for joint_index, ratio in ratios:
+        if math.isclose(ratio, 0.0, rel_tol=0.0, abs_tol=1e-12):
+            continue
+        limit = controller.config.joint_limits_rad[joint_index]
+        current_deg = math.degrees(float(current_joints[joint_index]))
+        min_delta_deg = math.degrees(limit.min_value + margin_rad) - current_deg
+        max_delta_deg = math.degrees(limit.max_value - margin_rad) - current_deg
+        joint_lower = min_delta_deg / ratio
+        joint_upper = max_delta_deg / ratio
+        if joint_lower > joint_upper:
+            joint_lower, joint_upper = joint_upper, joint_lower
+        lower = max(lower, joint_lower)
+        upper = min(upper, joint_upper)
+    if lower > upper:
+        raise SafetyError(
+            "dynamic joint pitch has no feasible delta within J2/J3/J5 limits: "
+            f"requested={requested_pitch_delta_deg:.3f}deg "
+            f"feasible=[{lower:.3f},{upper:.3f}]deg"
+        )
+    return min(upper, max(lower, requested_pitch_delta_deg))
+
+
+def apply_joint_pitch_adjustment(
+    controller: PiperController,
+    args: argparse.Namespace,
+    step: SequenceStep,
+    *,
+    phase: str,
+) -> JointPitchAdjustmentResult | None:
+    if not args.dynamic_pitch_by_x:
+        return None
+    pitch_source_x = (
+        float(step.pitch_source_x_mm)
+        if step.pitch_source_x_mm is not None
+        else float(step.pose.x_mm)
+    )
+    raw_pitch_delta_deg = (
+        (pitch_source_x - float(args.pitch_x_ref_mm))
+        * float(args.pitch_deg_per_mm)
+    )
+    requested_pitch_delta_deg = dynamic_pick_pitch_deg(args, pitch_source_x)
+    if math.isclose(requested_pitch_delta_deg, 0.0, rel_tol=0.0, abs_tol=1e-9):
+        return None
+
+    current_joints = joint_feedback_to_rad(controller.get_joint_state())
+    if current_joints is None:
+        raise RuntimeError(
+            "dynamic joint pitch requires valid joint feedback before JointCtrl"
+        )
+    pitch_delta_deg = clamp_pitch_delta_to_joint_limits(
+        controller,
+        current_joints,
+        requested_pitch_delta_deg,
+        args,
+    )
+    if math.isclose(pitch_delta_deg, 0.0, rel_tol=0.0, abs_tol=1e-9):
+        return None
+    target_joints = list(current_joints)
+    j2_delta_deg = pitch_delta_deg * float(args.dynamic_pitch_j2_ratio)
+    j3_delta_deg = pitch_delta_deg * float(args.dynamic_pitch_j3_ratio)
+    j5_delta_deg = pitch_delta_deg * float(args.dynamic_pitch_j5_ratio)
+    target_joints[1] += math.radians(j2_delta_deg)
+    target_joints[2] += math.radians(j3_delta_deg)
+    target_joints[4] += math.radians(j5_delta_deg)
+
+    print(
+        "Applying dynamic joint pitch: "
+        f"step={step.label} phase={phase} "
+        f"pick_x={step.pose.x_mm:.3f}mm "
+        f"source_x={pitch_source_x:.3f}mm "
+        f"pitch_delta={pitch_delta_deg:.3f}deg "
+        f"requested={requested_pitch_delta_deg:.3f}deg "
+        f"j2={j2_delta_deg:.3f}deg "
+        f"j3={j3_delta_deg:.3f}deg "
+        f"j5={j5_delta_deg:.3f}deg",
+        flush=True,
+    )
+    send_count = execute_joints_for_duration(
+        controller,
+        target_joints,
+        int(args.dynamic_pitch_speed),
+        float(args.command_duration_s),
+        float(args.command_period_s),
+    )
+    return JointPitchAdjustmentResult(
+        step_label=step.label,
+        phase=phase,
+        pick_x_mm=float(step.pose.x_mm),
+        pitch_source_x_mm=pitch_source_x,
+        raw_pitch_delta_deg=raw_pitch_delta_deg,
+        pitch_delta_deg=pitch_delta_deg,
+        requested_pitch_delta_deg=requested_pitch_delta_deg,
+        clamped=not math.isclose(
+            raw_pitch_delta_deg,
+            pitch_delta_deg,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ),
+        limit_clamped=not math.isclose(
+            requested_pitch_delta_deg,
+            pitch_delta_deg,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ),
+        j2_delta_deg=j2_delta_deg,
+        j3_delta_deg=j3_delta_deg,
+        j5_delta_deg=j5_delta_deg,
+        start_joints_deg=joints_rad_to_deg(current_joints),  # type: ignore[arg-type]
+        target_joints_deg=joints_rad_to_deg(target_joints),
+        send_count=send_count,
+    )
+
+
 def execute_and_record_step(
     controller: PiperController,
     args: argparse.Namespace,
     step: SequenceStep,
     gripper_results: list[SafeGripperResult],
+    joint_pitch_adjustments: list[JointPitchAdjustmentResult] | None = None,
 ) -> int:
-    send_count, gripper_result = execute_step(controller, args, step)
+    send_count, gripper_result = execute_step(
+        controller,
+        args,
+        step,
+        joint_pitch_adjustments=joint_pitch_adjustments,
+    )
     record_gripper_result(gripper_results, gripper_result)
     return send_count
 
@@ -1575,6 +2062,7 @@ def execute_plan(
     counts: dict[str, int] = {}
     guarded_result: GuardedDescentResult | None = None
     gripper_results: list[SafeGripperResult] = []
+    joint_pitch_adjustments: list[JointPitchAdjustmentResult] = []
     for index, step in enumerate(plan.steps):
         if should_guard_step(step, args):
             guarded_start_pose = guarded_start_pose_for_grasp(args, step.pose)
@@ -1590,6 +2078,7 @@ def execute_plan(
                 args,
                 guarded_start_step,
                 gripper_results,
+                joint_pitch_adjustments,
             )
             guarded_result = execute_guarded_descent(
                 controller,
@@ -1612,6 +2101,7 @@ def execute_plan(
                     args,
                     counts,
                     gripper_results,
+                    joint_pitch_adjustments,
                     abort_step,
                 )
                 record_gripper_result(
@@ -1626,11 +2116,25 @@ def execute_plan(
                     protected_abort_return_label=abort_return_label,
                     guarded_descent=guarded_result,
                     safe_gripper_results=tuple(gripper_results),
+                    joint_pitch_adjustments=tuple(joint_pitch_adjustments),
                 )
+            pitch_adjustment = apply_joint_pitch_adjustment(
+                controller,
+                args,
+                step,
+                phase="after_guarded_descent",
+            )
+            if pitch_adjustment is not None:
+                joint_pitch_adjustments.append(pitch_adjustment)
             gripper_result = send_gripper(controller, args, step.gripper_after)
             record_gripper_result(gripper_results, gripper_result)
             continue
-        send_count, gripper_result = execute_step(controller, args, step)
+        send_count, gripper_result = execute_step(
+            controller,
+            args,
+            step,
+            joint_pitch_adjustments=joint_pitch_adjustments,
+        )
         counts[step.label] = send_count
         record_gripper_result(gripper_results, gripper_result)
 
@@ -1644,6 +2148,7 @@ def execute_plan(
         send_counts=counts,
         guarded_descent=guarded_result,
         safe_gripper_results=tuple(gripper_results),
+        joint_pitch_adjustments=tuple(joint_pitch_adjustments),
     )
 
 
@@ -1663,6 +2168,7 @@ def execute_dynamic_preposition_plan(
 
     counts: dict[str, int] = {}
     gripper_results: list[SafeGripperResult] = []
+    joint_pitch_adjustments: list[JointPitchAdjustmentResult] = []
     started_s = time.monotonic()
     ready_step = plan.steps[0]
     pick_above_step = plan.steps[1]
@@ -1673,6 +2179,9 @@ def execute_dynamic_preposition_plan(
         "dynamic_preposition",
         preposition_pose,
         args.vertical_mode,
+        joint_pitch_before_pose=True,
+        joint_pitch_after_pose=True,
+        pitch_source_x_mm=pitch_source_x_mm(plan.target),
     )
 
     counts[ready_step.label] = execute_and_record_step(
@@ -1680,18 +2189,21 @@ def execute_dynamic_preposition_plan(
         args,
         ready_step,
         gripper_results,
+        joint_pitch_adjustments,
     )
     counts[pick_above_step.label] = execute_and_record_step(
         controller,
         args,
         pick_above_step,
         gripper_results,
+        joint_pitch_adjustments,
     )
     counts[preposition_step.label] = execute_and_record_step(
         controller,
         args,
         preposition_step,
         gripper_results,
+        joint_pitch_adjustments,
     )
 
     preposition_elapsed_s = time.monotonic() - started_s
@@ -1725,6 +2237,7 @@ def execute_dynamic_preposition_plan(
                 args,
                 counts,
                 gripper_results,
+                joint_pitch_adjustments,
                 abort_step,
             )
             record_gripper_result(
@@ -1745,7 +2258,16 @@ def execute_dynamic_preposition_plan(
                 final_action_late_s=final_action_late_s,
                 guarded_descent=guarded_result,
                 safe_gripper_results=tuple(gripper_results),
+                joint_pitch_adjustments=tuple(joint_pitch_adjustments),
             )
+        pitch_adjustment = apply_joint_pitch_adjustment(
+            controller,
+            args,
+            grasp_step,
+            phase="after_guarded_descent",
+        )
+        if pitch_adjustment is not None:
+            joint_pitch_adjustments.append(pitch_adjustment)
         gripper_result = send_gripper(controller, args, grasp_step.gripper_after)
         record_gripper_result(gripper_results, gripper_result)
     else:
@@ -1753,6 +2275,7 @@ def execute_dynamic_preposition_plan(
             controller,
             args,
             grasp_step,
+            joint_pitch_adjustments=joint_pitch_adjustments,
         )
         counts[grasp_step.label] = send_count
         record_gripper_result(gripper_results, gripper_result)
@@ -1762,6 +2285,7 @@ def execute_dynamic_preposition_plan(
         args,
         lift_step,
         gripper_results,
+        joint_pitch_adjustments,
     )
     for step in plan.steps[4:]:
         counts[step.label] = execute_and_record_step(
@@ -1769,6 +2293,7 @@ def execute_dynamic_preposition_plan(
             args,
             step,
             gripper_results,
+            joint_pitch_adjustments,
         )
 
     if args.print_feedback:
@@ -1788,6 +2313,7 @@ def execute_dynamic_preposition_plan(
         final_action_late_s=final_action_late_s,
         guarded_descent=guarded_result,
         safe_gripper_results=tuple(gripper_results),
+        joint_pitch_adjustments=tuple(joint_pitch_adjustments),
     )
 
 
@@ -1924,6 +2450,10 @@ def handle_message(
             },
             "pick_x_mm": target.pick_x_mm,
             "pick_y_mm": target.pick_y_mm,
+            "raw_pick_x_mm": target.raw_pick_x_mm,
+            "raw_pick_y_mm": target.raw_pick_y_mm,
+            "pick_x_source": target.pick_x_source,
+            "pick_y_source": target.pick_y_source,
             "grasp_z_mm": target.grasp_z_mm,
             "raw_grasp_z_mm": target.raw_grasp_z_mm,
             "grasp_z_source": target.grasp_z_source,
@@ -1938,6 +2468,9 @@ def handle_message(
                     "pose": pose_to_dict(step.pose),
                     "gripper_after": step.gripper_after,
                     "delay_before_s": step.delay_before_s,
+                    "joint_pitch_before_pose": step.joint_pitch_before_pose,
+                    "joint_pitch_after_pose": step.joint_pitch_after_pose,
+                    "pitch_source_x_mm": step.pitch_source_x_mm,
                 }
                 for step in plan.steps
             ],
@@ -1947,6 +2480,16 @@ def handle_message(
                 "ry_deg": args.ry_deg,
                 "rz_deg": args.rz_deg,
             },
+            "target_orientation_deg": {
+                "rx_deg": plan.steps[2].pose.rx_deg,
+                "ry_deg": plan.steps[2].pose.ry_deg,
+                "rz_deg": plan.steps[2].pose.rz_deg,
+            },
+            "dynamic_pitch": dynamic_pitch_summary(args, target),
+            "joint_pitch_adjustments": [
+                joint_pitch_adjustment_to_dict(result)
+                for result in execution.joint_pitch_adjustments
+            ],
             "sequence": {
                 "kind": sequence_kind,
                 "task": plan.task,

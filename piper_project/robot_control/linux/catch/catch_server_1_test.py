@@ -3,12 +3,14 @@ from __future__ import annotations
 import argparse
 import contextlib
 import io
+import math
 import unittest
 
 import numpy as np
 
+from robot_control.linux.arm.piper_arm import RAD_TO_MILLI_DEG
 from robot_control.linux.arm.piper_arm import PiperController
-from robot_control.linux.arm.piper_arm_test import FakePiperSdk
+from robot_control.linux.arm.piper_arm_test import FakeJointFeedback, FakePiperSdk
 from robot_control.linux.catch.catch_server_1 import (
     build_parser,
     build_steps,
@@ -56,15 +58,26 @@ def make_args(**overrides: object) -> argparse.Namespace:
         "guarded_abort_return": "pick_above",
         "collision_protection_level": None,
         "no_start_ready": False,
-        "ready_x_mm": 343.108,
+        "ready_x_mm": 350.0,
         "ready_y_mm": 0.0,
         "transfer_z_mm": 253.252,
         "grasp_z_mm": 133.252,
         "use_detected_z": False,
         "detected_z_offset_mm": 0.0,
-        "rx_deg": 180.0,
-        "ry_deg": 14.795,
-        "rz_deg": 180.0,
+        "rx_deg": -176.794223,
+        "ry_deg": 0.889438,
+        "rz_deg": -105.490597,
+        "force_pick_x_mm": None,
+        "force_pick_y_mm": None,
+        "dynamic_pitch_by_x": False,
+        "pitch_x_ref_mm": 350.0,
+        "pitch_deg_per_mm": 0.05,
+        "min_dynamic_pitch_deg": -20.0,
+        "max_dynamic_pitch_deg": 20.0,
+        "dynamic_pitch_j2_ratio": 0.0,
+        "dynamic_pitch_j3_ratio": 0.0,
+        "dynamic_pitch_j5_ratio": 1.0,
+        "dynamic_pitch_speed": 20,
         "pick_delay_s": 0.0,
         "place_x_mm": 130.0,
         "place_y_mm": 200.0,
@@ -217,6 +230,14 @@ def make_sequenced_feedback_controller(poses: list[EndPose]) -> PiperController:
     )
 
 
+def joint_feedback_from_degrees(*joints_deg: float) -> FakeJointFeedback:
+    if len(joints_deg) != 6:
+        raise ValueError("expected six joint values")
+    return FakeJointFeedback(
+        tuple(round(math.radians(value) * RAD_TO_MILLI_DEG) for value in joints_deg)
+    )
+
+
 class TestCatchServer1(unittest.TestCase):
     def test_parser_defaults_enable_guarded_descent_with_overridable_values(self):
         args = build_parser().parse_args([])
@@ -307,10 +328,66 @@ class TestCatchServer1(unittest.TestCase):
         self.assertAlmostEqual(steps[4].pose.z_mm, args.transfer_z_mm)
         self.assertEqual(
             (steps[2].pose.rx_deg, steps[2].pose.ry_deg, steps[2].pose.rz_deg),
-            (180.0, 14.795, 180.0),
+            (-176.794223, 0.889438, -105.490597),
         )
         self.assertEqual(steps[2].delay_before_s, 1.25)
         self.assertTrue(all(step.delay_before_s == 0.0 for step in steps[3:]))
+
+    def test_force_pick_y_and_dynamic_pitch_by_x_keeps_cartesian_orientation_fixed(self):
+        args = make_args(
+            force_pick_x_mm=350.0,
+            force_pick_y_mm=0.0,
+            dynamic_pitch_by_x=True,
+            pitch_x_ref_mm=350.0,
+            pitch_deg_per_mm=0.05,
+            ry_deg=1.353477,
+        )
+        command = CameraPointCommand(x_m=0.0, y_m=0.0, z_m=0.0, command_id="cmd")
+        camera_to_base = np.eye(4, dtype=float)
+        camera_to_base[:3, 3] = np.array([0.40, 0.06, 0.10])
+
+        target = target_from_command(command, camera_to_base, args)
+        steps = build_steps(args, target)
+
+        self.assertAlmostEqual(target.raw_pick_y_mm, 60.0)
+        self.assertAlmostEqual(target.raw_pick_x_mm, 400.0)
+        self.assertAlmostEqual(target.pick_x_mm, 350.0)
+        self.assertAlmostEqual(target.pick_y_mm, 0.0)
+        self.assertEqual(target.pick_x_source, "forced_pick_x")
+        self.assertEqual(target.pick_y_source, "forced_pick_y")
+        for index in (1, 2, 3):
+            self.assertAlmostEqual(steps[index].pose.x_mm, 350.0)
+            self.assertAlmostEqual(steps[index].pose.y_mm, 0.0)
+            self.assertAlmostEqual(steps[index].pose.ry_deg, 1.353477)
+            self.assertAlmostEqual(steps[index].pitch_source_x_mm, 400.0)
+        self.assertTrue(steps[1].joint_pitch_before_pose)
+        self.assertTrue(steps[1].joint_pitch_after_pose)
+        self.assertFalse(steps[2].joint_pitch_before_pose)
+        self.assertTrue(steps[2].joint_pitch_after_pose)
+        self.assertFalse(steps[3].joint_pitch_before_pose)
+        self.assertTrue(steps[3].joint_pitch_after_pose)
+        self.assertFalse(steps[0].joint_pitch_after_pose)
+        self.assertFalse(steps[4].joint_pitch_after_pose)
+        self.assertFalse(steps[6].joint_pitch_after_pose)
+
+    def test_dynamic_pitch_by_x_clamps_joint_pitch_delta(self):
+        args = make_args(
+            dynamic_pitch_by_x=True,
+            pitch_x_ref_mm=350.0,
+            pitch_deg_per_mm=0.5,
+            min_dynamic_pitch_deg=-10.0,
+            max_dynamic_pitch_deg=10.0,
+            ry_deg=1.0,
+        )
+        command = CameraPointCommand(x_m=0.0, y_m=0.0, z_m=0.0, command_id="cmd")
+        camera_to_base = np.eye(4, dtype=float)
+        camera_to_base[:3, 3] = np.array([0.50, 0.0, 0.10])
+
+        target = target_from_command(command, camera_to_base, args)
+        steps = build_steps(args, target)
+
+        self.assertAlmostEqual(steps[2].pose.ry_deg, 1.0)
+        self.assertTrue(steps[2].joint_pitch_after_pose)
 
     def test_build_steps_in_picks_selected_target_and_releases_at_ready(self):
         args = make_args(place_pick_delay_s=2.5)
@@ -654,7 +731,7 @@ class TestCatchServer1(unittest.TestCase):
             )
         )
         controller = make_feedback_controller(
-            EndPose(343.108, 0.0, 253.252, 180.0, 14.795, 180.0)
+            EndPose(350.0, 0.0, 253.252, -176.794223, 0.889438, -105.490597)
         )
 
         with contextlib.redirect_stdout(io.StringIO()):
@@ -712,7 +789,7 @@ class TestCatchServer1(unittest.TestCase):
             )
         )
         controller = make_feedback_controller(
-            EndPose(343.108, 0.0, 253.252, 180.0, 14.795, 180.0)
+            EndPose(350.0, 0.0, 253.252, -176.794223, 0.889438, -105.490597)
         )
 
         with contextlib.redirect_stdout(io.StringIO()):
@@ -760,7 +837,7 @@ class TestCatchServer1(unittest.TestCase):
             )
         )
         controller = make_feedback_controller(
-            EndPose(343.108, 0.0, 253.252, 180.0, 14.795, 180.0),
+            EndPose(350.0, 0.0, 253.252, -176.794223, 0.889438, -105.490597),
             stall_z_mm=140.0,
         )
 
@@ -806,7 +883,7 @@ class TestCatchServer1(unittest.TestCase):
             ],
         )
         abort_index = controller.sdk.calls.index(
-            ("EndPoseCtrl", (350000, -30000, 253252, 180000, 14795, 180000))
+            ("EndPoseCtrl", (350000, -30000, 253252, -176794, 889, -105491))
         )
         second_open_index = [
             index
@@ -846,7 +923,7 @@ class TestCatchServer1(unittest.TestCase):
             )
         )
         controller = make_feedback_controller(
-            EndPose(343.108, 0.0, 253.252, 180.0, 14.795, 180.0),
+            EndPose(350.0, 0.0, 253.252, -176.794223, 0.889438, -105.490597),
             stall_z_mm=140.0,
         )
 
@@ -1060,6 +1137,132 @@ class TestCatchServer1(unittest.TestCase):
             ],
         )
 
+    def test_dynamic_pitch_execution_only_changes_allowed_joints(self):
+        args = make_args(
+            execute=True,
+            grasp_only=True,
+            no_return_ready=True,
+            guarded_descent=False,
+            dynamic_pitch_by_x=True,
+            force_pick_x_mm=350.0,
+            pitch_x_ref_mm=350.0,
+            pitch_deg_per_mm=0.05,
+            dynamic_pitch_speed=12,
+            command_duration_s=0.0,
+        )
+        camera_to_base = np.eye(4, dtype=float)
+        camera_to_base[:3, 3] = np.array([0.40, 0.00, 0.00])
+        message = make_camera_point_message(
+            CameraPointCommand(x_m=0.0, y_m=0.0, z_m=0.30, command_id="cmd-pitch")
+        )
+        controller = make_controller()
+        controller.sdk.joint_feedbacks = [
+            joint_feedback_from_degrees(10.0, 20.0, -30.0, 40.0, 5.0, 60.0),
+            joint_feedback_from_degrees(10.0, 20.0, -30.0, 40.0, 5.0, 60.0),
+            joint_feedback_from_degrees(10.0, 20.0, -30.0, 40.0, 5.0, 60.0),
+            joint_feedback_from_degrees(10.0, 20.0, -30.0, 40.0, 5.0, 60.0),
+        ]
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            response = handle_message(
+                message,
+                args=args,
+                camera_to_base=camera_to_base,
+                validator=controller,
+                controller=controller,
+            )
+
+        joint_calls = [call for call in controller.sdk.calls if call[0] == "JointCtrl"]
+        self.assertEqual(
+            joint_calls,
+            [
+                ("JointCtrl", (10000, 20000, -30000, 40000, 7500, 60000)),
+                ("JointCtrl", (10000, 20000, -30000, 40000, 7500, 60000)),
+                ("JointCtrl", (10000, 20000, -30000, 40000, 7500, 60000)),
+                ("JointCtrl", (10000, 20000, -30000, 40000, 7500, 60000)),
+            ],
+        )
+        motion_j_calls = [
+            call for call in controller.sdk.calls
+            if call == ("MotionCtrl_2", (0x01, 0x01, 12, 0x00, 0, 0x00))
+        ]
+        self.assertEqual(len(motion_j_calls), 4)
+        end_pose_calls = [
+            call for call in controller.sdk.calls if call[0] == "EndPoseCtrl"
+        ]
+        self.assertEqual(end_pose_calls[1][1][0], 350000)
+        self.assertAlmostEqual(response["payload"]["raw_pick_x_mm"], 400.0)
+        self.assertAlmostEqual(response["payload"]["pick_x_mm"], 350.0)
+        self.assertEqual(response["payload"]["pick_x_source"], "forced_pick_x")
+        self.assertEqual(
+            response["payload"]["dynamic_pitch"]["method"],
+            "joint_space_j2_j3_j5",
+        )
+        self.assertAlmostEqual(
+            response["payload"]["dynamic_pitch"]["pitch_delta_deg"],
+            2.5,
+        )
+        self.assertEqual(len(response["payload"]["joint_pitch_adjustments"]), 4)
+        self.assertEqual(
+            [
+                adjustment["phase"]
+                for adjustment in response["payload"]["joint_pitch_adjustments"]
+            ],
+            ["before_pose", "after_pose", "after_pose", "after_pose"],
+        )
+        for adjustment in response["payload"]["joint_pitch_adjustments"]:
+            self.assertAlmostEqual(adjustment["pitch_source_x_mm"], 400.0)
+            self.assertAlmostEqual(adjustment["j2_delta_deg"], 0.0)
+            self.assertAlmostEqual(adjustment["j3_delta_deg"], 0.0)
+            self.assertAlmostEqual(adjustment["j5_delta_deg"], 2.5)
+
+    def test_dynamic_pitch_clamps_to_joint_limits_before_joint_command(self):
+        args = make_args(
+            execute=True,
+            grasp_only=True,
+            no_return_ready=True,
+            guarded_descent=False,
+            dynamic_pitch_by_x=True,
+            force_pick_x_mm=350.0,
+            pitch_x_ref_mm=350.0,
+            pitch_deg_per_mm=0.05,
+            dynamic_pitch_j2_ratio=0.5,
+            dynamic_pitch_j3_ratio=-1.0,
+            dynamic_pitch_j5_ratio=0.5,
+            dynamic_pitch_speed=12,
+            command_duration_s=0.0,
+        )
+        camera_to_base = np.eye(4, dtype=float)
+        camera_to_base[:3, 3] = np.array([0.40, 0.00, 0.00])
+        message = make_camera_point_message(
+            CameraPointCommand(x_m=0.0, y_m=0.0, z_m=0.30, command_id="cmd-pitch-limit")
+        )
+        controller = make_controller()
+        controller.sdk.joint_feedbacks = [
+            joint_feedback_from_degrees(10.0, 20.0, -30.0, 40.0, 69.5, 60.0),
+            joint_feedback_from_degrees(10.0, 20.0, -30.0, 40.0, 69.5, 60.0),
+            joint_feedback_from_degrees(10.0, 20.0, -30.0, 40.0, 69.5, 60.0),
+            joint_feedback_from_degrees(10.0, 20.0, -30.0, 40.0, 69.5, 60.0),
+        ]
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            response = handle_message(
+                message,
+                args=args,
+                camera_to_base=camera_to_base,
+                validator=controller,
+                controller=controller,
+            )
+
+        joint_calls = [call for call in controller.sdk.calls if call[0] == "JointCtrl"]
+        self.assertTrue(joint_calls)
+        for _, joints in joint_calls:
+            self.assertLessEqual(joints[4], 69900)
+        first_adjustment = response["payload"]["joint_pitch_adjustments"][0]
+        self.assertTrue(first_adjustment["limit_clamped"])
+        self.assertLess(first_adjustment["pitch_delta_deg"], 2.5)
+        self.assertAlmostEqual(first_adjustment["j5_delta_deg"], 0.4)
+
     def test_execute_grasp_only_sends_open_close_only_and_no_release(self):
         args = make_args(
             execute=True,
@@ -1156,7 +1359,7 @@ class TestCatchServer1(unittest.TestCase):
             )
         )
         controller = make_feedback_controller(
-            EndPose(343.108, 0.0, 253.252, 180.0, 14.795, 180.0),
+            EndPose(350.0, 0.0, 253.252, -176.794223, 0.889438, -105.490597),
             gripper_efforts_nm=[0.9],
         )
 
@@ -1215,7 +1418,7 @@ class TestCatchServer1(unittest.TestCase):
             CameraPointCommand(x_m=0.0, y_m=0.0, z_m=0.30, command_id="cmd-static-guard")
         )
         controller = make_feedback_controller(
-            EndPose(343.108, 0.0, 253.252, 180.0, 14.795, 180.0)
+            EndPose(350.0, 0.0, 253.252, -176.794223, 0.889438, -105.490597)
         )
 
         with contextlib.redirect_stdout(io.StringIO()):
@@ -1274,7 +1477,7 @@ class TestCatchServer1(unittest.TestCase):
             CameraPointCommand(x_m=0.0, y_m=0.0, z_m=0.30, command_id="cmd-guard-start")
         )
         controller = make_feedback_controller(
-            EndPose(250.0, 0.0, 180.0, 180.0, 14.795, 180.0),
+            EndPose(250.0, 0.0, 180.0, -176.794223, 0.889438, -105.490597),
             freeze_pose=True,
         )
 
@@ -1298,7 +1501,7 @@ class TestCatchServer1(unittest.TestCase):
         )
         end_pose_calls = [call for call in controller.sdk.calls if call[0] == "EndPoseCtrl"]
         self.assertNotIn(
-            ("EndPoseCtrl", (250000, 0, 160252, 180000, 14795, 180000)),
+            ("EndPoseCtrl", (250000, 0, 160252, -176794, 889, -105491)),
             end_pose_calls,
         )
 
@@ -1326,7 +1529,7 @@ class TestCatchServer1(unittest.TestCase):
             )
         )
         controller = make_feedback_controller(
-            EndPose(343.108, 0.0, 253.252, 180.0, 14.795, 180.0),
+            EndPose(350.0, 0.0, 253.252, -176.794223, 0.889438, -105.490597),
             stall_z_mm=args.grasp_z_mm + 30.0,
         )
 
@@ -1368,7 +1571,7 @@ class TestCatchServer1(unittest.TestCase):
             ],
         )
         abort_index = controller.sdk.calls.index(
-            ("EndPoseCtrl", (250000, 0, 253252, 180000, 14795, 180000))
+            ("EndPoseCtrl", (250000, 0, 253252, -176794, 889, -105491))
         )
         second_open_index = [
             index
@@ -1393,7 +1596,7 @@ class TestCatchServer1(unittest.TestCase):
             [
                 (
                     "EndPoseCtrl",
-                    (343108, 0, 253252, 180000, 14795, 180000),
+                    (350000, 0, 253252, -176794, 889, -105491),
                 )
             ],
         )
