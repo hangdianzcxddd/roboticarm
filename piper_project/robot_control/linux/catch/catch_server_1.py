@@ -62,6 +62,11 @@ DEFAULT_HAND_EYE_RESULT = (
     Path(__file__).resolve().parents[1] / "hand_eye" / "hand_eye_result.json"
 )
 Action = Literal["open", "close", None]
+JointPitchMode = Literal["disabled", "keep_fixed", "adjust"]
+DEFAULT_KEEP_PITCH_MIN_X_MM = 300.0
+DEFAULT_KEEP_PITCH_MAX_X_MM = 380.0
+DEFAULT_PITCH_DEG_PER_MM_FAR = 0.04
+DEFAULT_PITCH_DEG_PER_MM_NEAR = 0.03
 
 
 @dataclass(frozen=True)
@@ -135,6 +140,27 @@ class SafeGripperResult:
     last_effort_nm: float | None = None
     last_position_mm: float | None = None
     poll_count: int = 0
+
+
+@dataclass(frozen=True)
+class JointPitchDecision:
+    enabled: bool
+    mode: JointPitchMode
+    source_x_mm: float
+    keep_min_x_mm: float
+    keep_max_x_mm: float
+    over_mm: float
+    raw_pitch_delta_deg: float
+    requested_pitch_delta_deg: float
+    pitch_delta_deg: float
+    clamped: bool
+    limit_clamped: bool
+    j2_ratio: float
+    j3_ratio: float
+    j5_ratio: float
+    j2_delta_deg: float
+    j3_delta_deg: float
+    j5_delta_deg: float
 
 
 @dataclass(frozen=True)
@@ -377,40 +403,78 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--dynamic-pitch-by-x",
+        "--adaptive-joint-pitch-by-x",
         action="store_true",
+        dest="dynamic_pitch_by_x",
         help=(
-            "after reaching pick waypoints, apply a joint-space pitch trim using "
-            "only J2/J3/J5; Cartesian RX/RY/RZ stay fixed"
+            "after reaching pick waypoints outside the keep-pitch X band, apply "
+            "a joint-space pitch trim using only J2/J3/J5; Cartesian RX/RY/RZ "
+            "stay fixed"
         ),
     )
     parser.add_argument(
         "--pitch-x-ref-mm",
         type=float,
         default=350.0,
-        help="base X where dynamic joint pitch delta is zero",
+        help=(
+            "legacy dynamic pitch neutral X; kept for old --pitch-deg-per-mm "
+            "setups but not used by adaptive keep-band pitch"
+        ),
     )
     parser.add_argument(
         "--pitch-deg-per-mm",
         type=float,
-        default=0.05,
+        default=None,
         help=(
-            "joint-space pitch degrees added per millimeter of pick_x_mm beyond "
-            "--pitch-x-ref-mm"
+            "legacy single slope; when provided, sets both "
+            "--pitch-deg-per-mm-near and --pitch-deg-per-mm-far"
+        ),
+    )
+    parser.add_argument(
+        "--keep-pitch-min-x-mm",
+        type=float,
+        default=DEFAULT_KEEP_PITCH_MIN_X_MM,
+        help="minimum X in the fixed-gripper-pitch keep band",
+    )
+    parser.add_argument(
+        "--keep-pitch-max-x-mm",
+        type=float,
+        default=DEFAULT_KEEP_PITCH_MAX_X_MM,
+        help="maximum X in the fixed-gripper-pitch keep band",
+    )
+    parser.add_argument(
+        "--pitch-deg-per-mm-far",
+        type=float,
+        default=None,
+        help=(
+            "joint-space pitch degrees per millimeter beyond "
+            "--keep-pitch-max-x-mm"
+        ),
+    )
+    parser.add_argument(
+        "--pitch-deg-per-mm-near",
+        type=float,
+        default=None,
+        help=(
+            "joint-space pitch degrees per millimeter below "
+            "--keep-pitch-min-x-mm; over_mm is negative on the near side"
         ),
     )
     parser.add_argument(
         "--min-dynamic-pitch-deg",
+        "--min-required-pitch-deg",
         "--min-dynamic-ry-deg",
         dest="min_dynamic_pitch_deg",
         type=float,
-        default=-20.0,
+        default=-12.0,
     )
     parser.add_argument(
         "--max-dynamic-pitch-deg",
+        "--max-required-pitch-deg",
         "--max-dynamic-ry-deg",
         dest="max_dynamic_pitch_deg",
         type=float,
-        default=20.0,
+        default=12.0,
     )
     parser.add_argument(
         "--dynamic-pitch-j2-ratio",
@@ -537,7 +601,31 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def normalize_dynamic_pitch_args(args: argparse.Namespace) -> None:
+    if not hasattr(args, "keep_pitch_min_x_mm"):
+        args.keep_pitch_min_x_mm = DEFAULT_KEEP_PITCH_MIN_X_MM
+    if not hasattr(args, "keep_pitch_max_x_mm"):
+        args.keep_pitch_max_x_mm = DEFAULT_KEEP_PITCH_MAX_X_MM
+    legacy_slope = getattr(args, "pitch_deg_per_mm", None)
+    if getattr(args, "pitch_deg_per_mm_far", None) is None:
+        args.pitch_deg_per_mm_far = (
+            float(legacy_slope)
+            if legacy_slope is not None
+            else DEFAULT_PITCH_DEG_PER_MM_FAR
+        )
+    if getattr(args, "pitch_deg_per_mm_near", None) is None:
+        args.pitch_deg_per_mm_near = (
+            float(legacy_slope)
+            if legacy_slope is not None
+            else DEFAULT_PITCH_DEG_PER_MM_NEAR
+        )
+    if legacy_slope is None:
+        # Keep legacy summaries/tests from seeing None after validation.
+        args.pitch_deg_per_mm = float(args.pitch_deg_per_mm_far)
+
+
 def validate_args(args: argparse.Namespace) -> None:
+    normalize_dynamic_pitch_args(args)
     if not isinstance(args.speed, int) or not 0 <= args.speed <= 100:
         raise ValueError("--speed must be an integer in [0, 100]")
     if not isinstance(args.startup_speed, int) or not 0 <= args.startup_speed <= 100:
@@ -630,6 +718,10 @@ def validate_args(args: argparse.Namespace) -> None:
         "force_pick_y_mm",
         "pitch_x_ref_mm",
         "pitch_deg_per_mm",
+        "keep_pitch_min_x_mm",
+        "keep_pitch_max_x_mm",
+        "pitch_deg_per_mm_far",
+        "pitch_deg_per_mm_near",
         "min_dynamic_pitch_deg",
         "max_dynamic_pitch_deg",
         "dynamic_pitch_j2_ratio",
@@ -651,6 +743,10 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.min_dynamic_pitch_deg > args.max_dynamic_pitch_deg:
         raise ValueError(
             "--min-dynamic-pitch-deg must be <= --max-dynamic-pitch-deg"
+        )
+    if args.keep_pitch_min_x_mm > args.keep_pitch_max_x_mm:
+        raise ValueError(
+            "--keep-pitch-min-x-mm must be <= --keep-pitch-max-x-mm"
         )
     if (
         args.dynamic_pitch_by_x
@@ -686,16 +782,99 @@ def fixed_pose(args: argparse.Namespace, x_mm: float, y_mm: float, z_mm: float) 
     )
 
 
-def dynamic_pick_pitch_deg(args: argparse.Namespace, pick_x_mm: float) -> float:
+def clamp(value: float, lower: float, upper: float) -> float:
+    return min(upper, max(lower, value))
+
+
+def joint_pitch_decision(
+    args: argparse.Namespace,
+    source_x_mm: float,
+    *,
+    feasible_pitch_delta_deg: float | None = None,
+) -> JointPitchDecision:
+    normalize_dynamic_pitch_args(args)
+    source_x = float(source_x_mm)
+    keep_min_x = float(args.keep_pitch_min_x_mm)
+    keep_max_x = float(args.keep_pitch_max_x_mm)
+    j2_ratio = float(args.dynamic_pitch_j2_ratio)
+    j3_ratio = float(args.dynamic_pitch_j3_ratio)
+    j5_ratio = float(args.dynamic_pitch_j5_ratio)
     if not args.dynamic_pitch_by_x:
-        return 0.0
-    raw_pitch_deg = (
-        (float(pick_x_mm) - float(args.pitch_x_ref_mm))
-        * float(args.pitch_deg_per_mm)
+        return JointPitchDecision(
+            enabled=False,
+            mode="disabled",
+            source_x_mm=source_x,
+            keep_min_x_mm=keep_min_x,
+            keep_max_x_mm=keep_max_x,
+            over_mm=0.0,
+            raw_pitch_delta_deg=0.0,
+            requested_pitch_delta_deg=0.0,
+            pitch_delta_deg=0.0,
+            clamped=False,
+            limit_clamped=False,
+            j2_ratio=j2_ratio,
+            j3_ratio=j3_ratio,
+            j5_ratio=j5_ratio,
+            j2_delta_deg=0.0,
+            j3_delta_deg=0.0,
+            j5_delta_deg=0.0,
+        )
+    over_mm = 0.0
+    raw_pitch_deg = 0.0
+    mode: JointPitchMode = "keep_fixed"
+    if source_x > keep_max_x:
+        over_mm = source_x - keep_max_x
+        raw_pitch_deg = over_mm * float(args.pitch_deg_per_mm_far)
+        mode = "adjust"
+    elif source_x < keep_min_x:
+        over_mm = source_x - keep_min_x
+        raw_pitch_deg = over_mm * float(args.pitch_deg_per_mm_near)
+        mode = "adjust"
+
+    requested_pitch_deg = (
+        0.0
+        if mode == "keep_fixed"
+        else clamp(
+            raw_pitch_deg,
+            float(args.min_dynamic_pitch_deg),
+            float(args.max_dynamic_pitch_deg),
+        )
     )
-    return min(
-        float(args.max_dynamic_pitch_deg),
-        max(float(args.min_dynamic_pitch_deg), raw_pitch_deg),
+    pitch_delta_deg = (
+        requested_pitch_deg
+        if feasible_pitch_delta_deg is None
+        else float(feasible_pitch_delta_deg)
+    )
+    if mode != "adjust":
+        pitch_delta_deg = 0.0
+    return JointPitchDecision(
+        enabled=True,
+        mode=mode,
+        source_x_mm=source_x,
+        keep_min_x_mm=keep_min_x,
+        keep_max_x_mm=keep_max_x,
+        over_mm=over_mm,
+        raw_pitch_delta_deg=raw_pitch_deg,
+        requested_pitch_delta_deg=requested_pitch_deg,
+        pitch_delta_deg=pitch_delta_deg,
+        clamped=not math.isclose(
+            raw_pitch_deg,
+            requested_pitch_deg,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ),
+        limit_clamped=not math.isclose(
+            requested_pitch_deg,
+            pitch_delta_deg,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ),
+        j2_ratio=j2_ratio,
+        j3_ratio=j3_ratio,
+        j5_ratio=j5_ratio,
+        j2_delta_deg=pitch_delta_deg * j2_ratio,
+        j3_delta_deg=pitch_delta_deg * j3_ratio,
+        j5_delta_deg=pitch_delta_deg * j5_ratio,
     )
 
 
@@ -712,36 +891,37 @@ def dynamic_pitch_summary(
     target: YoloCatchTarget,
 ) -> dict[str, Any]:
     pitch_x_mm = pitch_source_x_mm(target)
-    raw_pitch_deg = 0.0
-    if args.dynamic_pitch_by_x:
-        raw_pitch_deg = (
-            (pitch_x_mm - float(args.pitch_x_ref_mm))
-            * float(args.pitch_deg_per_mm)
-        )
-    pitch_deg = dynamic_pick_pitch_deg(args, pitch_x_mm)
+    decision = joint_pitch_decision(args, pitch_x_mm)
     return {
-        "enabled": bool(args.dynamic_pitch_by_x),
+        "enabled": decision.enabled,
+        "mode": decision.mode,
         "method": "joint_space_j2_j3_j5",
         "fixed_pose_ry_deg": float(args.ry_deg),
         "pick_x_mm": float(target.pick_x_mm),
         "raw_pick_x_mm": target.raw_pick_x_mm,
         "pitch_source_x_mm": pitch_x_mm,
+        "source_x_mm": pitch_x_mm,
+        "keep_min_x_mm": decision.keep_min_x_mm,
+        "keep_max_x_mm": decision.keep_max_x_mm,
+        "over_mm": decision.over_mm,
         "x_ref_mm": float(args.pitch_x_ref_mm),
         "deg_per_mm": float(args.pitch_deg_per_mm),
-        "raw_pitch_delta_deg": raw_pitch_deg,
-        "pitch_delta_deg": pitch_deg,
+        "pitch_deg_per_mm_far": float(args.pitch_deg_per_mm_far),
+        "pitch_deg_per_mm_near": float(args.pitch_deg_per_mm_near),
+        "raw_pitch_delta_deg": decision.raw_pitch_delta_deg,
+        "requested_pitch_delta_deg": decision.requested_pitch_delta_deg,
+        "pitch_delta_deg": decision.pitch_delta_deg,
         "min_pitch_delta_deg": float(args.min_dynamic_pitch_deg),
         "max_pitch_delta_deg": float(args.max_dynamic_pitch_deg),
-        "j2_ratio": float(args.dynamic_pitch_j2_ratio),
-        "j3_ratio": float(args.dynamic_pitch_j3_ratio),
-        "j5_ratio": float(args.dynamic_pitch_j5_ratio),
+        "j2_ratio": decision.j2_ratio,
+        "j3_ratio": decision.j3_ratio,
+        "j5_ratio": decision.j5_ratio,
+        "j2_delta_deg": decision.j2_delta_deg,
+        "j3_delta_deg": decision.j3_delta_deg,
+        "j5_delta_deg": decision.j5_delta_deg,
         "speed": int(args.dynamic_pitch_speed),
-        "clamped": not math.isclose(
-            raw_pitch_deg,
-            pitch_deg,
-            rel_tol=0.0,
-            abs_tol=1e-9,
-        ),
+        "clamped": decision.clamped,
+        "limit_clamped": decision.limit_clamped,
     }
 
 
@@ -860,6 +1040,7 @@ def build_out_steps(
     pick_grasp = target_pose(args, target, target.grasp_z_mm)
     place_above = fixed_pose(args, args.place_x_mm, args.place_y_mm, args.transfer_z_mm)
     pitch_x_mm = pitch_source_x_mm(target)
+    use_joint_pitch = joint_pitch_decision(args, pitch_x_mm).mode == "adjust"
 
     steps: list[SequenceStep] = [
         SequenceStep("ready_open", ready, args.transfer_mode, "open"),
@@ -867,8 +1048,8 @@ def build_out_steps(
             "pick_above",
             pick_above,
             args.transfer_mode,
-            joint_pitch_before_pose=True,
-            joint_pitch_after_pose=True,
+            joint_pitch_before_pose=use_joint_pitch,
+            joint_pitch_after_pose=use_joint_pitch,
             pitch_source_x_mm=pitch_x_mm,
         ),
         SequenceStep(
@@ -877,14 +1058,14 @@ def build_out_steps(
             mode=args.vertical_mode,
             gripper_after="close",
             delay_before_s=args.pick_delay_s,
-            joint_pitch_after_pose=True,
+            joint_pitch_after_pose=use_joint_pitch,
             pitch_source_x_mm=pitch_x_mm,
         ),
         SequenceStep(
             "pick_lift",
             pick_above,
             args.vertical_mode,
-            joint_pitch_after_pose=True,
+            joint_pitch_after_pose=use_joint_pitch,
             pitch_source_x_mm=pitch_x_mm,
         ),
     ]
@@ -917,6 +1098,7 @@ def build_in_steps(
     pick_above = target_pose(args, target, args.transfer_z_mm)
     pick_grasp = target_pose(args, target, target.grasp_z_mm)
     pitch_x_mm = pitch_source_x_mm(target)
+    use_joint_pitch = joint_pitch_decision(args, pitch_x_mm).mode == "adjust"
     return (
         SequenceStep("ready_open", ready, args.transfer_mode, "open"),
         SequenceStep(
@@ -924,8 +1106,8 @@ def build_in_steps(
             pose=pick_above,
             mode=args.transfer_mode,
             delay_before_s=args.place_pick_delay_s,
-            joint_pitch_before_pose=True,
-            joint_pitch_after_pose=True,
+            joint_pitch_before_pose=use_joint_pitch,
+            joint_pitch_after_pose=use_joint_pitch,
             pitch_source_x_mm=pitch_x_mm,
         ),
         SequenceStep(
@@ -933,14 +1115,14 @@ def build_in_steps(
             pose=pick_grasp,
             mode=args.vertical_mode,
             gripper_after="close",
-            joint_pitch_after_pose=True,
+            joint_pitch_after_pose=use_joint_pitch,
             pitch_source_x_mm=pitch_x_mm,
         ),
         SequenceStep(
             "return_pick_lift",
             pick_above,
             args.vertical_mode,
-            joint_pitch_after_pose=True,
+            joint_pitch_after_pose=use_joint_pitch,
             pitch_source_x_mm=pitch_x_mm,
         ),
         SequenceStep("return_ready_above", ready, args.transfer_mode),
@@ -1575,14 +1757,21 @@ def print_plan(
         print(
             "  dynamic_pitch: "
             f"method={pitch['method']} "
-            f"x_ref={pitch['x_ref_mm']:.3f}mm "
-            f"k={pitch['deg_per_mm']:.6f}deg/mm "
+            f"mode={pitch['mode']} "
+            f"source_x={pitch['source_x_mm']:.3f}mm "
+            f"keep=[{pitch['keep_min_x_mm']:.3f},"
+            f"{pitch['keep_max_x_mm']:.3f}]mm "
+            f"over={pitch['over_mm']:.3f}mm "
+            f"k_near={pitch['pitch_deg_per_mm_near']:.6f}deg/mm "
+            f"k_far={pitch['pitch_deg_per_mm_far']:.6f}deg/mm "
             f"raw_delta={pitch['raw_pitch_delta_deg']:.3f}deg "
+            f"requested={pitch['requested_pitch_delta_deg']:.3f}deg "
             f"delta={pitch['pitch_delta_deg']:.3f}deg "
             f"j2={pitch['j2_ratio']:.3f} "
             f"j3={pitch['j3_ratio']:.3f} "
             f"j5={pitch['j5_ratio']:.3f} "
-            f"clamped={pitch['clamped']}",
+            f"clamped={pitch['clamped']} "
+            f"limit_clamped={pitch['limit_clamped']}",
             flush=True,
         )
     if metadata:
@@ -1948,19 +2137,21 @@ def apply_joint_pitch_adjustment(
     *,
     phase: str,
 ) -> JointPitchAdjustmentResult | None:
-    if not args.dynamic_pitch_by_x:
-        return None
     pitch_source_x = (
         float(step.pitch_source_x_mm)
         if step.pitch_source_x_mm is not None
         else float(step.pose.x_mm)
     )
-    raw_pitch_delta_deg = (
-        (pitch_source_x - float(args.pitch_x_ref_mm))
-        * float(args.pitch_deg_per_mm)
-    )
-    requested_pitch_delta_deg = dynamic_pick_pitch_deg(args, pitch_source_x)
-    if math.isclose(requested_pitch_delta_deg, 0.0, rel_tol=0.0, abs_tol=1e-9):
+    requested_decision = joint_pitch_decision(args, pitch_source_x)
+    if (
+        requested_decision.mode != "adjust"
+        or math.isclose(
+            requested_decision.requested_pitch_delta_deg,
+            0.0,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        )
+    ):
         return None
 
     current_joints = joint_feedback_to_rad(controller.get_joint_state())
@@ -1971,15 +2162,20 @@ def apply_joint_pitch_adjustment(
     pitch_delta_deg = clamp_pitch_delta_to_joint_limits(
         controller,
         current_joints,
-        requested_pitch_delta_deg,
+        requested_decision.requested_pitch_delta_deg,
         args,
     )
-    if math.isclose(pitch_delta_deg, 0.0, rel_tol=0.0, abs_tol=1e-9):
+    decision = joint_pitch_decision(
+        args,
+        pitch_source_x,
+        feasible_pitch_delta_deg=pitch_delta_deg,
+    )
+    if math.isclose(decision.pitch_delta_deg, 0.0, rel_tol=0.0, abs_tol=1e-9):
         return None
     target_joints = list(current_joints)
-    j2_delta_deg = pitch_delta_deg * float(args.dynamic_pitch_j2_ratio)
-    j3_delta_deg = pitch_delta_deg * float(args.dynamic_pitch_j3_ratio)
-    j5_delta_deg = pitch_delta_deg * float(args.dynamic_pitch_j5_ratio)
+    j2_delta_deg = decision.j2_delta_deg
+    j3_delta_deg = decision.j3_delta_deg
+    j5_delta_deg = decision.j5_delta_deg
     target_joints[1] += math.radians(j2_delta_deg)
     target_joints[2] += math.radians(j3_delta_deg)
     target_joints[4] += math.radians(j5_delta_deg)
@@ -1989,8 +2185,10 @@ def apply_joint_pitch_adjustment(
         f"step={step.label} phase={phase} "
         f"pick_x={step.pose.x_mm:.3f}mm "
         f"source_x={pitch_source_x:.3f}mm "
-        f"pitch_delta={pitch_delta_deg:.3f}deg "
-        f"requested={requested_pitch_delta_deg:.3f}deg "
+        f"mode={decision.mode} "
+        f"over={decision.over_mm:.3f}mm "
+        f"pitch_delta={decision.pitch_delta_deg:.3f}deg "
+        f"requested={decision.requested_pitch_delta_deg:.3f}deg "
         f"j2={j2_delta_deg:.3f}deg "
         f"j3={j3_delta_deg:.3f}deg "
         f"j5={j5_delta_deg:.3f}deg",
@@ -2008,21 +2206,11 @@ def apply_joint_pitch_adjustment(
         phase=phase,
         pick_x_mm=float(step.pose.x_mm),
         pitch_source_x_mm=pitch_source_x,
-        raw_pitch_delta_deg=raw_pitch_delta_deg,
-        pitch_delta_deg=pitch_delta_deg,
-        requested_pitch_delta_deg=requested_pitch_delta_deg,
-        clamped=not math.isclose(
-            raw_pitch_delta_deg,
-            pitch_delta_deg,
-            rel_tol=0.0,
-            abs_tol=1e-9,
-        ),
-        limit_clamped=not math.isclose(
-            requested_pitch_delta_deg,
-            pitch_delta_deg,
-            rel_tol=0.0,
-            abs_tol=1e-9,
-        ),
+        raw_pitch_delta_deg=decision.raw_pitch_delta_deg,
+        pitch_delta_deg=decision.pitch_delta_deg,
+        requested_pitch_delta_deg=decision.requested_pitch_delta_deg,
+        clamped=decision.clamped,
+        limit_clamped=decision.limit_clamped,
         j2_delta_deg=j2_delta_deg,
         j3_delta_deg=j3_delta_deg,
         j5_delta_deg=j5_delta_deg,
@@ -2175,13 +2363,17 @@ def execute_dynamic_preposition_plan(
     grasp_step = replace(plan.steps[2], delay_before_s=0.0)
     lift_step = plan.steps[3]
     preposition_pose, preposition_source = dynamic_preposition_pose(args, plan.target)
+    preposition_pitch_x_mm = pitch_source_x_mm(plan.target)
+    use_preposition_pitch = (
+        joint_pitch_decision(args, preposition_pitch_x_mm).mode == "adjust"
+    )
     preposition_step = SequenceStep(
         "dynamic_preposition",
         preposition_pose,
         args.vertical_mode,
-        joint_pitch_before_pose=True,
-        joint_pitch_after_pose=True,
-        pitch_source_x_mm=pitch_source_x_mm(plan.target),
+        joint_pitch_before_pose=use_preposition_pitch,
+        joint_pitch_after_pose=use_preposition_pitch,
+        pitch_source_x_mm=preposition_pitch_x_mm,
     )
 
     counts[ready_step.label] = execute_and_record_step(

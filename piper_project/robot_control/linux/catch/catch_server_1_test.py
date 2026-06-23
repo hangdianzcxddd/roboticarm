@@ -71,9 +71,13 @@ def make_args(**overrides: object) -> argparse.Namespace:
         "force_pick_y_mm": None,
         "dynamic_pitch_by_x": False,
         "pitch_x_ref_mm": 350.0,
-        "pitch_deg_per_mm": 0.05,
-        "min_dynamic_pitch_deg": -20.0,
-        "max_dynamic_pitch_deg": 20.0,
+        "pitch_deg_per_mm": None,
+        "keep_pitch_min_x_mm": 300.0,
+        "keep_pitch_max_x_mm": 380.0,
+        "pitch_deg_per_mm_far": None,
+        "pitch_deg_per_mm_near": None,
+        "min_dynamic_pitch_deg": -12.0,
+        "max_dynamic_pitch_deg": 12.0,
         "dynamic_pitch_j2_ratio": 0.0,
         "dynamic_pitch_j3_ratio": 0.0,
         "dynamic_pitch_j5_ratio": 1.0,
@@ -258,6 +262,14 @@ class TestCatchServer1(unittest.TestCase):
         self.assertAlmostEqual(args.place_y_mm, 200.0)
         self.assertAlmostEqual(args.place_pick_x_mm, -130.0)
         self.assertAlmostEqual(args.place_pick_y_mm, 200.0)
+        self.assertFalse(args.dynamic_pitch_by_x)
+        self.assertAlmostEqual(args.keep_pitch_min_x_mm, 300.0)
+        self.assertAlmostEqual(args.keep_pitch_max_x_mm, 380.0)
+        self.assertIsNone(args.pitch_deg_per_mm)
+        self.assertIsNone(args.pitch_deg_per_mm_far)
+        self.assertIsNone(args.pitch_deg_per_mm_near)
+        self.assertAlmostEqual(args.min_dynamic_pitch_deg, -12.0)
+        self.assertAlmostEqual(args.max_dynamic_pitch_deg, 12.0)
 
         args = build_parser().parse_args(
             [
@@ -275,6 +287,26 @@ class TestCatchServer1(unittest.TestCase):
         self.assertEqual(args.guarded_descent_speed, 12)
         self.assertAlmostEqual(args.guarded_follow_error_mm, 6.0)
         self.assertEqual(args.startup_speed, 9)
+
+    def test_parser_accepts_adaptive_joint_pitch_alias_and_slope_defaults(self):
+        args = build_parser().parse_args(["--adaptive-joint-pitch-by-x"])
+
+        validate_args(args)
+
+        self.assertTrue(args.dynamic_pitch_by_x)
+        self.assertAlmostEqual(args.pitch_deg_per_mm_far, 0.04)
+        self.assertAlmostEqual(args.pitch_deg_per_mm_near, 0.03)
+        self.assertAlmostEqual(args.pitch_deg_per_mm, 0.04)
+
+        args = build_parser().parse_args(
+            ["--dynamic-pitch-by-x", "--pitch-deg-per-mm", "0.07"]
+        )
+
+        validate_args(args)
+
+        self.assertTrue(args.dynamic_pitch_by_x)
+        self.assertAlmostEqual(args.pitch_deg_per_mm_far, 0.07)
+        self.assertAlmostEqual(args.pitch_deg_per_mm_near, 0.07)
 
     def test_parser_accepts_descent_protection_alias(self):
         args = build_parser().parse_args(["--no-descent-protection"])
@@ -333,13 +365,15 @@ class TestCatchServer1(unittest.TestCase):
         self.assertEqual(steps[2].delay_before_s, 1.25)
         self.assertTrue(all(step.delay_before_s == 0.0 for step in steps[3:]))
 
-    def test_force_pick_y_and_dynamic_pitch_by_x_keeps_cartesian_orientation_fixed(self):
+    def test_force_pick_y_and_adaptive_pitch_marks_only_outside_keep_band(self):
         args = make_args(
             force_pick_x_mm=350.0,
             force_pick_y_mm=0.0,
             dynamic_pitch_by_x=True,
-            pitch_x_ref_mm=350.0,
-            pitch_deg_per_mm=0.05,
+            keep_pitch_min_x_mm=300.0,
+            keep_pitch_max_x_mm=380.0,
+            pitch_deg_per_mm_far=0.04,
+            pitch_deg_per_mm_near=0.03,
             ry_deg=1.353477,
         )
         command = CameraPointCommand(x_m=0.0, y_m=0.0, z_m=0.0, command_id="cmd")
@@ -370,11 +404,36 @@ class TestCatchServer1(unittest.TestCase):
         self.assertFalse(steps[4].joint_pitch_after_pose)
         self.assertFalse(steps[6].joint_pitch_after_pose)
 
-    def test_dynamic_pitch_by_x_clamps_joint_pitch_delta(self):
+    def test_adaptive_pitch_keep_band_keeps_cartesian_orientation_and_no_joint_pitch(self):
+        args = make_args(
+            force_pick_x_mm=350.0,
+            force_pick_y_mm=0.0,
+            dynamic_pitch_by_x=True,
+            keep_pitch_min_x_mm=300.0,
+            keep_pitch_max_x_mm=380.0,
+            ry_deg=1.353477,
+        )
+        command = CameraPointCommand(x_m=0.0, y_m=0.0, z_m=0.0, command_id="cmd")
+        camera_to_base = np.eye(4, dtype=float)
+        camera_to_base[:3, 3] = np.array([0.35, 0.06, 0.10])
+
+        target = target_from_command(command, camera_to_base, args)
+        steps = build_steps(args, target)
+
+        self.assertAlmostEqual(target.raw_pick_x_mm, 350.0)
+        for index in (1, 2, 3):
+            self.assertAlmostEqual(steps[index].pose.x_mm, 350.0)
+            self.assertAlmostEqual(steps[index].pose.ry_deg, 1.353477)
+            self.assertAlmostEqual(steps[index].pitch_source_x_mm, 350.0)
+            self.assertFalse(steps[index].joint_pitch_before_pose)
+            self.assertFalse(steps[index].joint_pitch_after_pose)
+
+    def test_adaptive_pitch_by_x_clamps_business_pitch_delta(self):
         args = make_args(
             dynamic_pitch_by_x=True,
-            pitch_x_ref_mm=350.0,
-            pitch_deg_per_mm=0.5,
+            keep_pitch_min_x_mm=300.0,
+            keep_pitch_max_x_mm=380.0,
+            pitch_deg_per_mm_far=0.5,
             min_dynamic_pitch_deg=-10.0,
             max_dynamic_pitch_deg=10.0,
             ry_deg=1.0,
@@ -1145,8 +1204,9 @@ class TestCatchServer1(unittest.TestCase):
             guarded_descent=False,
             dynamic_pitch_by_x=True,
             force_pick_x_mm=350.0,
-            pitch_x_ref_mm=350.0,
-            pitch_deg_per_mm=0.05,
+            keep_pitch_min_x_mm=300.0,
+            keep_pitch_max_x_mm=380.0,
+            pitch_deg_per_mm_far=0.125,
             dynamic_pitch_speed=12,
             command_duration_s=0.0,
         )
@@ -1202,6 +1262,16 @@ class TestCatchServer1(unittest.TestCase):
             response["payload"]["dynamic_pitch"]["pitch_delta_deg"],
             2.5,
         )
+        self.assertEqual(response["payload"]["dynamic_pitch"]["mode"], "adjust")
+        self.assertAlmostEqual(response["payload"]["dynamic_pitch"]["over_mm"], 20.0)
+        self.assertAlmostEqual(
+            response["payload"]["dynamic_pitch"]["raw_pitch_delta_deg"],
+            2.5,
+        )
+        self.assertAlmostEqual(
+            response["payload"]["dynamic_pitch"]["requested_pitch_delta_deg"],
+            2.5,
+        )
         self.assertEqual(len(response["payload"]["joint_pitch_adjustments"]), 4)
         self.assertEqual(
             [
@@ -1216,6 +1286,46 @@ class TestCatchServer1(unittest.TestCase):
             self.assertAlmostEqual(adjustment["j3_delta_deg"], 0.0)
             self.assertAlmostEqual(adjustment["j5_delta_deg"], 2.5)
 
+    def test_adaptive_pitch_keep_band_execution_sends_no_joint_commands(self):
+        args = make_args(
+            execute=True,
+            grasp_only=True,
+            no_return_ready=True,
+            guarded_descent=False,
+            dynamic_pitch_by_x=True,
+            force_pick_x_mm=350.0,
+            keep_pitch_min_x_mm=300.0,
+            keep_pitch_max_x_mm=380.0,
+            command_duration_s=0.0,
+        )
+        camera_to_base = np.eye(4, dtype=float)
+        camera_to_base[:3, 3] = np.array([0.35, 0.00, 0.00])
+        message = make_camera_point_message(
+            CameraPointCommand(x_m=0.0, y_m=0.0, z_m=0.30, command_id="cmd-pitch-keep")
+        )
+        controller = make_controller()
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            response = handle_message(
+                message,
+                args=args,
+                camera_to_base=camera_to_base,
+                validator=controller,
+                controller=controller,
+            )
+
+        joint_calls = [call for call in controller.sdk.calls if call[0] == "JointCtrl"]
+        self.assertEqual(joint_calls, [])
+        self.assertEqual(response["payload"]["dynamic_pitch"]["mode"], "keep_fixed")
+        self.assertAlmostEqual(
+            response["payload"]["dynamic_pitch"]["pitch_delta_deg"],
+            0.0,
+        )
+        self.assertEqual(response["payload"]["joint_pitch_adjustments"], [])
+        for step in response["payload"]["steps"][1:4]:
+            self.assertFalse(step["joint_pitch_before_pose"])
+            self.assertFalse(step["joint_pitch_after_pose"])
+
     def test_dynamic_pitch_clamps_to_joint_limits_before_joint_command(self):
         args = make_args(
             execute=True,
@@ -1224,8 +1334,9 @@ class TestCatchServer1(unittest.TestCase):
             guarded_descent=False,
             dynamic_pitch_by_x=True,
             force_pick_x_mm=350.0,
-            pitch_x_ref_mm=350.0,
-            pitch_deg_per_mm=0.05,
+            keep_pitch_min_x_mm=300.0,
+            keep_pitch_max_x_mm=380.0,
+            pitch_deg_per_mm_far=0.125,
             dynamic_pitch_j2_ratio=0.5,
             dynamic_pitch_j3_ratio=-1.0,
             dynamic_pitch_j5_ratio=0.5,
@@ -1615,6 +1726,11 @@ class TestCatchServer1(unittest.TestCase):
         validate_args(make_args(startup_speed=0))
         with self.assertRaisesRegex(ValueError, "--startup-speed"):
             validate_args(make_args(startup_speed=101))
+
+    def test_keep_pitch_band_is_validated(self):
+        validate_args(make_args(keep_pitch_min_x_mm=300.0, keep_pitch_max_x_mm=300.0))
+        with self.assertRaisesRegex(ValueError, "--keep-pitch-min-x-mm"):
+            validate_args(make_args(keep_pitch_min_x_mm=381.0, keep_pitch_max_x_mm=380.0))
 
     def test_collision_protection_level_is_validated(self):
         validate_args(make_args(collision_protection_level=8))
