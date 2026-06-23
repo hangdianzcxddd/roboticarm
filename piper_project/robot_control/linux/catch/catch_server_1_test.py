@@ -70,6 +70,7 @@ def make_args(**overrides: object) -> argparse.Namespace:
         "force_pick_x_mm": None,
         "force_pick_y_mm": None,
         "dynamic_pitch_by_x": False,
+        "dynamic_pitch_mode": "joint",
         "pitch_x_ref_mm": 350.0,
         "pitch_deg_per_mm": None,
         "keep_pitch_min_x_mm": 300.0,
@@ -82,6 +83,13 @@ def make_args(**overrides: object) -> argparse.Namespace:
         "dynamic_pitch_j3_ratio": 0.0,
         "dynamic_pitch_j5_ratio": 1.0,
         "dynamic_pitch_speed": 20,
+        "planar_ik_max_iterations": 40,
+        "planar_ik_position_tolerance_mm": 3.0,
+        "planar_ik_ry_tolerance_deg": 1.0,
+        "planar_ik_max_step_deg": 8.0,
+        "planar_ik_damping": 1e-3,
+        "planar_ik_joint_tolerance_deg": 2.0,
+        "planar_ik_fk_tool_z_offset_mm": 82.0,
         "pick_delay_s": 0.0,
         "place_x_mm": 130.0,
         "place_y_mm": 200.0,
@@ -263,6 +271,7 @@ class TestCatchServer1(unittest.TestCase):
         self.assertAlmostEqual(args.place_pick_x_mm, -130.0)
         self.assertAlmostEqual(args.place_pick_y_mm, 200.0)
         self.assertFalse(args.dynamic_pitch_by_x)
+        self.assertEqual(args.dynamic_pitch_mode, "joint")
         self.assertAlmostEqual(args.keep_pitch_min_x_mm, 300.0)
         self.assertAlmostEqual(args.keep_pitch_max_x_mm, 380.0)
         self.assertIsNone(args.pitch_deg_per_mm)
@@ -270,6 +279,11 @@ class TestCatchServer1(unittest.TestCase):
         self.assertIsNone(args.pitch_deg_per_mm_near)
         self.assertAlmostEqual(args.min_dynamic_pitch_deg, -12.0)
         self.assertAlmostEqual(args.max_dynamic_pitch_deg, 12.0)
+        self.assertEqual(args.planar_ik_max_iterations, 40)
+        self.assertAlmostEqual(args.planar_ik_position_tolerance_mm, 3.0)
+        self.assertAlmostEqual(args.planar_ik_ry_tolerance_deg, 1.0)
+        self.assertAlmostEqual(args.planar_ik_joint_tolerance_deg, 2.0)
+        self.assertAlmostEqual(args.planar_ik_fk_tool_z_offset_mm, 82.0)
 
         args = build_parser().parse_args(
             [
@@ -447,6 +461,30 @@ class TestCatchServer1(unittest.TestCase):
 
         self.assertAlmostEqual(steps[2].pose.ry_deg, 1.0)
         self.assertTrue(steps[2].joint_pitch_after_pose)
+
+    def test_planar_ik_dynamic_pitch_marks_pick_steps_without_changing_pose_ry(self):
+        args = make_args(
+            dynamic_pitch_by_x=True,
+            dynamic_pitch_mode="planar-ik",
+            keep_pitch_min_x_mm=300.0,
+            keep_pitch_max_x_mm=380.0,
+            pitch_deg_per_mm_far=0.04,
+            force_pick_y_mm=0.0,
+            ry_deg=1.353477,
+        )
+        command = CameraPointCommand(x_m=0.0, y_m=0.0, z_m=0.0, command_id="cmd")
+        camera_to_base = np.eye(4, dtype=float)
+        camera_to_base[:3, 3] = np.array([0.40, 0.06, 0.10])
+
+        target = target_from_command(command, camera_to_base, args)
+        steps = build_steps(args, target)
+
+        for index in (1, 2, 3):
+            self.assertAlmostEqual(steps[index].pose.ry_deg, 1.353477)
+            self.assertAlmostEqual(steps[index].pitch_source_x_mm, 400.0)
+            self.assertFalse(steps[index].joint_pitch_before_pose)
+            self.assertFalse(steps[index].joint_pitch_after_pose)
+            self.assertTrue(steps[index].planar_ik)
 
     def test_build_steps_in_picks_selected_target_and_releases_at_ready(self):
         args = make_args(place_pick_delay_s=2.5)
@@ -1325,6 +1363,66 @@ class TestCatchServer1(unittest.TestCase):
         for step in response["payload"]["steps"][1:4]:
             self.assertFalse(step["joint_pitch_before_pose"])
             self.assertFalse(step["joint_pitch_after_pose"])
+
+    def test_planar_ik_dynamic_pitch_sends_only_joint_commands_for_pick_steps(self):
+        args = make_args(
+            execute=True,
+            grasp_only=True,
+            no_return_ready=True,
+            guarded_descent=False,
+            dynamic_pitch_by_x=True,
+            dynamic_pitch_mode="planar-ik",
+            force_pick_x_mm=350.0,
+            keep_pitch_min_x_mm=300.0,
+            keep_pitch_max_x_mm=380.0,
+            pitch_deg_per_mm_far=0.125,
+            command_duration_s=0.0,
+            no_wait_waypoints=True,
+        )
+        camera_to_base = np.eye(4, dtype=float)
+        camera_to_base[:3, 3] = np.array([0.40, 0.00, 0.00])
+        message = make_camera_point_message(
+            CameraPointCommand(x_m=0.0, y_m=0.0, z_m=0.30, command_id="cmd-cart-pitch")
+        )
+        controller = make_controller()
+        controller.sdk.joint_feedbacks = [
+            joint_feedback_from_degrees(0.0, 114.592, -94.538, 0.0, 68.755, -77.349),
+            joint_feedback_from_degrees(0.0, 114.592, -94.538, 0.0, 68.755, -77.349),
+            joint_feedback_from_degrees(0.0, 108.170, -70.384, 0.0, 41.558, -77.349),
+            joint_feedback_from_degrees(0.0, 108.170, -70.384, 0.0, 41.558, -77.349),
+            joint_feedback_from_degrees(0.0, 123.570, -62.773, 0.0, 18.543, -77.349),
+            joint_feedback_from_degrees(0.0, 123.570, -62.773, 0.0, 18.543, -77.349),
+        ]
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            response = handle_message(
+                message,
+                args=args,
+                camera_to_base=camera_to_base,
+                validator=controller,
+                controller=controller,
+            )
+
+        joint_calls = [call for call in controller.sdk.calls if call[0] == "JointCtrl"]
+        self.assertEqual(len(joint_calls), 3)
+        for _, joints in joint_calls:
+            self.assertEqual(joints[0], 0)
+            self.assertEqual(joints[3], 0)
+            self.assertEqual(joints[5], -77349)
+        end_pose_calls = [
+            call for call in controller.sdk.calls if call[0] == "EndPoseCtrl"
+        ]
+        self.assertEqual(len(end_pose_calls), 1)
+        self.assertEqual(response["payload"]["dynamic_pitch"]["method"], "planar_ik_j2_j3_j5")
+        self.assertEqual(response["payload"]["dynamic_pitch"]["control_mode"], "planar_ik")
+        self.assertEqual(response["payload"]["joint_pitch_adjustments"], [])
+        self.assertEqual(len(response["payload"]["planar_ik_results"]), 3)
+        first_result = response["payload"]["planar_ik_results"][0]
+        self.assertAlmostEqual(first_result["target_pose"]["x_mm"], 350.0)
+        self.assertLessEqual(
+            abs(first_result["ry_error_deg"]),
+            args.planar_ik_ry_tolerance_deg,
+        )
 
     def test_dynamic_pitch_clamps_to_joint_limits_before_joint_command(self):
         args = make_args(

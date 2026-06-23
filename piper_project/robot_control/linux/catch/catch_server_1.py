@@ -29,15 +29,23 @@ import time
 from dataclasses import dataclass, replace
 from typing import Any, Literal
 
+import numpy as np
+
+from robot_control.linux.arm.kinematics import (
+    forward_kinematics_pose,
+    normalize_degrees,
+)
 from robot_control.linux.arm.piper_arm import RAD_TO_MILLI_DEG, PiperController
 from robot_control.linux.arm.safety import SafetyError
 from robot_control.linux.catch.catch_server import (
     execute_pose_for_duration,
     feedback_to_pose,
     format_pose,
+    format_status,
     pose_delta,
     wait_until_pose_reached,
 )
+from robot_control.linux.catch.tcp_offset import rotation_matrix_xyz_deg
 from robot_control.linux.catch.hand_eye_mapping import (
     hand_eye_quality_summary,
     load_camera_to_base_transform,
@@ -63,10 +71,12 @@ DEFAULT_HAND_EYE_RESULT = (
 )
 Action = Literal["open", "close", None]
 JointPitchMode = Literal["disabled", "keep_fixed", "adjust"]
+DynamicPitchControlMode = Literal["joint", "planar_ik"]
 DEFAULT_KEEP_PITCH_MIN_X_MM = 300.0
 DEFAULT_KEEP_PITCH_MAX_X_MM = 380.0
 DEFAULT_PITCH_DEG_PER_MM_FAR = 0.04
 DEFAULT_PITCH_DEG_PER_MM_NEAR = 0.03
+PLANAR_IK_JOINT_INDICES = (1, 2, 4)
 
 
 @dataclass(frozen=True)
@@ -79,6 +89,7 @@ class SequenceStep:
     joint_pitch_before_pose: bool = False
     joint_pitch_after_pose: bool = False
     pitch_source_x_mm: float | None = None
+    planar_ik: bool = False
 
 
 @dataclass(frozen=True)
@@ -183,6 +194,45 @@ class JointPitchAdjustmentResult:
 
 
 @dataclass(frozen=True)
+class PlanarIkExecutionResult:
+    step_label: str
+    pitch_source_x_mm: float
+    target_pose: EndPose
+    solved_pose: EndPose
+    start_joints_deg: tuple[float, float, float, float, float, float]
+    target_joints_deg: tuple[float, float, float, float, float, float]
+    pitch_delta_deg: float
+    requested_pitch_delta_deg: float
+    iterations: int
+    x_error_mm: float
+    y_error_mm: float
+    z_error_mm: float
+    position_error_mm: float
+    ry_error_deg: float
+    send_count: int
+    solved_fk_pose: EndPose | None = None
+    final_joints_deg: tuple[float, float, float, float, float, float] | None = None
+    joint_errors_deg: tuple[float, float, float] | None = None
+    max_joint_error_deg: float | None = None
+    final_pose: EndPose | None = None
+
+
+@dataclass(frozen=True)
+class PlanarIkSolution:
+    target_joints_rad: tuple[float, float, float, float, float, float]
+    solved_pose: EndPose
+    solved_fk_pose: EndPose
+    pitch_delta_deg: float
+    requested_pitch_delta_deg: float
+    iterations: int
+    x_error_mm: float
+    y_error_mm: float
+    z_error_mm: float
+    position_error_mm: float
+    ry_error_deg: float
+
+
+@dataclass(frozen=True)
 class DynamicExecutionResult:
     send_counts: dict[str, int]
     protected_abort: bool = False
@@ -198,6 +248,7 @@ class DynamicExecutionResult:
     guarded_descent: GuardedDescentResult | None = None
     safe_gripper_results: tuple[SafeGripperResult, ...] = ()
     joint_pitch_adjustments: tuple[JointPitchAdjustmentResult, ...] = ()
+    planar_ik_results: tuple[PlanarIkExecutionResult, ...] = ()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -410,6 +461,35 @@ def build_parser() -> argparse.ArgumentParser:
             "after reaching pick waypoints outside the keep-pitch X band, apply "
             "a joint-space pitch trim using only J2/J3/J5; Cartesian RX/RY/RZ "
             "stay fixed"
+        ),
+    )
+    parser.add_argument(
+        "--dynamic-pitch-mode",
+        choices=("joint", "planar-ik"),
+        default="joint",
+        help=(
+            "joint keeps the legacy J2/J3/J5 trim after Cartesian waypoints; "
+            "planar-ik fixes J1/J4/J6 and solves J2/J3/J5 for target X/Z/RY"
+        ),
+    )
+    parser.add_argument("--planar-ik-max-iterations", type=int, default=40)
+    parser.add_argument("--planar-ik-position-tolerance-mm", type=float, default=3.0)
+    parser.add_argument("--planar-ik-ry-tolerance-deg", type=float, default=1.0)
+    parser.add_argument("--planar-ik-max-step-deg", type=float, default=8.0)
+    parser.add_argument("--planar-ik-damping", type=float, default=1e-3)
+    parser.add_argument(
+        "--planar-ik-joint-tolerance-deg",
+        type=float,
+        default=2.0,
+        help="joint feedback tolerance for J2/J3/J5 planar-IK waypoints",
+    )
+    parser.add_argument(
+        "--planar-ik-fk-tool-z-offset-mm",
+        type=float,
+        default=82.0,
+        help=(
+            "tool-frame Z offset from the raw DH FK frame to the Piper SDK "
+            "EndPose frame used by planar IK"
         ),
     )
     parser.add_argument(
@@ -641,10 +721,28 @@ def validate_args(args: argparse.Namespace) -> None:
         "place_pick_delay_s",
         "safe_gripper_monitor_s",
         "gripper_settle_s",
+        "planar_ik_position_tolerance_mm",
+        "planar_ik_ry_tolerance_deg",
+        "planar_ik_max_step_deg",
+        "planar_ik_damping",
+        "planar_ik_joint_tolerance_deg",
+        "planar_ik_fk_tool_z_offset_mm",
     ):
         value = float(getattr(args, name))
         if not math.isfinite(value) or value < 0:
             raise ValueError(f"--{name.replace('_', '-')} must be finite and >= 0")
+    if not isinstance(args.planar_ik_max_iterations, int) or args.planar_ik_max_iterations < 1:
+        raise ValueError("--planar-ik-max-iterations must be an integer >= 1")
+    if args.planar_ik_position_tolerance_mm <= 0.0:
+        raise ValueError("--planar-ik-position-tolerance-mm must be > 0")
+    if args.planar_ik_ry_tolerance_deg <= 0.0:
+        raise ValueError("--planar-ik-ry-tolerance-deg must be > 0")
+    if args.planar_ik_max_step_deg <= 0.0:
+        raise ValueError("--planar-ik-max-step-deg must be > 0")
+    if args.planar_ik_damping <= 0.0:
+        raise ValueError("--planar-ik-damping must be > 0")
+    if args.planar_ik_joint_tolerance_deg <= 0.0:
+        raise ValueError("--planar-ik-joint-tolerance-deg must be > 0")
     if not math.isfinite(args.command_period_s) or args.command_period_s <= 0:
         raise ValueError("--command-period-s must be finite and > 0")
     if not math.isfinite(args.safe_gripper_poll_s) or args.safe_gripper_poll_s <= 0:
@@ -688,6 +786,8 @@ def validate_args(args: argparse.Namespace) -> None:
         or not 0 <= args.collision_protection_level <= 8
     ):
         raise ValueError("--collision-protection-level must be an integer in [0, 8]")
+    if getattr(args, "dynamic_pitch_mode", "joint") == "planar-ik" and args.guarded_descent:
+        raise ValueError("--dynamic-pitch-mode planar-ik requires --no-guarded-descent")
     if args.grasp_z_mm > args.transfer_z_mm:
         raise ValueError("--grasp-z-mm should not be above --transfer-z-mm")
     if args.place_pick_z_mm is not None and args.place_pick_z_mm > args.transfer_z_mm:
@@ -784,6 +884,11 @@ def fixed_pose(args: argparse.Namespace, x_mm: float, y_mm: float, z_mm: float) 
 
 def clamp(value: float, lower: float, upper: float) -> float:
     return min(upper, max(lower, value))
+
+
+def dynamic_pitch_control_mode(args: argparse.Namespace) -> DynamicPitchControlMode:
+    value = getattr(args, "dynamic_pitch_mode", "joint")
+    return "planar_ik" if value == "planar-ik" else value
 
 
 def joint_pitch_decision(
@@ -886,17 +991,41 @@ def target_pose(
     return fixed_pose(args, target.pick_x_mm, target.pick_y_mm, z_mm)
 
 
+def use_joint_pitch_adjustment(args: argparse.Namespace, pitch_source_x_mm: float) -> bool:
+    return (
+        dynamic_pitch_control_mode(args) == "joint"
+        and joint_pitch_decision(args, pitch_source_x_mm).mode == "adjust"
+    )
+
+
+def use_planar_ik(args: argparse.Namespace, pitch_source_x_mm: float) -> bool:
+    return (
+        dynamic_pitch_control_mode(args) == "planar_ik"
+        and joint_pitch_decision(args, pitch_source_x_mm).mode == "adjust"
+    )
+
+
 def dynamic_pitch_summary(
     args: argparse.Namespace,
     target: YoloCatchTarget,
 ) -> dict[str, Any]:
     pitch_x_mm = pitch_source_x_mm(target)
     decision = joint_pitch_decision(args, pitch_x_mm)
+    control_mode = dynamic_pitch_control_mode(args)
+    target_ry_deg = float(args.ry_deg)
+    if control_mode == "planar_ik" and decision.mode == "adjust":
+        target_ry_deg += float(decision.pitch_delta_deg)
     return {
         "enabled": decision.enabled,
         "mode": decision.mode,
-        "method": "joint_space_j2_j3_j5",
+        "method": (
+            "planar_ik_j2_j3_j5"
+            if control_mode == "planar_ik"
+            else "joint_space_j2_j3_j5"
+        ),
+        "control_mode": control_mode,
         "fixed_pose_ry_deg": float(args.ry_deg),
+        "target_ry_deg": target_ry_deg,
         "pick_x_mm": float(target.pick_x_mm),
         "raw_pick_x_mm": target.raw_pick_x_mm,
         "pitch_source_x_mm": pitch_x_mm,
@@ -1040,7 +1169,8 @@ def build_out_steps(
     pick_grasp = target_pose(args, target, target.grasp_z_mm)
     place_above = fixed_pose(args, args.place_x_mm, args.place_y_mm, args.transfer_z_mm)
     pitch_x_mm = pitch_source_x_mm(target)
-    use_joint_pitch = joint_pitch_decision(args, pitch_x_mm).mode == "adjust"
+    use_joint_pitch = use_joint_pitch_adjustment(args, pitch_x_mm)
+    use_ik = use_planar_ik(args, pitch_x_mm)
 
     steps: list[SequenceStep] = [
         SequenceStep("ready_open", ready, args.transfer_mode, "open"),
@@ -1051,6 +1181,7 @@ def build_out_steps(
             joint_pitch_before_pose=use_joint_pitch,
             joint_pitch_after_pose=use_joint_pitch,
             pitch_source_x_mm=pitch_x_mm,
+            planar_ik=use_ik,
         ),
         SequenceStep(
             label="pick_grasp",
@@ -1060,6 +1191,7 @@ def build_out_steps(
             delay_before_s=args.pick_delay_s,
             joint_pitch_after_pose=use_joint_pitch,
             pitch_source_x_mm=pitch_x_mm,
+            planar_ik=use_ik,
         ),
         SequenceStep(
             "pick_lift",
@@ -1067,6 +1199,7 @@ def build_out_steps(
             args.vertical_mode,
             joint_pitch_after_pose=use_joint_pitch,
             pitch_source_x_mm=pitch_x_mm,
+            planar_ik=use_ik,
         ),
     ]
     if args.grasp_only:
@@ -1098,7 +1231,8 @@ def build_in_steps(
     pick_above = target_pose(args, target, args.transfer_z_mm)
     pick_grasp = target_pose(args, target, target.grasp_z_mm)
     pitch_x_mm = pitch_source_x_mm(target)
-    use_joint_pitch = joint_pitch_decision(args, pitch_x_mm).mode == "adjust"
+    use_joint_pitch = use_joint_pitch_adjustment(args, pitch_x_mm)
+    use_ik = use_planar_ik(args, pitch_x_mm)
     return (
         SequenceStep("ready_open", ready, args.transfer_mode, "open"),
         SequenceStep(
@@ -1109,6 +1243,7 @@ def build_in_steps(
             joint_pitch_before_pose=use_joint_pitch,
             joint_pitch_after_pose=use_joint_pitch,
             pitch_source_x_mm=pitch_x_mm,
+            planar_ik=use_ik,
         ),
         SequenceStep(
             label="return_pick_grasp",
@@ -1117,6 +1252,7 @@ def build_in_steps(
             gripper_after="close",
             joint_pitch_after_pose=use_joint_pitch,
             pitch_source_x_mm=pitch_x_mm,
+            planar_ik=use_ik,
         ),
         SequenceStep(
             "return_pick_lift",
@@ -1124,6 +1260,7 @@ def build_in_steps(
             args.vertical_mode,
             joint_pitch_after_pose=use_joint_pitch,
             pitch_source_x_mm=pitch_x_mm,
+            planar_ik=use_ik,
         ),
         SequenceStep("return_ready_above", ready, args.transfer_mode),
         SequenceStep("final_release", ready, args.transfer_mode, "open"),
@@ -1330,6 +1467,7 @@ def execute_protected_abort_return(
     counts: dict[str, int],
     gripper_results: list[SafeGripperResult],
     joint_pitch_adjustments: list[JointPitchAdjustmentResult],
+    planar_ik_results: list[PlanarIkExecutionResult],
     abort_step: SequenceStep | None,
 ) -> tuple[str | None, str | None]:
     if abort_step is None:
@@ -1340,6 +1478,7 @@ def execute_protected_abort_return(
         abort_step,
         gripper_results,
         joint_pitch_adjustments,
+        planar_ik_results,
     )
     abort_return = None
     if abort_step.label.startswith("protected_abort_return_"):
@@ -1971,10 +2110,17 @@ def execute_step(
     *,
     speed: int | None = None,
     joint_pitch_adjustments: list[JointPitchAdjustmentResult] | None = None,
+    planar_ik_results: list[PlanarIkExecutionResult] | None = None,
 ) -> tuple[int, SafeGripperResult | None]:
     if step.delay_before_s > 0:
         print(f"Waiting {step.delay_before_s:g}s before {step.label}", flush=True)
         time.sleep(step.delay_before_s)
+    if step.planar_ik:
+        send_count, planar_result = execute_planar_ik_step(controller, args, step)
+        if planar_ik_results is not None:
+            planar_ik_results.append(planar_result)
+        gripper_result = send_gripper(controller, args, step.gripper_after)
+        return send_count, gripper_result
     if step.joint_pitch_before_pose:
         pitch_adjustment = apply_joint_pitch_adjustment(
             controller,
@@ -2075,6 +2221,129 @@ def joints_rad_to_deg(joints_rad: tuple[float, ...] | list[float]) -> tuple[floa
     return tuple(math.degrees(value) for value in joints_rad)
 
 
+def joint_feedback_timestamp(joint_feedback: Any) -> float | None:
+    timestamp = getattr(joint_feedback, "time_stamp", None)
+    if timestamp is None:
+        return None
+    return float(timestamp)
+
+
+def apply_tool_z_offset_to_fk_pose(pose: EndPose, offset_mm: float) -> EndPose:
+    if math.isclose(offset_mm, 0.0, rel_tol=0.0, abs_tol=1e-9):
+        return pose
+    offset_base = rotation_matrix_xyz_deg(
+        pose.rx_deg,
+        pose.ry_deg,
+        pose.rz_deg,
+    ) @ np.array([0.0, 0.0, float(offset_mm)], dtype=float)
+    return EndPose(
+        x_mm=float(pose.x_mm + offset_base[0]),
+        y_mm=float(pose.y_mm + offset_base[1]),
+        z_mm=float(pose.z_mm + offset_base[2]),
+        rx_deg=pose.rx_deg,
+        ry_deg=pose.ry_deg,
+        rz_deg=pose.rz_deg,
+    )
+
+
+def forward_kinematics_planar_ik_pose(
+    joints_rad: tuple[float, ...] | list[float],
+    args: argparse.Namespace,
+) -> EndPose:
+    fk_pose = forward_kinematics_pose(joints_rad)
+    return apply_tool_z_offset_to_fk_pose(
+        fk_pose,
+        float(args.planar_ik_fk_tool_z_offset_mm),
+    )
+
+
+def joint_errors_deg(
+    current_joints_rad: tuple[float, ...] | list[float],
+    target_joints_rad: tuple[float, ...] | list[float],
+    joint_indices: tuple[int, ...] = PLANAR_IK_JOINT_INDICES,
+) -> tuple[float, ...]:
+    return tuple(
+        math.degrees(float(current_joints_rad[index]) - float(target_joints_rad[index]))
+        for index in joint_indices
+    )
+
+
+def wait_until_planar_ik_joints_reached(
+    controller: PiperController,
+    label: str,
+    target_joints_rad: tuple[float, ...] | list[float],
+    timeout_s: float,
+    joint_tolerance_deg: float,
+    *,
+    initial_feedback_stamp: float | None = None,
+) -> tuple[tuple[float, ...], tuple[float, ...], float]:
+    deadline = time.monotonic() + timeout_s
+    last_joints: tuple[float, ...] | None = None
+    last_errors: tuple[float, ...] | None = None
+    max_error = float("inf")
+    while timeout_s == 0 or time.monotonic() < deadline:
+        feedback = controller.get_joint_state()
+        current_joints = joint_feedback_to_rad(feedback)
+        timestamp = joint_feedback_timestamp(feedback)
+        fresh_feedback = (
+            initial_feedback_stamp is None
+            or timestamp is None
+            or timestamp > initial_feedback_stamp
+        )
+        if current_joints is not None:
+            last_joints = current_joints
+            last_errors = joint_errors_deg(current_joints, target_joints_rad)
+            max_error = max(abs(value) for value in last_errors)
+            if fresh_feedback and max_error <= joint_tolerance_deg:
+                return current_joints, last_errors, max_error
+        if timeout_s == 0:
+            break
+        time.sleep(0.05)
+    target_deg = joints_rad_to_deg(target_joints_rad)
+    last_deg = None if last_joints is None else joints_rad_to_deg(last_joints)
+    raise RuntimeError(
+        f"planar IK joints for {label} not reached: "
+        f"target_j2_j3_j5=({target_deg[1]:.3f}, {target_deg[2]:.3f}, {target_deg[4]:.3f}) "
+        f"last_j2_j3_j5="
+        f"{'unavailable' if last_deg is None else f'({last_deg[1]:.3f}, {last_deg[2]:.3f}, {last_deg[4]:.3f})'} "
+        f"max_joint_err={max_error:.3f}deg "
+        f"tol={joint_tolerance_deg:.3f}deg "
+        f"{format_status(controller)}"
+    )
+
+
+def planar_ik_result_to_dict(result: PlanarIkExecutionResult) -> dict[str, Any]:
+    payload = {
+        "step_label": result.step_label,
+        "pitch_source_x_mm": result.pitch_source_x_mm,
+        "target_pose": pose_to_dict(result.target_pose),
+        "solved_pose": pose_to_dict(result.solved_pose),
+        "solved_fk_pose": (
+            None if result.solved_fk_pose is None else pose_to_dict(result.solved_fk_pose)
+        ),
+        "start_joints_deg": list(result.start_joints_deg),
+        "target_joints_deg": list(result.target_joints_deg),
+        "final_joints_deg": (
+            None if result.final_joints_deg is None else list(result.final_joints_deg)
+        ),
+        "joint_errors_deg": (
+            None if result.joint_errors_deg is None else list(result.joint_errors_deg)
+        ),
+        "max_joint_error_deg": result.max_joint_error_deg,
+        "final_pose": None if result.final_pose is None else pose_to_dict(result.final_pose),
+        "pitch_delta_deg": result.pitch_delta_deg,
+        "requested_pitch_delta_deg": result.requested_pitch_delta_deg,
+        "iterations": result.iterations,
+        "x_error_mm": result.x_error_mm,
+        "y_error_mm": result.y_error_mm,
+        "z_error_mm": result.z_error_mm,
+        "position_error_mm": result.position_error_mm,
+        "ry_error_deg": result.ry_error_deg,
+        "send_count": result.send_count,
+    }
+    return payload
+
+
 def execute_joints_for_duration(
     controller: PiperController,
     joints_rad: tuple[float, ...] | list[float],
@@ -2128,6 +2397,238 @@ def clamp_pitch_delta_to_joint_limits(
             f"feasible=[{lower:.3f},{upper:.3f}]deg"
         )
     return min(upper, max(lower, requested_pitch_delta_deg))
+
+
+def _planar_ik_residual(
+    joints_rad: tuple[float, ...] | list[float],
+    args: argparse.Namespace,
+    target_pose: EndPose,
+    target_ry_deg: float,
+) -> np.ndarray:
+    pose = forward_kinematics_planar_ik_pose(joints_rad, args)
+    return np.array(
+        [
+            (pose.x_mm - target_pose.x_mm) / 100.0,
+            (pose.z_mm - target_pose.z_mm) / 100.0,
+            normalize_degrees(pose.ry_deg - target_ry_deg) / 10.0,
+        ],
+        dtype=float,
+    )
+
+
+def solve_planar_ik_j2_j3_j5(
+    controller: PiperController,
+    args: argparse.Namespace,
+    current_joints: tuple[float, ...],
+    target_pose: EndPose,
+    pitch_source_x_mm: float,
+) -> PlanarIkSolution:
+    decision = joint_pitch_decision(args, pitch_source_x_mm)
+    if decision.mode != "adjust":
+        raise RuntimeError("planar IK requires an adjust-mode dynamic pitch target")
+    target_ry_deg = float(args.ry_deg) + float(decision.requested_pitch_delta_deg)
+    joints = np.array(current_joints, dtype=float)
+    max_step_rad = math.radians(float(args.planar_ik_max_step_deg))
+    damping = float(args.planar_ik_damping)
+    iterations = 0
+
+    for iteration in range(int(args.planar_ik_max_iterations)):
+        iterations = iteration + 1
+        residual = _planar_ik_residual(joints, args, target_pose, target_ry_deg)
+        solved_pose = forward_kinematics_planar_ik_pose(joints, args)
+        position_error_mm = math.sqrt(
+            (solved_pose.x_mm - target_pose.x_mm) ** 2
+            + (solved_pose.z_mm - target_pose.z_mm) ** 2
+        )
+        ry_error_deg = abs(normalize_degrees(solved_pose.ry_deg - target_ry_deg))
+        if (
+            position_error_mm <= float(args.planar_ik_position_tolerance_mm)
+            and ry_error_deg <= float(args.planar_ik_ry_tolerance_deg)
+        ):
+            break
+
+        jacobian = np.zeros((3, 3), dtype=float)
+        epsilon = 1e-4
+        for column, joint_index in enumerate(PLANAR_IK_JOINT_INDICES):
+            plus = joints.copy()
+            plus[joint_index] += epsilon
+            minus = joints.copy()
+            minus[joint_index] -= epsilon
+            jacobian[:, column] = (
+                _planar_ik_residual(plus, args, target_pose, target_ry_deg)
+                - _planar_ik_residual(minus, args, target_pose, target_ry_deg)
+            ) / (2.0 * epsilon)
+
+        try:
+            delta = np.linalg.solve(
+                jacobian.T @ jacobian + damping * np.eye(3, dtype=float),
+                -jacobian.T @ residual,
+            )
+        except np.linalg.LinAlgError as exc:
+            raise SafetyError("planar IK failed: singular J2/J3/J5 Jacobian") from exc
+        max_abs_delta = float(np.max(np.abs(delta)))
+        if max_abs_delta > max_step_rad:
+            delta *= max_step_rad / max_abs_delta
+
+        for delta_value, joint_index in zip(delta, PLANAR_IK_JOINT_INDICES):
+            limit = controller.config.joint_limits_rad[joint_index]
+            joints[joint_index] = min(
+                limit.max_value - math.radians(0.1),
+                max(limit.min_value + math.radians(0.1), joints[joint_index] + delta_value),
+            )
+
+    target_joints = tuple(float(value) for value in joints)
+    controller.validate_joints(target_joints)
+    solved_fk_pose = forward_kinematics_pose(target_joints)
+    solved_pose = apply_tool_z_offset_to_fk_pose(
+        solved_fk_pose,
+        float(args.planar_ik_fk_tool_z_offset_mm),
+    )
+    x_error_mm = solved_pose.x_mm - target_pose.x_mm
+    y_error_mm = solved_pose.y_mm - target_pose.y_mm
+    z_error_mm = solved_pose.z_mm - target_pose.z_mm
+    position_error_mm = math.sqrt(x_error_mm**2 + z_error_mm**2)
+    ry_error_deg = normalize_degrees(solved_pose.ry_deg - target_ry_deg)
+    if (
+        position_error_mm > float(args.planar_ik_position_tolerance_mm)
+        or abs(ry_error_deg) > float(args.planar_ik_ry_tolerance_deg)
+    ):
+        raise SafetyError(
+            "planar IK did not converge within tolerance: "
+            f"target={format_pose(target_pose)} "
+            f"target_ry={target_ry_deg:.3f}deg "
+            f"solved={format_pose(solved_pose)} "
+            f"x_err={x_error_mm:.3f}mm z_err={z_error_mm:.3f}mm "
+            f"ry_err={ry_error_deg:.3f}deg "
+            f"iterations={iterations}"
+        )
+    return PlanarIkSolution(
+        target_joints_rad=target_joints,  # type: ignore[arg-type]
+        solved_pose=solved_pose,
+        solved_fk_pose=solved_fk_pose,
+        pitch_delta_deg=normalize_degrees(target_ry_deg - float(args.ry_deg)),
+        requested_pitch_delta_deg=decision.requested_pitch_delta_deg,
+        iterations=iterations,
+        x_error_mm=x_error_mm,
+        y_error_mm=y_error_mm,
+        z_error_mm=z_error_mm,
+        position_error_mm=position_error_mm,
+        ry_error_deg=ry_error_deg,
+    )
+
+
+def execute_planar_ik_step(
+    controller: PiperController,
+    args: argparse.Namespace,
+    step: SequenceStep,
+) -> tuple[int, PlanarIkExecutionResult]:
+    pitch_source_x = (
+        float(step.pitch_source_x_mm)
+        if step.pitch_source_x_mm is not None
+        else float(step.pose.x_mm)
+    )
+    initial_joint_feedback = controller.get_joint_state()
+    initial_feedback_stamp = joint_feedback_timestamp(initial_joint_feedback)
+    current_joints = joint_feedback_to_rad(initial_joint_feedback)
+    if current_joints is None:
+        raise RuntimeError("planar IK requires valid joint feedback before JointCtrl")
+    solution = solve_planar_ik_j2_j3_j5(
+        controller,
+        args,
+        current_joints,
+        step.pose,
+        pitch_source_x,
+    )
+    print(
+        "Running planar IK J2/J3/J5: "
+        f"step={step.label} "
+        f"target={format_pose(step.pose)} "
+        f"solved={format_pose(solution.solved_pose)} "
+        f"raw_fk={format_pose(solution.solved_fk_pose)} "
+        f"fk_tool_z_offset={float(args.planar_ik_fk_tool_z_offset_mm):.3f}mm "
+        f"pitch_delta={solution.pitch_delta_deg:.3f}deg "
+        f"x_err={solution.x_error_mm:.3f}mm "
+        f"z_err={solution.z_error_mm:.3f}mm "
+        f"ry_err={solution.ry_error_deg:.3f}deg",
+        flush=True,
+    )
+    send_count = execute_joints_for_duration(
+        controller,
+        solution.target_joints_rad,
+        int(args.speed),
+        float(args.command_duration_s),
+        float(args.command_period_s),
+    )
+    final_joints: tuple[float, ...] | None = None
+    final_joint_errors: tuple[float, ...] | None = None
+    max_joint_error: float | None = None
+    if not args.no_wait_waypoints:
+        final_joints, final_joint_errors, max_joint_error = (
+            wait_until_planar_ik_joints_reached(
+                controller,
+                step.label,
+                solution.target_joints_rad,
+                timeout_s=args.motion_timeout_s,
+                joint_tolerance_deg=float(args.planar_ik_joint_tolerance_deg),
+                initial_feedback_stamp=initial_feedback_stamp,
+            )
+        )
+    else:
+        feedback_joints = joint_feedback_to_rad(controller.get_joint_state())
+        if feedback_joints is not None:
+            final_joints = feedback_joints
+            final_joint_errors = joint_errors_deg(feedback_joints, solution.target_joints_rad)
+            max_joint_error = max(abs(value) for value in final_joint_errors)
+    final_pose = feedback_to_pose(controller.get_end_pose())
+    if final_joints is not None and final_joint_errors is not None:
+        print(
+            "Planar IK joint feedback: "
+            f"step={step.label} "
+            f"j2_err={final_joint_errors[0]:.3f}deg "
+            f"j3_err={final_joint_errors[1]:.3f}deg "
+            f"j5_err={final_joint_errors[2]:.3f}deg "
+            f"max_err={max_joint_error:.3f}deg "
+            f"final_pose={format_pose(final_pose)}",
+            flush=True,
+        )
+    elif final_pose is not None:
+        print(
+            "Planar IK feedback pose: "
+            f"step={step.label} final_pose={format_pose(final_pose)}",
+            flush=True,
+        )
+    return send_count, PlanarIkExecutionResult(
+        step_label=step.label,
+        pitch_source_x_mm=pitch_source_x,
+        target_pose=step.pose,
+        solved_pose=solution.solved_pose,
+        start_joints_deg=joints_rad_to_deg(current_joints),  # type: ignore[arg-type]
+        target_joints_deg=joints_rad_to_deg(solution.target_joints_rad),
+        pitch_delta_deg=solution.pitch_delta_deg,
+        requested_pitch_delta_deg=solution.requested_pitch_delta_deg,
+        iterations=solution.iterations,
+        x_error_mm=solution.x_error_mm,
+        y_error_mm=solution.y_error_mm,
+        z_error_mm=solution.z_error_mm,
+        position_error_mm=solution.position_error_mm,
+        ry_error_deg=solution.ry_error_deg,
+        send_count=send_count,
+        solved_fk_pose=solution.solved_fk_pose,
+        final_joints_deg=(
+            None if final_joints is None else joints_rad_to_deg(final_joints)
+        ),
+        joint_errors_deg=(
+            None
+            if final_joint_errors is None
+            else (
+                float(final_joint_errors[0]),
+                float(final_joint_errors[1]),
+                float(final_joint_errors[2]),
+            )
+        ),
+        max_joint_error_deg=max_joint_error,
+        final_pose=final_pose,
+    )
 
 
 def apply_joint_pitch_adjustment(
@@ -2226,12 +2727,14 @@ def execute_and_record_step(
     step: SequenceStep,
     gripper_results: list[SafeGripperResult],
     joint_pitch_adjustments: list[JointPitchAdjustmentResult] | None = None,
+    planar_ik_results: list[PlanarIkExecutionResult] | None = None,
 ) -> int:
     send_count, gripper_result = execute_step(
         controller,
         args,
         step,
         joint_pitch_adjustments=joint_pitch_adjustments,
+        planar_ik_results=planar_ik_results,
     )
     record_gripper_result(gripper_results, gripper_result)
     return send_count
@@ -2251,6 +2754,7 @@ def execute_plan(
     guarded_result: GuardedDescentResult | None = None
     gripper_results: list[SafeGripperResult] = []
     joint_pitch_adjustments: list[JointPitchAdjustmentResult] = []
+    planar_ik_results: list[PlanarIkExecutionResult] = []
     for index, step in enumerate(plan.steps):
         if should_guard_step(step, args):
             guarded_start_pose = guarded_start_pose_for_grasp(args, step.pose)
@@ -2267,6 +2771,7 @@ def execute_plan(
                 guarded_start_step,
                 gripper_results,
                 joint_pitch_adjustments,
+                planar_ik_results,
             )
             guarded_result = execute_guarded_descent(
                 controller,
@@ -2290,6 +2795,7 @@ def execute_plan(
                     counts,
                     gripper_results,
                     joint_pitch_adjustments,
+                    planar_ik_results,
                     abort_step,
                 )
                 record_gripper_result(
@@ -2305,6 +2811,7 @@ def execute_plan(
                     guarded_descent=guarded_result,
                     safe_gripper_results=tuple(gripper_results),
                     joint_pitch_adjustments=tuple(joint_pitch_adjustments),
+                    planar_ik_results=tuple(planar_ik_results),
                 )
             pitch_adjustment = apply_joint_pitch_adjustment(
                 controller,
@@ -2322,6 +2829,7 @@ def execute_plan(
             args,
             step,
             joint_pitch_adjustments=joint_pitch_adjustments,
+            planar_ik_results=planar_ik_results,
         )
         counts[step.label] = send_count
         record_gripper_result(gripper_results, gripper_result)
@@ -2337,6 +2845,7 @@ def execute_plan(
         guarded_descent=guarded_result,
         safe_gripper_results=tuple(gripper_results),
         joint_pitch_adjustments=tuple(joint_pitch_adjustments),
+        planar_ik_results=tuple(planar_ik_results),
     )
 
 
@@ -2357,16 +2866,16 @@ def execute_dynamic_preposition_plan(
     counts: dict[str, int] = {}
     gripper_results: list[SafeGripperResult] = []
     joint_pitch_adjustments: list[JointPitchAdjustmentResult] = []
+    planar_ik_results: list[PlanarIkExecutionResult] = []
     started_s = time.monotonic()
     ready_step = plan.steps[0]
     pick_above_step = plan.steps[1]
     grasp_step = replace(plan.steps[2], delay_before_s=0.0)
     lift_step = plan.steps[3]
-    preposition_pose, preposition_source = dynamic_preposition_pose(args, plan.target)
     preposition_pitch_x_mm = pitch_source_x_mm(plan.target)
-    use_preposition_pitch = (
-        joint_pitch_decision(args, preposition_pitch_x_mm).mode == "adjust"
-    )
+    preposition_pose, preposition_source = dynamic_preposition_pose(args, plan.target)
+    use_preposition_pitch = use_joint_pitch_adjustment(args, preposition_pitch_x_mm)
+    use_preposition_ik = use_planar_ik(args, preposition_pitch_x_mm)
     preposition_step = SequenceStep(
         "dynamic_preposition",
         preposition_pose,
@@ -2374,6 +2883,7 @@ def execute_dynamic_preposition_plan(
         joint_pitch_before_pose=use_preposition_pitch,
         joint_pitch_after_pose=use_preposition_pitch,
         pitch_source_x_mm=preposition_pitch_x_mm,
+        planar_ik=use_preposition_ik,
     )
 
     counts[ready_step.label] = execute_and_record_step(
@@ -2382,6 +2892,7 @@ def execute_dynamic_preposition_plan(
         ready_step,
         gripper_results,
         joint_pitch_adjustments,
+        planar_ik_results,
     )
     counts[pick_above_step.label] = execute_and_record_step(
         controller,
@@ -2389,6 +2900,7 @@ def execute_dynamic_preposition_plan(
         pick_above_step,
         gripper_results,
         joint_pitch_adjustments,
+        planar_ik_results,
     )
     counts[preposition_step.label] = execute_and_record_step(
         controller,
@@ -2396,6 +2908,7 @@ def execute_dynamic_preposition_plan(
         preposition_step,
         gripper_results,
         joint_pitch_adjustments,
+        planar_ik_results,
     )
 
     preposition_elapsed_s = time.monotonic() - started_s
@@ -2430,6 +2943,7 @@ def execute_dynamic_preposition_plan(
                 counts,
                 gripper_results,
                 joint_pitch_adjustments,
+                planar_ik_results,
                 abort_step,
             )
             record_gripper_result(
@@ -2451,6 +2965,7 @@ def execute_dynamic_preposition_plan(
                 guarded_descent=guarded_result,
                 safe_gripper_results=tuple(gripper_results),
                 joint_pitch_adjustments=tuple(joint_pitch_adjustments),
+                planar_ik_results=tuple(planar_ik_results),
             )
         pitch_adjustment = apply_joint_pitch_adjustment(
             controller,
@@ -2468,6 +2983,7 @@ def execute_dynamic_preposition_plan(
             args,
             grasp_step,
             joint_pitch_adjustments=joint_pitch_adjustments,
+            planar_ik_results=planar_ik_results,
         )
         counts[grasp_step.label] = send_count
         record_gripper_result(gripper_results, gripper_result)
@@ -2478,6 +2994,7 @@ def execute_dynamic_preposition_plan(
         lift_step,
         gripper_results,
         joint_pitch_adjustments,
+        planar_ik_results,
     )
     for step in plan.steps[4:]:
         counts[step.label] = execute_and_record_step(
@@ -2486,6 +3003,7 @@ def execute_dynamic_preposition_plan(
             step,
             gripper_results,
             joint_pitch_adjustments,
+            planar_ik_results,
         )
 
     if args.print_feedback:
@@ -2506,6 +3024,7 @@ def execute_dynamic_preposition_plan(
         guarded_descent=guarded_result,
         safe_gripper_results=tuple(gripper_results),
         joint_pitch_adjustments=tuple(joint_pitch_adjustments),
+        planar_ik_results=tuple(planar_ik_results),
     )
 
 
@@ -2663,6 +3182,7 @@ def handle_message(
                     "joint_pitch_before_pose": step.joint_pitch_before_pose,
                     "joint_pitch_after_pose": step.joint_pitch_after_pose,
                     "pitch_source_x_mm": step.pitch_source_x_mm,
+                    "planar_ik": step.planar_ik,
                 }
                 for step in plan.steps
             ],
@@ -2681,6 +3201,10 @@ def handle_message(
             "joint_pitch_adjustments": [
                 joint_pitch_adjustment_to_dict(result)
                 for result in execution.joint_pitch_adjustments
+            ],
+            "planar_ik_results": [
+                planar_ik_result_to_dict(result)
+                for result in execution.planar_ik_results
             ],
             "sequence": {
                 "kind": sequence_kind,
