@@ -26,7 +26,7 @@ from pathlib import Path
 import socket
 import sys
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
 import numpy as np
@@ -105,6 +105,9 @@ class YoloCatchTarget:
     pick_y_source: str = "mapped_command_y"
     raw_grasp_z_mm: float | None = None
     grasp_z_source: str = "fixed_grasp_z"
+    uncompensated_grasp_z_mm: float | None = None
+    planar_ik_grasp_z_comp_mm: float = 0.0
+    planar_ik_grasp_z_comp_pitch_delta_deg: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -215,6 +218,8 @@ class PlanarIkExecutionResult:
     joint_errors_deg: tuple[float, float, float] | None = None
     max_joint_error_deg: float | None = None
     final_pose: EndPose | None = None
+    reused: bool = False
+    reused_from_step_label: str | None = None
 
 
 @dataclass(frozen=True)
@@ -230,6 +235,21 @@ class PlanarIkSolution:
     z_error_mm: float
     position_error_mm: float
     ry_error_deg: float
+
+
+PlanarIkCacheKey = tuple[float, ...]
+
+
+@dataclass(frozen=True)
+class PlanarIkCachedTarget:
+    step_label: str
+    target_joints_rad: tuple[float, ...]
+    result: PlanarIkExecutionResult
+
+
+@dataclass
+class PlanarIkReuseState:
+    targets: dict[PlanarIkCacheKey, PlanarIkCachedTarget] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -478,6 +498,32 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--planar-ik-max-step-deg", type=float, default=8.0)
     parser.add_argument("--planar-ik-damping", type=float, default=1e-3)
     parser.add_argument(
+        "--planar-ik-speed",
+        type=int,
+        help=(
+            "speed percent for planar-IK JointCtrl moves; defaults to --speed "
+            "when omitted"
+        ),
+    )
+    parser.add_argument(
+        "--planar-ik-grasp-z-comp-mm-per-deg",
+        type=float,
+        default=0.0,
+        help=(
+            "lower only far planar-IK grasp Z by abs(pitch_delta_deg) times "
+            "this coefficient; default 0 disables pitch-based height compensation"
+        ),
+    )
+    parser.add_argument(
+        "--reuse-planar-ik-above-target",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "reuse a previously solved planar-IK joint target for repeated "
+            "same-pose above/lift steps; enabled by default"
+        ),
+    )
+    parser.add_argument(
         "--planar-ik-joint-tolerance-deg",
         type=float,
         default=2.0,
@@ -710,6 +756,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--speed must be an integer in [0, 100]")
     if not isinstance(args.startup_speed, int) or not 0 <= args.startup_speed <= 100:
         raise ValueError("--startup-speed must be an integer in [0, 100]")
+    if args.planar_ik_speed is not None and (
+        not isinstance(args.planar_ik_speed, int) or not 0 <= args.planar_ik_speed <= 100
+    ):
+        raise ValueError("--planar-ik-speed must be an integer in [0, 100]")
     for name in (
         "command_duration_s",
         "motion_timeout_s",
@@ -725,6 +775,7 @@ def validate_args(args: argparse.Namespace) -> None:
         "planar_ik_ry_tolerance_deg",
         "planar_ik_max_step_deg",
         "planar_ik_damping",
+        "planar_ik_grasp_z_comp_mm_per_deg",
         "planar_ik_joint_tolerance_deg",
         "planar_ik_fk_tool_z_offset_mm",
     ):
@@ -840,6 +891,8 @@ def validate_args(args: argparse.Namespace) -> None:
         value = getattr(args, name)
         if value is not None and not math.isfinite(float(value)):
             raise ValueError(f"--{name.replace('_', '-')} must be finite")
+    if args.planar_ik_grasp_z_comp_mm_per_deg < 0.0:
+        raise ValueError("--planar-ik-grasp-z-comp-mm-per-deg must be >= 0")
     if args.min_dynamic_pitch_deg > args.max_dynamic_pitch_deg:
         raise ValueError(
             "--min-dynamic-pitch-deg must be <= --max-dynamic-pitch-deg"
@@ -1005,6 +1058,18 @@ def use_planar_ik(args: argparse.Namespace, pitch_source_x_mm: float) -> bool:
     )
 
 
+def fixed_pitch_source_x_mm(args: argparse.Namespace) -> float:
+    return clamp(
+        float(args.ready_x_mm),
+        float(args.keep_pitch_min_x_mm),
+        float(args.keep_pitch_max_x_mm),
+    )
+
+
+def far_planar_transfer_via_ready(args: argparse.Namespace, pitch_source_x_mm: float) -> bool:
+    return use_planar_ik(args, pitch_source_x_mm)
+
+
 def dynamic_pitch_summary(
     args: argparse.Namespace,
     target: YoloCatchTarget,
@@ -1049,6 +1114,7 @@ def dynamic_pitch_summary(
         "j3_delta_deg": decision.j3_delta_deg,
         "j5_delta_deg": decision.j5_delta_deg,
         "speed": int(args.dynamic_pitch_speed),
+        "planar_ik_speed": planar_ik_speed(args),
         "clamped": decision.clamped,
         "limit_clamped": decision.limit_clamped,
     }
@@ -1071,6 +1137,18 @@ def pitch_source_x_mm(target: YoloCatchTarget) -> float:
         if target.raw_pick_x_mm is not None
         else float(target.pick_x_mm)
     )
+
+
+def planar_ik_grasp_z_compensation(
+    args: argparse.Namespace,
+    pitch_source_x_mm: float,
+) -> tuple[float, float]:
+    coefficient = float(getattr(args, "planar_ik_grasp_z_comp_mm_per_deg", 0.0))
+    if coefficient <= 0.0 or not use_planar_ik(args, pitch_source_x_mm):
+        return 0.0, 0.0
+    decision = joint_pitch_decision(args, pitch_source_x_mm)
+    pitch_delta_deg = float(decision.pitch_delta_deg)
+    return abs(pitch_delta_deg) * coefficient, pitch_delta_deg
 
 
 def target_from_command(
@@ -1124,6 +1202,14 @@ def target_from_command(
             grasp_z_source = f"{grasp_z_source}_clamped_to_fixed_grasp_z"
     else:
         grasp_z_mm = args.grasp_z_mm
+    uncompensated_grasp_z_mm = float(grasp_z_mm)
+    grasp_z_comp_mm, grasp_z_comp_pitch_delta_deg = planar_ik_grasp_z_compensation(
+        args,
+        float(raw_pick_x_mm),
+    )
+    if grasp_z_comp_mm > 0.0:
+        grasp_z_mm = float(grasp_z_mm) - grasp_z_comp_mm
+        grasp_z_source = f"{grasp_z_source}_planar_ik_pitch_z_comp"
     target = YoloCatchTarget(
         camera_command=command,
         base_xyz_m=base_xyz_m,
@@ -1136,6 +1222,9 @@ def target_from_command(
         pick_y_source=pick_y_source,
         raw_grasp_z_mm=raw_grasp_z_mm,
         grasp_z_source=grasp_z_source,
+        uncompensated_grasp_z_mm=uncompensated_grasp_z_mm,
+        planar_ik_grasp_z_comp_mm=grasp_z_comp_mm,
+        planar_ik_grasp_z_comp_pitch_delta_deg=grasp_z_comp_pitch_delta_deg,
     )
     if validate:
         validate_target(target, args)
@@ -1171,6 +1260,7 @@ def build_out_steps(
     pitch_x_mm = pitch_source_x_mm(target)
     use_joint_pitch = use_joint_pitch_adjustment(args, pitch_x_mm)
     use_ik = use_planar_ik(args, pitch_x_mm)
+    use_ready_planar_return = far_planar_transfer_via_ready(args, pitch_x_mm)
 
     steps: list[SequenceStep] = [
         SequenceStep("ready_open", ready, args.transfer_mode, "open"),
@@ -1204,9 +1294,27 @@ def build_out_steps(
     ]
     if args.grasp_only:
         if not args.no_return_ready:
-            steps.append(SequenceStep("return_ready", ready, args.transfer_mode))
+            steps.append(
+                SequenceStep(
+                    "return_ready",
+                    ready,
+                    args.transfer_mode,
+                    pitch_source_x_mm=fixed_pitch_source_x_mm(args),
+                    planar_ik=use_ready_planar_return,
+                )
+            )
         return tuple(steps)
 
+    if use_ready_planar_return:
+        steps.append(
+            SequenceStep(
+                "return_ready_above",
+                ready,
+                args.transfer_mode,
+                pitch_source_x_mm=fixed_pitch_source_x_mm(args),
+                planar_ik=True,
+            )
+        )
     steps.extend(
         [
             SequenceStep("place_above", place_above, args.transfer_mode),
@@ -1469,6 +1577,7 @@ def execute_protected_abort_return(
     joint_pitch_adjustments: list[JointPitchAdjustmentResult],
     planar_ik_results: list[PlanarIkExecutionResult],
     abort_step: SequenceStep | None,
+    planar_ik_reuse_state: PlanarIkReuseState | None = None,
 ) -> tuple[str | None, str | None]:
     if abort_step is None:
         return None, None
@@ -1479,6 +1588,7 @@ def execute_protected_abort_return(
         gripper_results,
         joint_pitch_adjustments,
         planar_ik_results,
+        planar_ik_reuse_state,
     )
     abort_return = None
     if abort_step.label.startswith("protected_abort_return_"):
@@ -1874,6 +1984,16 @@ def print_plan(
             f"final={plan.target.grasp_z_mm:.3f}mm",
             flush=True,
         )
+    if plan.target.planar_ik_grasp_z_comp_mm > 0.0:
+        print(
+            "  planar_ik_grasp_z_comp: "
+            f"pitch_delta={plan.target.planar_ik_grasp_z_comp_pitch_delta_deg:.3f}deg "
+            f"k={float(args.planar_ik_grasp_z_comp_mm_per_deg):.3f}mm/deg "
+            f"comp={plan.target.planar_ik_grasp_z_comp_mm:.3f}mm "
+            f"original_z={plan.target.uncompensated_grasp_z_mm:.3f}mm "
+            f"adjusted_z={plan.target.grasp_z_mm:.3f}mm",
+            flush=True,
+        )
     if (
         plan.target.raw_pick_x_mm is not None
         and (
@@ -2111,12 +2231,45 @@ def execute_step(
     speed: int | None = None,
     joint_pitch_adjustments: list[JointPitchAdjustmentResult] | None = None,
     planar_ik_results: list[PlanarIkExecutionResult] | None = None,
+    planar_ik_reuse_state: PlanarIkReuseState | None = None,
 ) -> tuple[int, SafeGripperResult | None]:
     if step.delay_before_s > 0:
         print(f"Waiting {step.delay_before_s:g}s before {step.label}", flush=True)
         time.sleep(step.delay_before_s)
     if step.planar_ik:
+        pitch_source_x = (
+            float(step.pitch_source_x_mm)
+            if step.pitch_source_x_mm is not None
+            else float(step.pose.x_mm)
+        )
+        cache_key = planar_ik_cache_key(args, step, pitch_source_x)
+        cached = (
+            None
+            if planar_ik_reuse_state is None
+            else planar_ik_reuse_state.targets.get(cache_key)
+        )
+        if cached is not None and can_reuse_planar_ik_target(
+            args,
+            step,
+            planar_ik_reuse_state,
+        ):
+            send_count, planar_result = execute_reused_planar_ik_step(
+                controller,
+                args,
+                step,
+                cached,
+            )
+            if planar_ik_results is not None:
+                planar_ik_results.append(planar_result)
+            gripper_result = send_gripper(controller, args, step.gripper_after)
+            return send_count, gripper_result
         send_count, planar_result = execute_planar_ik_step(controller, args, step)
+        if planar_ik_reuse_state is not None:
+            planar_ik_reuse_state.targets[cache_key] = PlanarIkCachedTarget(
+                step.label,
+                tuple(math.radians(value) for value in planar_result.target_joints_deg),
+                planar_result,
+            )
         if planar_ik_results is not None:
             planar_ik_results.append(planar_result)
         gripper_result = send_gripper(controller, args, step.gripper_after)
@@ -2331,6 +2484,8 @@ def planar_ik_result_to_dict(result: PlanarIkExecutionResult) -> dict[str, Any]:
         ),
         "max_joint_error_deg": result.max_joint_error_deg,
         "final_pose": None if result.final_pose is None else pose_to_dict(result.final_pose),
+        "reused": result.reused,
+        "reused_from_step_label": result.reused_from_step_label,
         "pitch_delta_deg": result.pitch_delta_deg,
         "requested_pitch_delta_deg": result.requested_pitch_delta_deg,
         "iterations": result.iterations,
@@ -2360,6 +2515,123 @@ def execute_joints_for_duration(
             break
         time.sleep(period_s)
     return send_count
+
+
+def planar_ik_speed(args: argparse.Namespace) -> int:
+    value = getattr(args, "planar_ik_speed", None)
+    return int(args.speed if value is None else value)
+
+
+def planar_ik_cache_key(
+    args: argparse.Namespace,
+    step: SequenceStep,
+    pitch_source_x_mm: float,
+) -> PlanarIkCacheKey:
+    decision = joint_pitch_decision(args, pitch_source_x_mm)
+    return (
+        round(float(step.pose.x_mm), 3),
+        round(float(step.pose.y_mm), 3),
+        round(float(step.pose.z_mm), 3),
+        round(float(step.pose.rx_deg), 3),
+        round(float(step.pose.ry_deg), 3),
+        round(float(step.pose.rz_deg), 3),
+        round(float(pitch_source_x_mm), 3),
+        round(float(decision.requested_pitch_delta_deg), 6),
+        round(float(args.planar_ik_fk_tool_z_offset_mm), 3),
+    )
+
+
+def can_reuse_planar_ik_target(
+    args: argparse.Namespace,
+    step: SequenceStep,
+    reuse_state: PlanarIkReuseState | None,
+) -> bool:
+    return bool(
+        getattr(args, "reuse_planar_ik_above_target", True)
+        and reuse_state is not None
+        and step.planar_ik
+        and step.label.endswith("_lift")
+        and step.gripper_after is None
+    )
+
+
+def execute_reused_planar_ik_step(
+    controller: PiperController,
+    args: argparse.Namespace,
+    step: SequenceStep,
+    cached: PlanarIkCachedTarget,
+) -> tuple[int, PlanarIkExecutionResult]:
+    initial_joint_feedback = controller.get_joint_state()
+    initial_feedback_stamp = joint_feedback_timestamp(initial_joint_feedback)
+    print(
+        "Reusing planar IK J2/J3/J5: "
+        f"step={step.label} from={cached.step_label} "
+        f"target={format_pose(step.pose)} "
+        f"speed={planar_ik_speed(args)}",
+        flush=True,
+    )
+    send_count = execute_joints_for_duration(
+        controller,
+        cached.target_joints_rad,
+        planar_ik_speed(args),
+        float(args.command_duration_s),
+        float(args.command_period_s),
+    )
+    final_joints: tuple[float, ...] | None = None
+    final_joint_errors: tuple[float, ...] | None = None
+    max_joint_error: float | None = None
+    if not args.no_wait_waypoints:
+        final_joints, final_joint_errors, max_joint_error = (
+            wait_until_planar_ik_joints_reached(
+                controller,
+                step.label,
+                cached.target_joints_rad,
+                timeout_s=args.motion_timeout_s,
+                joint_tolerance_deg=float(args.planar_ik_joint_tolerance_deg),
+                initial_feedback_stamp=initial_feedback_stamp,
+            )
+        )
+    else:
+        feedback_joints = joint_feedback_to_rad(controller.get_joint_state())
+        if feedback_joints is not None:
+            final_joints = feedback_joints
+            final_joint_errors = joint_errors_deg(feedback_joints, cached.target_joints_rad)
+            max_joint_error = max(abs(value) for value in final_joint_errors)
+    final_pose = feedback_to_pose(controller.get_end_pose())
+    if final_joints is not None and final_joint_errors is not None:
+        print(
+            "Planar IK reuse feedback: "
+            f"step={step.label} "
+            f"j2_err={final_joint_errors[0]:.3f}deg "
+            f"j3_err={final_joint_errors[1]:.3f}deg "
+            f"j5_err={final_joint_errors[2]:.3f}deg "
+            f"max_err={max_joint_error:.3f}deg "
+            f"final_pose={format_pose(final_pose)}",
+            flush=True,
+        )
+    reused = replace(
+        cached.result,
+        step_label=step.label,
+        target_pose=step.pose,
+        send_count=send_count,
+        final_joints_deg=(
+            None if final_joints is None else joints_rad_to_deg(final_joints)
+        ),
+        joint_errors_deg=(
+            None
+            if final_joint_errors is None
+            else (
+                float(final_joint_errors[0]),
+                float(final_joint_errors[1]),
+                float(final_joint_errors[2]),
+            )
+        ),
+        max_joint_error_deg=max_joint_error,
+        final_pose=final_pose,
+        reused=True,
+        reused_from_step_label=cached.step_label,
+    )
+    return send_count, reused
 
 
 def clamp_pitch_delta_to_joint_limits(
@@ -2424,8 +2696,6 @@ def solve_planar_ik_j2_j3_j5(
     pitch_source_x_mm: float,
 ) -> PlanarIkSolution:
     decision = joint_pitch_decision(args, pitch_source_x_mm)
-    if decision.mode != "adjust":
-        raise RuntimeError("planar IK requires an adjust-mode dynamic pitch target")
     target_ry_deg = float(args.ry_deg) + float(decision.requested_pitch_delta_deg)
     joints = np.array(current_joints, dtype=float)
     max_step_rad = math.radians(float(args.planar_ik_max_step_deg))
@@ -2549,13 +2819,14 @@ def execute_planar_ik_step(
         f"pitch_delta={solution.pitch_delta_deg:.3f}deg "
         f"x_err={solution.x_error_mm:.3f}mm "
         f"z_err={solution.z_error_mm:.3f}mm "
-        f"ry_err={solution.ry_error_deg:.3f}deg",
+        f"ry_err={solution.ry_error_deg:.3f}deg "
+        f"speed={planar_ik_speed(args)}",
         flush=True,
     )
     send_count = execute_joints_for_duration(
         controller,
         solution.target_joints_rad,
-        int(args.speed),
+        planar_ik_speed(args),
         float(args.command_duration_s),
         float(args.command_period_s),
     )
@@ -2728,6 +2999,7 @@ def execute_and_record_step(
     gripper_results: list[SafeGripperResult],
     joint_pitch_adjustments: list[JointPitchAdjustmentResult] | None = None,
     planar_ik_results: list[PlanarIkExecutionResult] | None = None,
+    planar_ik_reuse_state: PlanarIkReuseState | None = None,
 ) -> int:
     send_count, gripper_result = execute_step(
         controller,
@@ -2735,6 +3007,7 @@ def execute_and_record_step(
         step,
         joint_pitch_adjustments=joint_pitch_adjustments,
         planar_ik_results=planar_ik_results,
+        planar_ik_reuse_state=planar_ik_reuse_state,
     )
     record_gripper_result(gripper_results, gripper_result)
     return send_count
@@ -2755,6 +3028,7 @@ def execute_plan(
     gripper_results: list[SafeGripperResult] = []
     joint_pitch_adjustments: list[JointPitchAdjustmentResult] = []
     planar_ik_results: list[PlanarIkExecutionResult] = []
+    planar_ik_reuse_state = PlanarIkReuseState()
     for index, step in enumerate(plan.steps):
         if should_guard_step(step, args):
             guarded_start_pose = guarded_start_pose_for_grasp(args, step.pose)
@@ -2772,6 +3046,7 @@ def execute_plan(
                 gripper_results,
                 joint_pitch_adjustments,
                 planar_ik_results,
+                planar_ik_reuse_state,
             )
             guarded_result = execute_guarded_descent(
                 controller,
@@ -2797,6 +3072,7 @@ def execute_plan(
                     joint_pitch_adjustments,
                     planar_ik_results,
                     abort_step,
+                    planar_ik_reuse_state,
                 )
                 record_gripper_result(
                     gripper_results,
@@ -2830,6 +3106,7 @@ def execute_plan(
             step,
             joint_pitch_adjustments=joint_pitch_adjustments,
             planar_ik_results=planar_ik_results,
+            planar_ik_reuse_state=planar_ik_reuse_state,
         )
         counts[step.label] = send_count
         record_gripper_result(gripper_results, gripper_result)
@@ -2867,6 +3144,7 @@ def execute_dynamic_preposition_plan(
     gripper_results: list[SafeGripperResult] = []
     joint_pitch_adjustments: list[JointPitchAdjustmentResult] = []
     planar_ik_results: list[PlanarIkExecutionResult] = []
+    planar_ik_reuse_state = PlanarIkReuseState()
     started_s = time.monotonic()
     ready_step = plan.steps[0]
     pick_above_step = plan.steps[1]
@@ -2893,6 +3171,7 @@ def execute_dynamic_preposition_plan(
         gripper_results,
         joint_pitch_adjustments,
         planar_ik_results,
+        planar_ik_reuse_state,
     )
     counts[pick_above_step.label] = execute_and_record_step(
         controller,
@@ -2901,6 +3180,7 @@ def execute_dynamic_preposition_plan(
         gripper_results,
         joint_pitch_adjustments,
         planar_ik_results,
+        planar_ik_reuse_state,
     )
     counts[preposition_step.label] = execute_and_record_step(
         controller,
@@ -2909,6 +3189,7 @@ def execute_dynamic_preposition_plan(
         gripper_results,
         joint_pitch_adjustments,
         planar_ik_results,
+        planar_ik_reuse_state,
     )
 
     preposition_elapsed_s = time.monotonic() - started_s
@@ -2945,6 +3226,7 @@ def execute_dynamic_preposition_plan(
                 joint_pitch_adjustments,
                 planar_ik_results,
                 abort_step,
+                planar_ik_reuse_state,
             )
             record_gripper_result(
                 gripper_results,
@@ -2984,6 +3266,7 @@ def execute_dynamic_preposition_plan(
             grasp_step,
             joint_pitch_adjustments=joint_pitch_adjustments,
             planar_ik_results=planar_ik_results,
+            planar_ik_reuse_state=planar_ik_reuse_state,
         )
         counts[grasp_step.label] = send_count
         record_gripper_result(gripper_results, gripper_result)
@@ -2995,6 +3278,7 @@ def execute_dynamic_preposition_plan(
         gripper_results,
         joint_pitch_adjustments,
         planar_ik_results,
+        planar_ik_reuse_state,
     )
     for step in plan.steps[4:]:
         counts[step.label] = execute_and_record_step(
@@ -3004,6 +3288,7 @@ def execute_dynamic_preposition_plan(
             gripper_results,
             joint_pitch_adjustments,
             planar_ik_results,
+            planar_ik_reuse_state,
         )
 
     if args.print_feedback:
@@ -3133,6 +3418,7 @@ def handle_message(
         f"({command.x_m:.4f}, {command.y_m:.4f}, {command.z_m:.4f}) m -> "
         f"base_xy=({target.pick_x_mm:.3f}, {target.pick_y_mm:.3f}) mm "
         f"grasp_z={target.grasp_z_mm:.3f} mm "
+        f"grasp_z_comp={target.planar_ik_grasp_z_comp_mm:.3f} mm "
         f"task_pose={format_pose(plan.steps[2].pose)} "
         f"place=({args.place_x_mm:.3f}, {args.place_y_mm:.3f}) mm",
         flush=True,
@@ -3168,6 +3454,14 @@ def handle_message(
             "grasp_z_mm": target.grasp_z_mm,
             "raw_grasp_z_mm": target.raw_grasp_z_mm,
             "grasp_z_source": target.grasp_z_source,
+            "uncompensated_grasp_z_mm": target.uncompensated_grasp_z_mm,
+            "planar_ik_grasp_z_comp_mm": target.planar_ik_grasp_z_comp_mm,
+            "planar_ik_grasp_z_comp_pitch_delta_deg": (
+                target.planar_ik_grasp_z_comp_pitch_delta_deg
+            ),
+            "planar_ik_grasp_z_comp_mm_per_deg": (
+                args.planar_ik_grasp_z_comp_mm_per_deg
+            ),
             "fixed_grasp_z_floor_mm": args.grasp_z_mm if args.use_detected_z else None,
             "place_x_mm": args.place_x_mm,
             "place_y_mm": args.place_y_mm,
