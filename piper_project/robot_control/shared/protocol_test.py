@@ -48,6 +48,11 @@ class TestTcpProtocol(unittest.TestCase):
             mask_top_v=80.0,
             mask_depth_median_m=0.456,
             mask_depth_valid_count=976,
+            object_short_axis_yaw_deg=-35.2,
+            object_yaw_source="opencv_min_area_rect_short_edge",
+            object_rect_width_px=123.0,
+            object_rect_height_px=58.0,
+            object_rect_angle_deg=12.5,
         )
 
         decoded = decode_message(encode_message(make_camera_point_message(command)))
@@ -83,6 +88,11 @@ class TestTcpProtocol(unittest.TestCase):
         self.assertAlmostEqual(parsed.mask_top_v, 80.0)
         self.assertAlmostEqual(parsed.mask_depth_median_m, 0.456)
         self.assertEqual(parsed.mask_depth_valid_count, 976)
+        self.assertAlmostEqual(parsed.object_short_axis_yaw_deg, -35.2)
+        self.assertEqual(parsed.object_yaw_source, "opencv_min_area_rect_short_edge")
+        self.assertAlmostEqual(parsed.object_rect_width_px, 123.0)
+        self.assertAlmostEqual(parsed.object_rect_height_px, 58.0)
+        self.assertAlmostEqual(parsed.object_rect_angle_deg, 12.5)
 
     def test_camera_point_task_defaults_to_out(self):
         message = make_camera_point_message(

@@ -14,9 +14,10 @@ protocol used by the YOLO clients.
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Literal
 
@@ -42,6 +43,7 @@ from robot_control.windows.client.yolo_seg_grasp_send_tcp import (
     YoloSegGraspSender,
     clamp_pixel_from_centroid,
     color_for_index,
+    deproject_pixel_with_depth,
     mask_centroid,
     segments_to_ranked_targets,
 )
@@ -111,6 +113,15 @@ class SuppressedDynamicTarget:
     x_mm: float
     y_mm: float
     expires_at_s: float
+
+
+@dataclass(frozen=True)
+class ObjectShortAxisYaw:
+    yaw_deg: float
+    source: str
+    rect_width_px: float
+    rect_height_px: float
+    rect_angle_deg: float
 
 
 class OpenCVGraspSender(YoloSegGraspSender):
@@ -312,6 +323,127 @@ def bbox_touches_roi_border(
 ) -> bool:
     x0, y0, x1, y1 = roi_bounds
     return x <= x0 or y <= y0 or x + width >= x1 or y + height >= y1
+
+
+def normalize_degrees(angle_deg: float) -> float:
+    return (float(angle_deg) + 180.0) % 360.0 - 180.0
+
+
+def _shortest_rect_edge(box_points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    if box_points.shape != (4, 2):
+        raise ValueError("box_points must be a 4x2 array")
+    edges: list[tuple[float, np.ndarray, np.ndarray]] = []
+    for index in range(4):
+        p1 = np.asarray(box_points[index], dtype=float)
+        p2 = np.asarray(box_points[(index + 1) % 4], dtype=float)
+        edges.append((float(np.linalg.norm(p2 - p1)), p1, p2))
+    _, p1, p2 = min(edges, key=lambda item: item[0])
+    return p1, p2
+
+
+def object_short_axis_yaw_from_mask(
+    segment: SegmentationDetection,
+    depth_frame: Any,
+    *,
+    depth_m: float,
+    intrinsics: PinholeIntrinsics | None,
+    camera_to_base: np.ndarray | None,
+) -> ObjectShortAxisYaw | None:
+    if camera_to_base is None:
+        return None
+    mask_u8 = segment.mask.astype(np.uint8)
+    contours, _ = cv2.findContours(
+        mask_u8,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE,
+    )
+    if not contours:
+        return None
+    contour = max(contours, key=cv2.contourArea)
+    if len(contour) < 3:
+        return None
+
+    rect = cv2.minAreaRect(contour)
+    (_, _), (rect_width_px, rect_height_px), rect_angle_deg = rect
+    if rect_width_px <= 0.0 or rect_height_px <= 0.0:
+        return None
+    p1_px, p2_px = _shortest_rect_edge(cv2.boxPoints(rect))
+    width = int(depth_frame.get_width())
+    height = int(depth_frame.get_height())
+    p1_u = max(0, min(width - 1, int(round(float(p1_px[0])))))
+    p1_v = max(0, min(height - 1, int(round(float(p1_px[1])))))
+    p2_u = max(0, min(width - 1, int(round(float(p2_px[0])))))
+    p2_v = max(0, min(height - 1, int(round(float(p2_px[1])))))
+
+    p1_camera = deproject_pixel_with_depth(
+        depth_frame,
+        p1_u,
+        p1_v,
+        depth_m,
+        intrinsics=intrinsics,
+    )
+    p2_camera = deproject_pixel_with_depth(
+        depth_frame,
+        p2_u,
+        p2_v,
+        depth_m,
+        intrinsics=intrinsics,
+    )
+    p1_base = map_camera_point_to_base_xyz_m(
+        p1_camera.x_m,
+        p1_camera.y_m,
+        p1_camera.z_m,
+        camera_to_base,
+    )
+    p2_base = map_camera_point_to_base_xyz_m(
+        p2_camera.x_m,
+        p2_camera.y_m,
+        p2_camera.z_m,
+        camera_to_base,
+    )
+    dx_m = p2_base[0] - p1_base[0]
+    dy_m = p2_base[1] - p1_base[1]
+    if math.hypot(dx_m, dy_m) <= 1e-9:
+        return None
+    return ObjectShortAxisYaw(
+        yaw_deg=normalize_degrees(math.degrees(math.atan2(dy_m, dx_m))),
+        source="opencv_min_area_rect_short_edge",
+        rect_width_px=float(rect_width_px),
+        rect_height_px=float(rect_height_px),
+        rect_angle_deg=float(rect_angle_deg),
+    )
+
+
+def attach_object_short_axis_yaw(
+    targets: list[RankedSegTarget],
+    depth_frame: Any,
+    *,
+    intrinsics: PinholeIntrinsics | None,
+    camera_to_base: np.ndarray | None,
+) -> list[RankedSegTarget]:
+    updated: list[RankedSegTarget] = []
+    for target in targets:
+        yaw = object_short_axis_yaw_from_mask(
+            target.segment,
+            depth_frame,
+            depth_m=target.raw_point.depth_m,
+            intrinsics=intrinsics,
+            camera_to_base=camera_to_base,
+        )
+        if yaw is None:
+            updated.append(target)
+            continue
+        updated.append(
+            replace(
+                target,
+                object_short_axis_yaw_deg=yaw.yaw_deg,
+                object_yaw_source=yaw.source,
+                object_rect_width_px=yaw.rect_width_px,
+                object_rect_height_px=yaw.rect_height_px,
+                object_rect_angle_deg=yaw.rect_angle_deg,
+            )
+        )
+    return updated
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -766,6 +898,11 @@ def format_target_line(target: RankedSegTarget) -> str:
         if target.top_base_xyz_mm is None
         else f"{target.top_base_xyz_mm[2]:.1f}mm"
     )
+    yaw_text = (
+        "NA"
+        if target.object_short_axis_yaw_deg is None
+        else f"{target.object_short_axis_yaw_deg:.1f}deg"
+    )
     return (
         f"{target.rank}: {detection.label} conf={confidence} "
         f"depth={target.depth_mm:.1f}mm "
@@ -773,7 +910,7 @@ def format_target_line(target: RankedSegTarget) -> str:
         f"valid_depth={target.mask_depth_valid_count}px "
         f"bbox=({detection.x},{detection.y},{detection.width},{detection.height}) "
         f"centroid=({target.segment.centroid_u:.1f},{target.segment.centroid_v:.1f}) "
-        f"top={top_pixel} top_base_z={top_base_z} "
+        f"top={top_pixel} top_base_z={top_base_z} short_yaw={yaw_text} "
         f"pixel=({target.send_point.u},{target.send_point.v}) "
         f"send=({target.send_point.x_m:.4f},"
         f"{target.send_point.y_m:.4f},{target.send_point.z_m:.4f})m"
@@ -1232,6 +1369,12 @@ def main() -> None:
                 point_z_offset_mm=args.point_z_offset_mm,
                 camera_to_base=camera_to_base,
                 base_z_offset_mm=args.base_z_offset_mm,
+            )
+            latest_targets = attach_object_short_axis_yaw(
+                latest_targets,
+                depth_frame,
+                intrinsics=intrinsics,
+                camera_to_base=camera_to_base,
             )
 
             now = time.monotonic()

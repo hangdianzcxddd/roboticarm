@@ -49,6 +49,11 @@ class CameraPointCommand:
     mask_top_v: float | None = None
     mask_depth_median_m: float | None = None
     mask_depth_valid_count: int | None = None
+    object_short_axis_yaw_deg: float | None = None
+    object_yaw_source: str | None = None
+    object_rect_width_px: float | None = None
+    object_rect_height_px: float | None = None
+    object_rect_angle_deg: float | None = None
 
 
 def make_camera_point_message(command: CameraPointCommand) -> dict[str, Any]:
@@ -171,6 +176,18 @@ def camera_point_from_message(message: dict[str, Any]) -> CameraPointCommand:
             mask_top_v=_optional_float(payload, "mask_top_v"),
             mask_depth_median_m=_optional_float(payload, "mask_depth_median_m"),
             mask_depth_valid_count=_optional_int(payload, "mask_depth_valid_count"),
+            object_short_axis_yaw_deg=_optional_float(
+                payload,
+                "object_short_axis_yaw_deg",
+            ),
+            object_yaw_source=(
+                str(payload["object_yaw_source"])
+                if payload.get("object_yaw_source") is not None
+                else None
+            ),
+            object_rect_width_px=_optional_float(payload, "object_rect_width_px"),
+            object_rect_height_px=_optional_float(payload, "object_rect_height_px"),
+            object_rect_angle_deg=_optional_float(payload, "object_rect_angle_deg"),
             grasp_mode=cast(GraspMode, grasp_mode),
             t_arrive_s=_optional_float(payload, "t_arrive_s"),
             conveyor_speed_mm_s=_optional_float(payload, "conveyor_speed_mm_s"),

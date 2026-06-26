@@ -100,6 +100,11 @@ class RankedSegTarget:
     top_base_xyz_mm: tuple[float, float, float] | None = None
     mask_top_u: float | None = None
     mask_top_v: float | None = None
+    object_short_axis_yaw_deg: float | None = None
+    object_yaw_source: str | None = None
+    object_rect_width_px: float | None = None
+    object_rect_height_px: float | None = None
+    object_rect_angle_deg: float | None = None
 
     @property
     def detection(self) -> Detection:
@@ -640,6 +645,11 @@ def segments_to_ranked_targets(
             top_base_xyz_mm=target.top_base_xyz_mm,
             mask_top_u=target.mask_top_u,
             mask_top_v=target.mask_top_v,
+            object_short_axis_yaw_deg=target.object_short_axis_yaw_deg,
+            object_yaw_source=target.object_yaw_source,
+            object_rect_width_px=target.object_rect_width_px,
+            object_rect_height_px=target.object_rect_height_px,
+            object_rect_angle_deg=target.object_rect_angle_deg,
         )
         for index, target in enumerate(ranked, start=1)
     ], errors
@@ -693,6 +703,11 @@ def camera_point_command_from_target(
         mask_top_v=target.mask_top_v,
         mask_depth_median_m=target.raw_point.depth_m,
         mask_depth_valid_count=target.mask_depth_valid_count,
+        object_short_axis_yaw_deg=target.object_short_axis_yaw_deg,
+        object_yaw_source=target.object_yaw_source,
+        object_rect_width_px=target.object_rect_width_px,
+        object_rect_height_px=target.object_rect_height_px,
+        object_rect_angle_deg=target.object_rect_angle_deg,
         grasp_mode=grasp_mode,
         t_arrive_s=t_arrive_s,
         conveyor_speed_mm_s=conveyor_speed_mm_s,

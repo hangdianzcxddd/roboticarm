@@ -17,6 +17,7 @@ from robot_control.linux.catch.catch_server_1 import (
     build_steps,
     dynamic_preposition_pose,
     dynamic_timing_from_command,
+    apply_grasp_yaw_adjustment,
     guarded_step_abort_status,
     handle_message,
     move_to_start_ready,
@@ -71,6 +72,11 @@ def make_args(**overrides: object) -> argparse.Namespace:
         "rx_deg": -176.794223,
         "ry_deg": 0.889438,
         "rz_deg": -105.490597,
+        "grasp_yaw_by_object_short_edge": False,
+        "gripper_close_axis_offset_deg": 0.0,
+        "grasp_yaw_max_delta_deg": 45.0,
+        "grasp_yaw_deadband_deg": 5.0,
+        "grasp_yaw_speed": 20,
         "force_pick_x_mm": None,
         "force_pick_y_mm": None,
         "dynamic_pitch_by_x": False,
@@ -295,6 +301,11 @@ class TestCatchServer1(unittest.TestCase):
         self.assertAlmostEqual(args.planar_ik_joint_tolerance_deg, 2.0)
         self.assertAlmostEqual(args.planar_ik_fk_tool_z_offset_mm, 82.0)
         self.assertEqual(args.use_detected_z, "off")
+        self.assertFalse(args.grasp_yaw_by_object_short_edge)
+        self.assertAlmostEqual(args.gripper_close_axis_offset_deg, 0.0)
+        self.assertAlmostEqual(args.grasp_yaw_max_delta_deg, 45.0)
+        self.assertAlmostEqual(args.grasp_yaw_deadband_deg, 5.0)
+        self.assertEqual(args.grasp_yaw_speed, 20)
 
         args = build_parser().parse_args(["--use-detected-z"])
         self.assertEqual(args.use_detected_z, "center")
@@ -863,6 +874,137 @@ class TestCatchServer1(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "detected_top_z_mm"):
             target_from_command(command, camera_to_base, args)
+
+    def test_grasp_yaw_adjustment_is_disabled_by_default(self):
+        args = make_args(grasp_yaw_by_object_short_edge=False)
+        command = CameraPointCommand(
+            x_m=0.35,
+            y_m=0.02,
+            z_m=0.30,
+            command_id="cmd-yaw-disabled",
+            object_short_axis_yaw_deg=80.0,
+        )
+        target = target_from_command(command, np.eye(4, dtype=float), args)
+        controller = make_controller()
+
+        result = apply_grasp_yaw_adjustment(controller, args, target)
+
+        self.assertFalse(result.enabled)
+        self.assertFalse(result.applied)
+        self.assertEqual(
+            [call for call in controller.sdk.calls if call[0] == "JointCtrl"],
+            [],
+        )
+
+    def test_grasp_yaw_adjustment_rotates_only_j6_and_clamps_delta(self):
+        args = make_args(
+            grasp_yaw_by_object_short_edge=True,
+            gripper_close_axis_offset_deg=0.0,
+            grasp_yaw_max_delta_deg=30.0,
+            grasp_yaw_deadband_deg=0.0,
+            grasp_yaw_speed=20,
+            command_duration_s=0.0,
+        )
+        command = CameraPointCommand(
+            x_m=0.35,
+            y_m=0.02,
+            z_m=0.30,
+            command_id="cmd-yaw-adjust",
+            object_short_axis_yaw_deg=80.0,
+        )
+        target = target_from_command(command, np.eye(4, dtype=float), args)
+        controller = make_controller()
+
+        result = apply_grasp_yaw_adjustment(controller, args, target)
+
+        self.assertTrue(result.enabled)
+        self.assertTrue(result.applied)
+        self.assertTrue(result.clamped)
+        self.assertAlmostEqual(result.delta_deg, 30.0)
+        joint_calls = [call for call in controller.sdk.calls if call[0] == "JointCtrl"]
+        self.assertEqual(len(joint_calls), 1)
+        self.assertEqual(joint_calls[0][1][:5], (0, 0, 0, 0, 0))
+        self.assertAlmostEqual(joint_calls[0][1][5], 30000, delta=1)
+
+    def test_grasp_yaw_adjustment_uses_nearest_180_equivalent_axis(self):
+        args = make_args(
+            grasp_yaw_by_object_short_edge=True,
+            grasp_yaw_max_delta_deg=90.0,
+            grasp_yaw_deadband_deg=0.0,
+            command_duration_s=0.0,
+        )
+        command = CameraPointCommand(
+            x_m=0.35,
+            y_m=0.02,
+            z_m=0.30,
+            command_id="cmd-yaw-equivalent",
+            object_short_axis_yaw_deg=170.0,
+        )
+        target = target_from_command(command, np.eye(4, dtype=float), args)
+        controller = make_controller()
+
+        result = apply_grasp_yaw_adjustment(controller, args, target)
+
+        self.assertTrue(result.applied)
+        self.assertAlmostEqual(result.delta_deg, -10.0)
+
+    def test_execute_plan_applies_grasp_yaw_after_grasp_pose_before_close(self):
+        args = make_args(
+            execute=True,
+            grasp_only=True,
+            no_return_ready=True,
+            no_gripper=False,
+            guarded_descent=False,
+            grasp_yaw_by_object_short_edge=True,
+            grasp_yaw_max_delta_deg=30.0,
+            grasp_yaw_deadband_deg=0.0,
+            command_duration_s=0.0,
+        )
+        camera_to_base = np.eye(4, dtype=float)
+        message = make_camera_point_message(
+            CameraPointCommand(
+                x_m=0.35,
+                y_m=0.02,
+                z_m=0.30,
+                command_id="cmd-yaw-execute",
+                object_short_axis_yaw_deg=20.0,
+            )
+        )
+        controller = make_feedback_controller(
+            EndPose(350.0, 20.0, 253.252, -176.794223, 0.889438, -105.490597)
+        )
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            response = handle_message(
+                message,
+                args=args,
+                camera_to_base=camera_to_base,
+                validator=controller,
+                controller=controller,
+            )
+
+        self.assertTrue(response["payload"]["executed"])
+        yaw_results = response["payload"]["grasp_yaw_adjustments"]
+        self.assertEqual(len(yaw_results), 1)
+        self.assertTrue(yaw_results[0]["applied"])
+        calls = controller.sdk.calls
+        pick_grasp_index = next(
+            index
+            for index, call in enumerate(calls)
+            if call[0] == "EndPoseCtrl" and call[1][2] == round(args.grasp_z_mm * 1000)
+        )
+        yaw_joint_index = next(
+            index
+            for index, call in enumerate(calls)
+            if call[0] == "JointCtrl" and call[1][5] != 0
+        )
+        close_index = next(
+            index
+            for index, call in enumerate(calls)
+            if call[0] == "GripperCtrl" and call[1][0] == -100000
+        )
+        self.assertLess(pick_grasp_index, yaw_joint_index)
+        self.assertLess(yaw_joint_index, close_index)
 
     def test_planar_ik_grasp_z_compensation_lowers_far_grasp_only(self):
         args = make_args(
@@ -2328,6 +2470,11 @@ class TestCatchServer1(unittest.TestCase):
                 "detected_top_x_mm": 331.0,
                 "detected_top_y_mm": 16.0,
                 "detected_top_z_mm": 145.0,
+                "object_short_axis_yaw_deg": -35.2,
+                "object_yaw_source": "opencv_min_area_rect_short_edge",
+                "object_rect_width_px": 123.0,
+                "object_rect_height_px": 58.0,
+                "object_rect_angle_deg": 12.5,
             }
         }
 
@@ -2344,6 +2491,11 @@ class TestCatchServer1(unittest.TestCase):
         self.assertAlmostEqual(metadata["detected_top_x_mm"], 331.0)
         self.assertAlmostEqual(metadata["detected_top_y_mm"], 16.0)
         self.assertAlmostEqual(metadata["detected_top_z_mm"], 145.0)
+        self.assertAlmostEqual(metadata["object_short_axis_yaw_deg"], -35.2)
+        self.assertEqual(metadata["object_yaw_source"], "opencv_min_area_rect_short_edge")
+        self.assertAlmostEqual(metadata["object_rect_width_px"], 123.0)
+        self.assertAlmostEqual(metadata["object_rect_height_px"], 58.0)
+        self.assertAlmostEqual(metadata["object_rect_angle_deg"], 12.5)
 
     def test_use_detected_z_rejects_grasp_above_transfer_plane(self):
         args = make_args(use_detected_z=True, detected_z_offset_mm=0.0)

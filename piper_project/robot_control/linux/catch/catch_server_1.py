@@ -198,6 +198,21 @@ class JointPitchAdjustmentResult:
 
 
 @dataclass(frozen=True)
+class GraspYawAdjustmentResult:
+    enabled: bool
+    applied: bool = False
+    reason: str | None = None
+    source_yaw_deg: float | None = None
+    target_yaw_deg: float | None = None
+    current_j6_deg: float | None = None
+    delta_deg: float | None = None
+    clamped: bool = False
+    start_joints_deg: tuple[float, float, float, float, float, float] | None = None
+    target_joints_deg: tuple[float, float, float, float, float, float] | None = None
+    send_count: int = 0
+
+
+@dataclass(frozen=True)
 class PlanarIkExecutionResult:
     step_label: str
     pitch_source_x_mm: float
@@ -269,6 +284,7 @@ class DynamicExecutionResult:
     guarded_descent: GuardedDescentResult | None = None
     safe_gripper_results: tuple[SafeGripperResult, ...] = ()
     joint_pitch_adjustments: tuple[JointPitchAdjustmentResult, ...] = ()
+    grasp_yaw_adjustments: tuple[GraspYawAdjustmentResult, ...] = ()
     planar_ik_results: tuple[PlanarIkExecutionResult, ...] = ()
 
 
@@ -471,6 +487,38 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rx-deg", type=float, default=-176.794223)
     parser.add_argument("--ry-deg", type=float, default=0.889438)
     parser.add_argument("--rz-deg", type=float, default=-105.490597)
+    parser.add_argument(
+        "--grasp-yaw-by-object-short-edge",
+        action="store_true",
+        help=(
+            "before final grasp descent, rotate only J6 toward the object short-edge "
+            "yaw reported by the vision payload; disabled by default"
+        ),
+    )
+    parser.add_argument(
+        "--gripper-close-axis-offset-deg",
+        type=float,
+        default=0.0,
+        help="calibration offset from reported object short-edge yaw to desired J6 angle",
+    )
+    parser.add_argument(
+        "--grasp-yaw-max-delta-deg",
+        type=float,
+        default=45.0,
+        help="maximum absolute J6 yaw correction applied per grasp",
+    )
+    parser.add_argument(
+        "--grasp-yaw-deadband-deg",
+        type=float,
+        default=5.0,
+        help="skip J6 yaw correction when the required delta is within this band",
+    )
+    parser.add_argument(
+        "--grasp-yaw-speed",
+        type=int,
+        default=20,
+        help="speed percent for object-short-edge J6 yaw alignment",
+    )
     parser.add_argument(
         "--force-pick-x-mm",
         type=float,
@@ -823,6 +871,11 @@ def validate_args(args: argparse.Namespace) -> None:
         or not 0 <= args.dynamic_pitch_speed <= 100
     ):
         raise ValueError("--dynamic-pitch-speed must be an integer in [0, 100]")
+    if (
+        not isinstance(args.grasp_yaw_speed, int)
+        or not 0 <= args.grasp_yaw_speed <= 100
+    ):
+        raise ValueError("--grasp-yaw-speed must be an integer in [0, 100]")
     for name in (
         "dynamic_preposition_clearance_mm",
         "guarded_descent_zone_mm",
@@ -880,6 +933,9 @@ def validate_args(args: argparse.Namespace) -> None:
         "rx_deg",
         "ry_deg",
         "rz_deg",
+        "gripper_close_axis_offset_deg",
+        "grasp_yaw_max_delta_deg",
+        "grasp_yaw_deadband_deg",
         "force_pick_x_mm",
         "force_pick_y_mm",
         "pitch_x_ref_mm",
@@ -908,6 +964,10 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError(f"--{name.replace('_', '-')} must be finite")
     if args.planar_ik_grasp_z_comp_mm_per_deg < 0.0:
         raise ValueError("--planar-ik-grasp-z-comp-mm-per-deg must be >= 0")
+    if args.grasp_yaw_max_delta_deg < 0.0:
+        raise ValueError("--grasp-yaw-max-delta-deg must be >= 0")
+    if args.grasp_yaw_deadband_deg < 0.0:
+        raise ValueError("--grasp-yaw-deadband-deg must be >= 0")
     if args.min_dynamic_pitch_deg > args.max_dynamic_pitch_deg:
         raise ValueError(
             "--min-dynamic-pitch-deg must be <= --max-dynamic-pitch-deg"
@@ -2000,10 +2060,20 @@ def yolo_metadata_from_message(message: dict[str, Any]) -> dict[str, Any]:
         "detected_top_x_mm",
         "detected_top_y_mm",
         "detected_top_z_mm",
+        "object_short_axis_yaw_deg",
+        "object_rect_width_px",
+        "object_rect_height_px",
+        "object_rect_angle_deg",
     ):
         if payload.get(key) is not None:
             value = payload[key]
-            metadata[key] = int(value) if key.endswith("_count") or key.endswith("_px") else float(value)
+            metadata[key] = (
+                int(value)
+                if key in ("mask_area_px", "mask_depth_valid_count")
+                else float(value)
+            )
+    if payload.get("object_yaw_source") is not None:
+        metadata["object_yaw_source"] = str(payload["object_yaw_source"])
     return metadata
 
 
@@ -2298,6 +2368,8 @@ def execute_step(
     *,
     speed: int | None = None,
     joint_pitch_adjustments: list[JointPitchAdjustmentResult] | None = None,
+    grasp_yaw_adjustments: list[GraspYawAdjustmentResult] | None = None,
+    grasp_yaw_target: YoloCatchTarget | None = None,
     planar_ik_results: list[PlanarIkExecutionResult] | None = None,
     planar_ik_reuse_state: PlanarIkReuseState | None = None,
 ) -> tuple[int, SafeGripperResult | None]:
@@ -2329,6 +2401,14 @@ def execute_step(
             )
             if planar_ik_results is not None:
                 planar_ik_results.append(planar_result)
+            if (
+                step.label in ("pick_grasp", "return_pick_grasp")
+                and grasp_yaw_target is not None
+                and grasp_yaw_adjustments is not None
+            ):
+                grasp_yaw_adjustments.append(
+                    apply_grasp_yaw_adjustment(controller, args, grasp_yaw_target)
+                )
             gripper_result = send_gripper(controller, args, step.gripper_after)
             return send_count, gripper_result
         send_count, planar_result = execute_planar_ik_step(controller, args, step)
@@ -2340,6 +2420,14 @@ def execute_step(
             )
         if planar_ik_results is not None:
             planar_ik_results.append(planar_result)
+        if (
+            step.label in ("pick_grasp", "return_pick_grasp")
+            and grasp_yaw_target is not None
+            and grasp_yaw_adjustments is not None
+        ):
+            grasp_yaw_adjustments.append(
+                apply_grasp_yaw_adjustment(controller, args, grasp_yaw_target)
+            )
         gripper_result = send_gripper(controller, args, step.gripper_after)
         return send_count, gripper_result
     if step.joint_pitch_before_pose:
@@ -2378,6 +2466,14 @@ def execute_step(
         )
         if pitch_adjustment is not None and joint_pitch_adjustments is not None:
             joint_pitch_adjustments.append(pitch_adjustment)
+    if (
+        step.label in ("pick_grasp", "return_pick_grasp")
+        and grasp_yaw_target is not None
+        and grasp_yaw_adjustments is not None
+    ):
+        grasp_yaw_adjustments.append(
+            apply_grasp_yaw_adjustment(controller, args, grasp_yaw_target)
+        )
     gripper_result = send_gripper(controller, args, step.gripper_after)
     return send_count, gripper_result
 
@@ -2424,6 +2520,26 @@ def joint_pitch_adjustment_to_dict(
         "j5_delta_deg": result.j5_delta_deg,
         "start_joints_deg": list(result.start_joints_deg),
         "target_joints_deg": list(result.target_joints_deg),
+        "send_count": result.send_count,
+    }
+
+
+def grasp_yaw_adjustment_to_dict(result: GraspYawAdjustmentResult) -> dict[str, Any]:
+    return {
+        "enabled": result.enabled,
+        "applied": result.applied,
+        "reason": result.reason,
+        "source_yaw_deg": result.source_yaw_deg,
+        "target_yaw_deg": result.target_yaw_deg,
+        "current_j6_deg": result.current_j6_deg,
+        "delta_deg": result.delta_deg,
+        "clamped": result.clamped,
+        "start_joints_deg": (
+            None if result.start_joints_deg is None else list(result.start_joints_deg)
+        ),
+        "target_joints_deg": (
+            None if result.target_joints_deg is None else list(result.target_joints_deg)
+        ),
         "send_count": result.send_count,
     }
 
@@ -3060,6 +3176,94 @@ def apply_joint_pitch_adjustment(
     )
 
 
+def nearest_axis_equivalent_delta_deg(target_deg: float, current_deg: float) -> float:
+    """Return nearest delta where target and target+180 describe same gripper axis."""
+
+    delta = normalize_degrees(float(target_deg) - float(current_deg))
+    if delta > 90.0:
+        delta -= 180.0
+    elif delta < -90.0:
+        delta += 180.0
+    return delta
+
+
+def apply_grasp_yaw_adjustment(
+    controller: PiperController,
+    args: argparse.Namespace,
+    target: YoloCatchTarget,
+) -> GraspYawAdjustmentResult:
+    if not getattr(args, "grasp_yaw_by_object_short_edge", False):
+        return GraspYawAdjustmentResult(enabled=False, reason="disabled")
+
+    source_yaw = target.camera_command.object_short_axis_yaw_deg
+    if source_yaw is None or not math.isfinite(float(source_yaw)):
+        return GraspYawAdjustmentResult(
+            enabled=True,
+            reason="missing_object_short_axis_yaw_deg",
+        )
+
+    current_joints = joint_feedback_to_rad(controller.get_joint_state())
+    if current_joints is None:
+        raise RuntimeError("grasp yaw adjustment requires valid joint feedback")
+
+    start_joints_deg = joints_rad_to_deg(current_joints)  # type: ignore[arg-type]
+    current_j6_deg = float(start_joints_deg[5])
+    target_yaw_deg = normalize_degrees(
+        float(source_yaw) + float(args.gripper_close_axis_offset_deg)
+    )
+    raw_delta_deg = nearest_axis_equivalent_delta_deg(target_yaw_deg, current_j6_deg)
+    if abs(raw_delta_deg) <= float(args.grasp_yaw_deadband_deg):
+        return GraspYawAdjustmentResult(
+            enabled=True,
+            applied=False,
+            reason="within_deadband",
+            source_yaw_deg=float(source_yaw),
+            target_yaw_deg=target_yaw_deg,
+            current_j6_deg=current_j6_deg,
+            delta_deg=0.0,
+            start_joints_deg=start_joints_deg,  # type: ignore[arg-type]
+            target_joints_deg=start_joints_deg,  # type: ignore[arg-type]
+        )
+
+    max_delta_deg = float(args.grasp_yaw_max_delta_deg)
+    delta_deg = min(max_delta_deg, max(-max_delta_deg, raw_delta_deg))
+    clamped = not math.isclose(delta_deg, raw_delta_deg, rel_tol=0.0, abs_tol=1e-9)
+    target_joints = list(current_joints)
+    target_joints[5] += math.radians(delta_deg)
+    controller.validate_joints(target_joints)
+
+    print(
+        "Applying object short-edge grasp yaw: "
+        f"source_yaw={float(source_yaw):.3f}deg "
+        f"offset={float(args.gripper_close_axis_offset_deg):.3f}deg "
+        f"target_yaw={target_yaw_deg:.3f}deg "
+        f"current_j6={current_j6_deg:.3f}deg "
+        f"delta={delta_deg:.3f}deg "
+        f"raw_delta={raw_delta_deg:.3f}deg "
+        f"clamped={clamped}",
+        flush=True,
+    )
+    send_count = execute_joints_for_duration(
+        controller,
+        target_joints,
+        int(args.grasp_yaw_speed),
+        float(args.command_duration_s),
+        float(args.command_period_s),
+    )
+    return GraspYawAdjustmentResult(
+        enabled=True,
+        applied=True,
+        source_yaw_deg=float(source_yaw),
+        target_yaw_deg=target_yaw_deg,
+        current_j6_deg=current_j6_deg,
+        delta_deg=delta_deg,
+        clamped=clamped,
+        start_joints_deg=start_joints_deg,  # type: ignore[arg-type]
+        target_joints_deg=joints_rad_to_deg(target_joints),
+        send_count=send_count,
+    )
+
+
 def execute_and_record_step(
     controller: PiperController,
     args: argparse.Namespace,
@@ -3068,12 +3272,16 @@ def execute_and_record_step(
     joint_pitch_adjustments: list[JointPitchAdjustmentResult] | None = None,
     planar_ik_results: list[PlanarIkExecutionResult] | None = None,
     planar_ik_reuse_state: PlanarIkReuseState | None = None,
+    grasp_yaw_adjustments: list[GraspYawAdjustmentResult] | None = None,
+    grasp_yaw_target: YoloCatchTarget | None = None,
 ) -> int:
     send_count, gripper_result = execute_step(
         controller,
         args,
         step,
         joint_pitch_adjustments=joint_pitch_adjustments,
+        grasp_yaw_adjustments=grasp_yaw_adjustments,
+        grasp_yaw_target=grasp_yaw_target,
         planar_ik_results=planar_ik_results,
         planar_ik_reuse_state=planar_ik_reuse_state,
     )
@@ -3095,6 +3303,7 @@ def execute_plan(
     guarded_result: GuardedDescentResult | None = None
     gripper_results: list[SafeGripperResult] = []
     joint_pitch_adjustments: list[JointPitchAdjustmentResult] = []
+    grasp_yaw_adjustments: list[GraspYawAdjustmentResult] = []
     planar_ik_results: list[PlanarIkExecutionResult] = []
     planar_ik_reuse_state = PlanarIkReuseState()
     for index, step in enumerate(plan.steps):
@@ -3155,6 +3364,7 @@ def execute_plan(
                     guarded_descent=guarded_result,
                     safe_gripper_results=tuple(gripper_results),
                     joint_pitch_adjustments=tuple(joint_pitch_adjustments),
+                    grasp_yaw_adjustments=tuple(grasp_yaw_adjustments),
                     planar_ik_results=tuple(planar_ik_results),
                 )
             pitch_adjustment = apply_joint_pitch_adjustment(
@@ -3165,6 +3375,9 @@ def execute_plan(
             )
             if pitch_adjustment is not None:
                 joint_pitch_adjustments.append(pitch_adjustment)
+            grasp_yaw_adjustments.append(
+                apply_grasp_yaw_adjustment(controller, args, plan.target)
+            )
             gripper_result = send_gripper(controller, args, step.gripper_after)
             record_gripper_result(gripper_results, gripper_result)
             continue
@@ -3173,6 +3386,8 @@ def execute_plan(
             args,
             step,
             joint_pitch_adjustments=joint_pitch_adjustments,
+            grasp_yaw_adjustments=grasp_yaw_adjustments,
+            grasp_yaw_target=plan.target,
             planar_ik_results=planar_ik_results,
             planar_ik_reuse_state=planar_ik_reuse_state,
         )
@@ -3190,6 +3405,7 @@ def execute_plan(
         guarded_descent=guarded_result,
         safe_gripper_results=tuple(gripper_results),
         joint_pitch_adjustments=tuple(joint_pitch_adjustments),
+        grasp_yaw_adjustments=tuple(grasp_yaw_adjustments),
         planar_ik_results=tuple(planar_ik_results),
     )
 
@@ -3211,6 +3427,7 @@ def execute_dynamic_preposition_plan(
     counts: dict[str, int] = {}
     gripper_results: list[SafeGripperResult] = []
     joint_pitch_adjustments: list[JointPitchAdjustmentResult] = []
+    grasp_yaw_adjustments: list[GraspYawAdjustmentResult] = []
     planar_ik_results: list[PlanarIkExecutionResult] = []
     planar_ik_reuse_state = PlanarIkReuseState()
     started_s = time.monotonic()
@@ -3330,6 +3547,7 @@ def execute_dynamic_preposition_plan(
                 guarded_descent=guarded_result,
                 safe_gripper_results=tuple(gripper_results),
                 joint_pitch_adjustments=tuple(joint_pitch_adjustments),
+                grasp_yaw_adjustments=tuple(grasp_yaw_adjustments),
                 planar_ik_results=tuple(planar_ik_results),
             )
         pitch_adjustment = apply_joint_pitch_adjustment(
@@ -3340,6 +3558,9 @@ def execute_dynamic_preposition_plan(
         )
         if pitch_adjustment is not None:
             joint_pitch_adjustments.append(pitch_adjustment)
+        grasp_yaw_adjustments.append(
+            apply_grasp_yaw_adjustment(controller, args, plan.target)
+        )
         gripper_result = send_gripper(controller, args, grasp_step.gripper_after)
         record_gripper_result(gripper_results, gripper_result)
     else:
@@ -3348,6 +3569,8 @@ def execute_dynamic_preposition_plan(
             args,
             grasp_step,
             joint_pitch_adjustments=joint_pitch_adjustments,
+            grasp_yaw_adjustments=grasp_yaw_adjustments,
+            grasp_yaw_target=plan.target,
             planar_ik_results=planar_ik_results,
             planar_ik_reuse_state=planar_ik_reuse_state,
         )
@@ -3392,6 +3615,7 @@ def execute_dynamic_preposition_plan(
         guarded_descent=guarded_result,
         safe_gripper_results=tuple(gripper_results),
         joint_pitch_adjustments=tuple(joint_pitch_adjustments),
+        grasp_yaw_adjustments=tuple(grasp_yaw_adjustments),
         planar_ik_results=tuple(planar_ik_results),
     )
 
@@ -3581,6 +3805,10 @@ def handle_message(
             "joint_pitch_adjustments": [
                 joint_pitch_adjustment_to_dict(result)
                 for result in execution.joint_pitch_adjustments
+            ],
+            "grasp_yaw_adjustments": [
+                grasp_yaw_adjustment_to_dict(result)
+                for result in execution.grasp_yaw_adjustments
             ],
             "planar_ik_results": [
                 planar_ik_result_to_dict(result)
