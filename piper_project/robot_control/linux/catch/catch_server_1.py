@@ -1442,13 +1442,16 @@ def dynamic_timing_from_command(
         raise ValueError("dynamic t_arrive_s must be finite and >= 0")
     if not math.isfinite(t_robot_s) or t_robot_s < 0.0:
         raise ValueError("--t-robot-s must be finite and >= 0")
-    if args.dynamic_preposition:
+    wait_placement = str(getattr(args, "dynamic_wait_placement", "wait"))
+    if args.dynamic_preposition and wait_placement == "nowait":
+        action_time_s = t_robot_s
+        action_time_label = "t_robot"
+    elif args.dynamic_preposition:
         action_time_s = float(args.final_action_time_s)
         action_time_label = "final_action_time"
     else:
         action_time_s = t_robot_s
         action_time_label = "t_robot"
-    wait_placement = str(getattr(args, "dynamic_wait_placement", "wait"))
     if not math.isfinite(action_time_s) or action_time_s < 0.0:
         raise ValueError(f"--{action_time_label.replace('_', '-')} must be finite and >= 0")
     t_wait_s = t_arrive_s - action_time_s
@@ -1688,11 +1691,14 @@ def wait_for_dynamic_final_action(
     *,
     elapsed_s: float,
     final_action_time_s: float,
-    placement: Literal["wait", "nowait"] = "wait",
+    placement: str = "wait",
 ) -> float:
     due_s = timing.t_arrive_s - final_action_time_s
     wait_s = due_s - elapsed_s
-    placement_text = "at initial ready" if placement == "nowait" else "at preposition"
+    placement_text = {
+        "nowait": "at initial ready",
+        "preposition_after_nowait": "at preposition",
+    }.get(placement, "at preposition")
     if wait_s <= 0.0:
         late_s = elapsed_s - due_s
         print(
@@ -3238,16 +3244,17 @@ def execute_dynamic_preposition_plan(
     )
     ready_elapsed_s = time.monotonic() - started_s
     final_action_due_s = timing.t_arrive_s - float(args.final_action_time_s)
+    ready_departure_due_s = timing.t_arrive_s - float(timing.t_robot_s)
     final_wait_s = 0.0
-    final_action_late_s = max(0.0, ready_elapsed_s - final_action_due_s)
+    final_action_late_s = 0.0
     if nowait:
-        final_wait_s = wait_for_dynamic_final_action(
+        wait_for_dynamic_final_action(
             timing,
             elapsed_s=ready_elapsed_s,
-            final_action_time_s=float(args.final_action_time_s),
+            final_action_time_s=float(timing.t_robot_s),
             placement="nowait",
         )
-        final_action_late_s = max(0.0, ready_elapsed_s - final_action_due_s)
+        final_action_late_s = max(0.0, ready_elapsed_s - ready_departure_due_s)
 
     counts[pick_above_step.label] = execute_and_record_step(
         controller,
@@ -3269,14 +3276,13 @@ def execute_dynamic_preposition_plan(
     )
 
     preposition_elapsed_s = time.monotonic() - started_s
-    if not nowait:
-        final_wait_s = wait_for_dynamic_final_action(
-            timing,
-            elapsed_s=preposition_elapsed_s,
-            final_action_time_s=float(args.final_action_time_s),
-            placement="wait",
-        )
-        final_action_late_s = max(0.0, preposition_elapsed_s - final_action_due_s)
+    final_wait_s = wait_for_dynamic_final_action(
+        timing,
+        elapsed_s=preposition_elapsed_s,
+        final_action_time_s=float(args.final_action_time_s),
+        placement="wait" if not nowait else "preposition_after_nowait",
+    )
+    final_action_late_s = max(0.0, preposition_elapsed_s - final_action_due_s)
 
     guarded_result: GuardedDescentResult | None = None
     if args.guarded_descent:

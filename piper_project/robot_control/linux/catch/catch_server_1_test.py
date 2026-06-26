@@ -16,6 +16,7 @@ from robot_control.linux.catch.catch_server_1 import (
     build_parser,
     build_steps,
     dynamic_preposition_pose,
+    dynamic_timing_from_command,
     guarded_step_abort_status,
     handle_message,
     move_to_start_ready,
@@ -981,6 +982,36 @@ class TestCatchServer1(unittest.TestCase):
             "wait",
         )
 
+    def test_dynamic_preposition_nowait_timing_uses_robot_time(self):
+        args = make_args(
+            dynamic_preposition=True,
+            dynamic_wait_placement="nowait",
+            t_robot_s=2.80,
+            final_action_time_s=0.55,
+        )
+        command = CameraPointCommand(
+            x_m=0.35,
+            y_m=0.02,
+            z_m=0.30,
+            command_id="cmd-dynamic-nowait-timing",
+            grasp_mode="dynamic",
+            t_arrive_s=3.20,
+            conveyor_speed_mm_s=100.0,
+            pick_x_mm=350.0,
+            pick_y_mm=-30.0,
+            detected_z_mm=120.0,
+        )
+
+        timing = dynamic_timing_from_command(command, args)
+
+        assert timing is not None
+        self.assertFalse(timing.skipped)
+        self.assertAlmostEqual(timing.t_robot_s, 2.80)
+        self.assertAlmostEqual(timing.action_time_s, 2.80)
+        self.assertAlmostEqual(timing.t_wait_s, 0.40)
+        self.assertEqual(timing.wait_placement, "nowait")
+        self.assertAlmostEqual(timing.final_action_time_s, 0.55)
+
     def test_execute_dynamic_preposition_guarded_descent_success(self):
         args = make_args(
             execute=True,
@@ -1104,7 +1135,7 @@ class TestCatchServer1(unittest.TestCase):
                 z_m=0.30,
                 command_id="cmd-dynamic-nowait",
                 grasp_mode="dynamic",
-                t_arrive_s=0.80,
+                t_arrive_s=3.20,
                 conveyor_speed_mm_s=100.0,
                 pick_x_mm=350.0,
                 pick_y_mm=-30.0,
@@ -1155,7 +1186,20 @@ class TestCatchServer1(unittest.TestCase):
             response["payload"]["dynamic_execution"]["wait_placement"],
             "nowait",
         )
-        wait_for_final_action.assert_called_once()
+        self.assertEqual(wait_for_final_action.call_count, 2)
+        self.assertAlmostEqual(
+            wait_for_final_action.call_args_list[0].kwargs["final_action_time_s"],
+            2.80,
+        )
+        self.assertEqual(wait_for_final_action.call_args_list[0].kwargs["placement"], "nowait")
+        self.assertAlmostEqual(
+            wait_for_final_action.call_args_list[1].kwargs["final_action_time_s"],
+            0.25,
+        )
+        self.assertEqual(
+            wait_for_final_action.call_args_list[1].kwargs["placement"],
+            "preposition_after_nowait",
+        )
         self.assertEqual(
             [item for item in call_order if item in ("ready_open", "wait", "pick_above")][:3],
             ["ready_open", "wait", "pick_above"],
