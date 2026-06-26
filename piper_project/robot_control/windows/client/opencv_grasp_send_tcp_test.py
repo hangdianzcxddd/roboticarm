@@ -129,9 +129,59 @@ class TestOpenCVGraspSendTcp(unittest.TestCase):
         self.assertEqual(payload["label"], "opencv_object")
         self.assertGreater(payload["mask_area_px"], 0)
         self.assertAlmostEqual(payload["mask_depth_median_m"], 0.45, places=3)
+        self.assertAlmostEqual(payload["mask_top_u"], 8.5)
+        self.assertAlmostEqual(payload["mask_top_v"], 5.0)
+
+    def test_segments_include_top_base_z_when_hand_eye_is_available(self):
+        frame = green_frame(20, 20)
+        frame[5:10, 6:12] = (0, 0, 255)
+        detector = GreenConveyorOpenCVDetector(
+            GreenConveyorDetectorConfig(
+                min_area_px=10,
+                morphology_kernel_size=1,
+            )
+        )
+        segments = detector.detect(frame)
+        depth = np.full((20, 20), 0.45, dtype=np.float32)
+
+        targets, errors = segments_to_ranked_targets(
+            segments,
+            FakeDepthFrame(depth),
+            intrinsics=PinholeIntrinsics(
+                width=20,
+                height=20,
+                fx=100.0,
+                fy=100.0,
+                ppx=10.0,
+                ppy=10.0,
+            ),
+            max_depth_m=1.5,
+            min_depth_valid_px=1,
+            mask_depth_erode_px=0,
+            camera_up_offset_mm=0.0,
+            point_z_offset_mm=0.0,
+            camera_to_base=np.eye(4, dtype=float),
+            base_z_offset_mm=0.0,
+        )
+        sender = OpenCVGraspSender(host=None, port=5005, timeout_s=1.0, dry_run=True)
+
+        response = sender.send_target(targets[0], source="opencv_test", task="in")
+
+        self.assertEqual(errors, {})
+        payload = response["payload"]
+        self.assertAlmostEqual(payload["mask_top_u"], 8.5)
+        self.assertAlmostEqual(payload["mask_top_v"], 5.0)
+        self.assertAlmostEqual(payload["detected_top_z_mm"], 450.0, places=3)
 
     def test_dynamic_mode_defaults_to_hand_eye_result_when_not_explicitly_disabled(self):
         args = build_parser().parse_args(["dynamic", "--dry-run", "--conveyor-speed-mm-s", "80"])
+
+        validate_args(args)
+
+        self.assertIsNotNone(args.hand_eye_result)
+
+    def test_static_mode_defaults_to_hand_eye_result_for_top_z_metadata(self):
+        args = build_parser().parse_args(["--dry-run"])
 
         validate_args(args)
 

@@ -96,6 +96,10 @@ class RankedSegTarget:
     raw_point: CameraPoint
     send_point: CameraPoint
     mask_depth_valid_count: int
+    top_point: CameraPoint | None = None
+    top_base_xyz_mm: tuple[float, float, float] | None = None
+    mask_top_u: float | None = None
+    mask_top_v: float | None = None
 
     @property
     def detection(self) -> Detection:
@@ -509,6 +513,19 @@ def clamp_pixel_from_centroid(
     return max(0, min(width - 1, u)), max(0, min(height - 1, v))
 
 
+def mask_top_pixel(mask: np.ndarray) -> tuple[float, float]:
+    if mask.ndim != 2:
+        raise ValueError("mask must be a single-channel image")
+    rows, cols = np.nonzero(mask)
+    if rows.size == 0:
+        raise ValueError("mask contains no object pixels")
+    top_v = int(rows.min())
+    top_cols = cols[rows == top_v]
+    if top_cols.size == 0:
+        raise ValueError("mask top row contains no object pixels")
+    return float(np.mean(top_cols)), float(top_v)
+
+
 def segments_to_ranked_targets(
     segments: list[SegmentationDetection],
     depth_frame: Any,
@@ -546,10 +563,24 @@ def segments_to_ranked_targets(
                 width=width,
                 height=height,
             )
+            top_u_float, top_v_float = mask_top_pixel(segment.mask)
+            top_u, top_v = clamp_pixel_from_centroid(
+                top_u_float,
+                top_v_float,
+                width=width,
+                height=height,
+            )
             raw_point = deproject_pixel_with_depth(
                 depth_frame,
                 u,
                 v,
+                depth_stats.median_m,
+                intrinsics=intrinsics,
+            )
+            top_point = deproject_pixel_with_depth(
+                depth_frame,
+                top_u,
+                top_v,
                 depth_stats.median_m,
                 intrinsics=intrinsics,
             )
@@ -563,6 +594,15 @@ def segments_to_ranked_targets(
                 camera_to_base=camera_to_base,
                 base_z_offset_mm=base_z_offset_mm,
             )
+            top_base_xyz_mm = None
+            if camera_to_base is not None:
+                top_base_xyz_m = map_camera_point_to_base_xyz_m(
+                    top_point.x_m,
+                    top_point.y_m,
+                    top_point.z_m,
+                    camera_to_base,
+                )
+                top_base_xyz_mm = tuple(float(value) * 1000.0 for value in top_base_xyz_m)
         except (RuntimeError, ValueError) as exc:
             errors[index] = str(exc)
             continue
@@ -574,6 +614,10 @@ def segments_to_ranked_targets(
                 raw_point=raw_point,
                 send_point=send_point,
                 mask_depth_valid_count=depth_stats.valid_count,
+                top_point=top_point,
+                top_base_xyz_mm=top_base_xyz_mm,
+                mask_top_u=top_u_float,
+                mask_top_v=top_v_float,
             )
         )
 
@@ -592,6 +636,10 @@ def segments_to_ranked_targets(
             raw_point=target.raw_point,
             send_point=target.send_point,
             mask_depth_valid_count=target.mask_depth_valid_count,
+            top_point=target.top_point,
+            top_base_xyz_mm=target.top_base_xyz_mm,
+            mask_top_u=target.mask_top_u,
+            mask_top_v=target.mask_top_v,
         )
         for index, target in enumerate(ranked, start=1)
     ], errors
@@ -614,6 +662,11 @@ def camera_point_command_from_target(
     detected_z_mm = None
     if detected_xyz_mm is not None:
         detected_x_mm, detected_y_mm, detected_z_mm = detected_xyz_mm
+    detected_top_x_mm = None
+    detected_top_y_mm = None
+    detected_top_z_mm = None
+    if target.top_base_xyz_mm is not None:
+        detected_top_x_mm, detected_top_y_mm, detected_top_z_mm = target.top_base_xyz_mm
     return CameraPointCommand(
         x_m=target.send_point.x_m,
         y_m=target.send_point.y_m,
@@ -636,6 +689,8 @@ def camera_point_command_from_target(
         mask_area_px=target.segment.mask_area_px,
         mask_centroid_u=target.segment.centroid_u,
         mask_centroid_v=target.segment.centroid_v,
+        mask_top_u=target.mask_top_u,
+        mask_top_v=target.mask_top_v,
         mask_depth_median_m=target.raw_point.depth_m,
         mask_depth_valid_count=target.mask_depth_valid_count,
         grasp_mode=grasp_mode,
@@ -646,6 +701,9 @@ def camera_point_command_from_target(
         detected_x_mm=detected_x_mm,
         detected_y_mm=detected_y_mm,
         detected_z_mm=detected_z_mm,
+        detected_top_x_mm=detected_top_x_mm,
+        detected_top_y_mm=detected_top_y_mm,
+        detected_top_z_mm=detected_top_z_mm,
     )
 
 

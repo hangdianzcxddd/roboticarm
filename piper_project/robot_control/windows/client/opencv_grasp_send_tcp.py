@@ -565,6 +565,12 @@ def validate_args(args: argparse.Namespace) -> None:
         and not getattr(args, "no_hand_eye_result", False)
     ):
         args.hand_eye_result = DEFAULT_HAND_EYE_RESULT
+    if (
+        mode == "static"
+        and args.hand_eye_result is None
+        and not getattr(args, "no_hand_eye_result", False)
+    ):
+        args.hand_eye_result = DEFAULT_HAND_EYE_RESULT
     if not args.dry_run and not args.host:
         raise ValueError("--host is required unless --dry-run is used")
     if args.timeout_s <= 0:
@@ -750,6 +756,16 @@ def find_ranked_target(
 def format_target_line(target: RankedSegTarget) -> str:
     detection = target.detection
     confidence = "NA" if detection.confidence is None else f"{detection.confidence:.2f}"
+    top_pixel = (
+        "NA"
+        if target.mask_top_u is None or target.mask_top_v is None
+        else f"({target.mask_top_u:.1f},{target.mask_top_v:.1f})"
+    )
+    top_base_z = (
+        "NA"
+        if target.top_base_xyz_mm is None
+        else f"{target.top_base_xyz_mm[2]:.1f}mm"
+    )
     return (
         f"{target.rank}: {detection.label} conf={confidence} "
         f"depth={target.depth_mm:.1f}mm "
@@ -757,6 +773,7 @@ def format_target_line(target: RankedSegTarget) -> str:
         f"valid_depth={target.mask_depth_valid_count}px "
         f"bbox=({detection.x},{detection.y},{detection.width},{detection.height}) "
         f"centroid=({target.segment.centroid_u:.1f},{target.segment.centroid_v:.1f}) "
+        f"top={top_pixel} top_base_z={top_base_z} "
         f"pixel=({target.send_point.u},{target.send_point.v}) "
         f"send=({target.send_point.x_m:.4f},"
         f"{target.send_point.y_m:.4f},{target.send_point.z_m:.4f})m"
@@ -1142,7 +1159,7 @@ def main() -> None:
     if args.mode == "static":
         terminal.start()
     source = (
-        "opencv_green_conveyor_mask_centroid_median_depth"
+        "opencv_green_conveyor_mask_centroid_top_median_depth"
         if args.mode == "static"
         else "opencv_green_conveyor_dynamic_timed"
     )

@@ -38,9 +38,14 @@ class TestTcpProtocol(unittest.TestCase):
             detected_x_mm=330.0,
             detected_y_mm=15.0,
             detected_z_mm=120.0,
+            detected_top_x_mm=331.0,
+            detected_top_y_mm=16.0,
+            detected_top_z_mm=145.0,
             mask_area_px=1280,
             mask_centroid_u=321.5,
             mask_centroid_v=123.25,
+            mask_top_u=320.0,
+            mask_top_v=80.0,
             mask_depth_median_m=0.456,
             mask_depth_valid_count=976,
         )
@@ -68,9 +73,14 @@ class TestTcpProtocol(unittest.TestCase):
         self.assertAlmostEqual(parsed.detected_x_mm, 330.0)
         self.assertAlmostEqual(parsed.detected_y_mm, 15.0)
         self.assertAlmostEqual(parsed.detected_z_mm, 120.0)
+        self.assertAlmostEqual(parsed.detected_top_x_mm, 331.0)
+        self.assertAlmostEqual(parsed.detected_top_y_mm, 16.0)
+        self.assertAlmostEqual(parsed.detected_top_z_mm, 145.0)
         self.assertEqual(parsed.mask_area_px, 1280)
         self.assertAlmostEqual(parsed.mask_centroid_u, 321.5)
         self.assertAlmostEqual(parsed.mask_centroid_v, 123.25)
+        self.assertAlmostEqual(parsed.mask_top_u, 320.0)
+        self.assertAlmostEqual(parsed.mask_top_v, 80.0)
         self.assertAlmostEqual(parsed.mask_depth_median_m, 0.456)
         self.assertEqual(parsed.mask_depth_valid_count, 976)
 

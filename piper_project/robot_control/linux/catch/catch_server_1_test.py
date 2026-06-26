@@ -45,6 +45,7 @@ def make_args(**overrides: object) -> argparse.Namespace:
         "debug_plan": False,
         "t_robot_s": 1.7,
         "dynamic_preposition": False,
+        "dynamic_wait_placement": "wait",
         "dynamic_preposition_clearance_mm": 20.0,
         "final_action_time_s": 0.55,
         "guarded_descent": True,
@@ -64,7 +65,7 @@ def make_args(**overrides: object) -> argparse.Namespace:
         "ready_y_mm": 0.0,
         "transfer_z_mm": 253.252,
         "grasp_z_mm": 133.252,
-        "use_detected_z": False,
+        "use_detected_z": "off",
         "detected_z_offset_mm": 0.0,
         "rx_deg": -176.794223,
         "ry_deg": 0.889438,
@@ -277,6 +278,7 @@ class TestCatchServer1(unittest.TestCase):
         self.assertAlmostEqual(args.place_pick_y_mm, 200.0)
         self.assertFalse(args.dynamic_pitch_by_x)
         self.assertEqual(args.dynamic_pitch_mode, "joint")
+        self.assertEqual(args.dynamic_wait_placement, "wait")
         self.assertAlmostEqual(args.keep_pitch_min_x_mm, 300.0)
         self.assertAlmostEqual(args.keep_pitch_max_x_mm, 380.0)
         self.assertIsNone(args.pitch_deg_per_mm)
@@ -291,6 +293,13 @@ class TestCatchServer1(unittest.TestCase):
         self.assertTrue(args.reuse_planar_ik_above_target)
         self.assertAlmostEqual(args.planar_ik_joint_tolerance_deg, 2.0)
         self.assertAlmostEqual(args.planar_ik_fk_tool_z_offset_mm, 82.0)
+        self.assertEqual(args.use_detected_z, "off")
+
+        args = build_parser().parse_args(["--use-detected-z"])
+        self.assertEqual(args.use_detected_z, "center")
+
+        args = build_parser().parse_args(["--use-detected-z", "top"])
+        self.assertEqual(args.use_detected_z, "top")
 
         args = build_parser().parse_args(
             [
@@ -303,6 +312,8 @@ class TestCatchServer1(unittest.TestCase):
                 "9",
                 "--planar-ik-speed",
                 "25",
+                "--dynamic-wait-placement",
+                "nowait",
             ]
         )
 
@@ -311,6 +322,7 @@ class TestCatchServer1(unittest.TestCase):
         self.assertAlmostEqual(args.guarded_follow_error_mm, 6.0)
         self.assertEqual(args.startup_speed, 9)
         self.assertEqual(args.planar_ik_speed, 25)
+        self.assertEqual(args.dynamic_wait_placement, "nowait")
 
     def test_parser_accepts_adaptive_joint_pitch_alias_and_slope_defaults(self):
         args = build_parser().parse_args(["--adaptive-joint-pitch-by-x"])
@@ -742,6 +754,35 @@ class TestCatchServer1(unittest.TestCase):
         self.assertAlmostEqual(pose.y_mm, -30.0)
         self.assertAlmostEqual(pose.z_mm, 140.0)
 
+    def test_dynamic_preposition_pose_uses_top_height_in_top_detected_mode(self):
+        args = make_args(
+            dynamic_preposition=True,
+            dynamic_preposition_clearance_mm=20.0,
+            guarded_descent_zone_mm=30.0,
+            use_detected_z="top",
+        )
+        camera_to_base = np.eye(4, dtype=float)
+        command = CameraPointCommand(
+            x_m=0.0,
+            y_m=0.0,
+            z_m=0.30,
+            command_id="cmd-dynamic-prepose-top",
+            grasp_mode="dynamic",
+            t_arrive_s=1.0,
+            pick_x_mm=350.0,
+            pick_y_mm=-30.0,
+            detected_z_mm=120.0,
+            detected_top_z_mm=150.0,
+        )
+        target = target_from_command(command, camera_to_base, args)
+
+        pose, source = dynamic_preposition_pose(args, target)
+
+        self.assertEqual(source, "detected_top_z_plus_clearance")
+        self.assertAlmostEqual(pose.x_mm, 350.0)
+        self.assertAlmostEqual(pose.y_mm, -30.0)
+        self.assertAlmostEqual(pose.z_mm, 170.0)
+
     def test_use_detected_z_clamps_low_dynamic_grasp_to_fixed_safe_floor(self):
         args = make_args(use_detected_z=True, detected_z_offset_mm=130.0)
         camera_to_base = np.eye(4, dtype=float)
@@ -786,6 +827,41 @@ class TestCatchServer1(unittest.TestCase):
         self.assertAlmostEqual(target.raw_grasp_z_mm, 160.0)
         self.assertAlmostEqual(target.grasp_z_mm, 160.0)
         self.assertEqual(target.grasp_z_source, "dynamic_detected_z_plus_offset")
+
+    def test_use_detected_z_top_uses_command_top_z(self):
+        args = make_args(use_detected_z="top", detected_z_offset_mm=8.0)
+        camera_to_base = np.eye(4, dtype=float)
+        command = CameraPointCommand(
+            x_m=0.35,
+            y_m=0.02,
+            z_m=-0.50,
+            command_id="cmd-top-detected-z",
+            grasp_mode="dynamic",
+            t_arrive_s=1.0,
+            pick_x_mm=350.0,
+            pick_y_mm=-30.0,
+            detected_z_mm=120.0,
+            detected_top_z_mm=160.0,
+        )
+
+        target = target_from_command(command, camera_to_base, args)
+
+        self.assertAlmostEqual(target.raw_grasp_z_mm, 168.0)
+        self.assertAlmostEqual(target.grasp_z_mm, 168.0)
+        self.assertEqual(target.grasp_z_source, "detected_top_z_plus_offset")
+
+    def test_use_detected_z_top_requires_command_top_z(self):
+        args = make_args(use_detected_z="top", detected_z_offset_mm=0.0)
+        camera_to_base = np.eye(4, dtype=float)
+        command = CameraPointCommand(
+            x_m=0.35,
+            y_m=0.02,
+            z_m=0.12,
+            command_id="cmd-missing-top-z",
+        )
+
+        with self.assertRaisesRegex(ValueError, "detected_top_z_mm"):
+            target_from_command(command, camera_to_base, args)
 
     def test_planar_ik_grasp_z_compensation_lowers_far_grasp_only(self):
         args = make_args(
@@ -895,9 +971,14 @@ class TestCatchServer1(unittest.TestCase):
         self.assertAlmostEqual(timing["t_robot_s"], 2.80)
         self.assertAlmostEqual(timing["action_time_s"], 0.55)
         self.assertAlmostEqual(timing["t_wait_s"], 0.25)
+        self.assertEqual(timing["wait_placement"], "wait")
         self.assertEqual(
             response["payload"]["dynamic_execution"]["preposition_enabled"],
             True,
+        )
+        self.assertEqual(
+            response["payload"]["dynamic_execution"]["wait_placement"],
+            "wait",
         )
 
     def test_execute_dynamic_preposition_guarded_descent_success(self):
@@ -1003,6 +1084,84 @@ class TestCatchServer1(unittest.TestCase):
         self.assertAlmostEqual(execution["final_action_due_s"], 0.0)
         self.assertEqual(execution["final_wait_s"], 0.0)
         self.assertGreaterEqual(execution["final_action_late_s"], 0.0)
+
+    def test_dynamic_preposition_nowait_waits_at_ready_before_target_moves(self):
+        args = make_args(
+            execute=True,
+            grasp_only=True,
+            no_return_ready=True,
+            dynamic_preposition=True,
+            dynamic_wait_placement="nowait",
+            final_action_time_s=0.25,
+            t_robot_s=2.80,
+            guarded_descent=False,
+        )
+        camera_to_base = np.eye(4, dtype=float)
+        message = make_camera_point_message(
+            CameraPointCommand(
+                x_m=0.35,
+                y_m=0.02,
+                z_m=0.30,
+                command_id="cmd-dynamic-nowait",
+                grasp_mode="dynamic",
+                t_arrive_s=0.80,
+                conveyor_speed_mm_s=100.0,
+                pick_x_mm=350.0,
+                pick_y_mm=-30.0,
+                detected_z_mm=120.0,
+            )
+        )
+        controller = make_feedback_controller(
+            EndPose(350.0, 0.0, 253.252, -176.794223, 0.889438, -105.490597)
+        )
+        call_order: list[str] = []
+
+        original_move_to_pose = controller.move_to_pose
+
+        def record_move_to_pose(pose, *args_, **kwargs_):
+            if math.isclose(pose.x_mm, 350.0) and math.isclose(pose.y_mm, 0.0):
+                call_order.append("ready_open")
+            elif math.isclose(pose.z_mm, 253.252):
+                call_order.append("pick_above")
+            elif math.isclose(pose.z_mm, 140.0):
+                call_order.append("dynamic_preposition")
+            elif math.isclose(pose.z_mm, 133.252):
+                call_order.append("pick_grasp")
+            return original_move_to_pose(pose, *args_, **kwargs_)
+
+        def record_wait(*args_, **kwargs_):
+            call_order.append("wait")
+            return 0.0
+
+        with mock.patch.object(
+            controller,
+            "move_to_pose",
+            side_effect=record_move_to_pose,
+        ), mock.patch(
+            "robot_control.linux.catch.catch_server_1.wait_for_dynamic_final_action",
+            side_effect=record_wait,
+        ) as wait_for_final_action, contextlib.redirect_stdout(io.StringIO()):
+            response = handle_message(
+                message,
+                args=args,
+                camera_to_base=camera_to_base,
+                validator=controller,
+                controller=controller,
+            )
+
+        self.assertTrue(response["payload"]["executed"])
+        self.assertEqual(response["payload"]["dynamic_timing"]["wait_placement"], "nowait")
+        self.assertEqual(
+            response["payload"]["dynamic_execution"]["wait_placement"],
+            "nowait",
+        )
+        wait_for_final_action.assert_called_once()
+        self.assertEqual(
+            [item for item in call_order if item in ("ready_open", "wait", "pick_above")][:3],
+            ["ready_open", "wait", "pick_above"],
+        )
+        self.assertLess(call_order.index("wait"), call_order.index("dynamic_preposition"))
+        self.assertLess(call_order.index("dynamic_preposition"), call_order.index("pick_grasp"))
 
     def test_execute_dynamic_preposition_guarded_descent_abort_returns_above(self):
         args = make_args(
@@ -2118,8 +2277,13 @@ class TestCatchServer1(unittest.TestCase):
                 "mask_area_px": 1280,
                 "mask_centroid_u": 321.5,
                 "mask_centroid_v": 123.25,
+                "mask_top_u": 320.0,
+                "mask_top_v": 80.0,
                 "mask_depth_median_m": 0.456,
                 "mask_depth_valid_count": 976,
+                "detected_top_x_mm": 331.0,
+                "detected_top_y_mm": 16.0,
+                "detected_top_z_mm": 145.0,
             }
         }
 
@@ -2129,8 +2293,13 @@ class TestCatchServer1(unittest.TestCase):
         self.assertEqual(metadata["mask_area_px"], 1280)
         self.assertAlmostEqual(metadata["mask_centroid_u"], 321.5)
         self.assertAlmostEqual(metadata["mask_centroid_v"], 123.25)
+        self.assertAlmostEqual(metadata["mask_top_u"], 320.0)
+        self.assertAlmostEqual(metadata["mask_top_v"], 80.0)
         self.assertAlmostEqual(metadata["mask_depth_median_m"], 0.456)
         self.assertEqual(metadata["mask_depth_valid_count"], 976)
+        self.assertAlmostEqual(metadata["detected_top_x_mm"], 331.0)
+        self.assertAlmostEqual(metadata["detected_top_y_mm"], 16.0)
+        self.assertAlmostEqual(metadata["detected_top_z_mm"], 145.0)
 
     def test_use_detected_z_rejects_grasp_above_transfer_plane(self):
         args = make_args(use_detected_z=True, detected_z_offset_mm=0.0)

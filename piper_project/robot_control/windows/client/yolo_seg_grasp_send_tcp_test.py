@@ -18,6 +18,7 @@ from robot_control.windows.client.yolo_seg_grasp_send_tcp import (
     find_dynamic_seg_candidates,
     mask_centroid,
     mask_depth_median,
+    mask_top_pixel,
     segments_to_ranked_targets,
     validate_args,
 )
@@ -162,6 +163,49 @@ class TestYoloSegGraspSendTcp(unittest.TestCase):
         self.assertEqual([target.detection.label for target in targets], ["near", "far"])
         self.assertAlmostEqual(targets[0].raw_point.depth_m, 0.25, places=3)
         self.assertAlmostEqual(targets[1].raw_point.depth_m, 0.55, places=3)
+
+    def test_mask_top_pixel_uses_uppermost_mask_row(self):
+        mask = np.zeros((8, 8), dtype=bool)
+        mask[3, 2:6] = True
+        mask[4:6, 1:7] = True
+
+        u, v = mask_top_pixel(mask)
+
+        self.assertAlmostEqual(u, 3.5)
+        self.assertAlmostEqual(v, 3.0)
+
+    def test_segments_include_mask_top_base_metadata_when_hand_eye_available(self):
+        mask = np.zeros((8, 8), dtype=bool)
+        mask[2, 3:5] = True
+        mask[3:6, 2:6] = True
+        depth = np.full((8, 8), 0.50, dtype=np.float32)
+
+        targets, errors = segments_to_ranked_targets(
+            [segment(mask)],
+            FakeDepthFrame(depth),
+            intrinsics=PinholeIntrinsics(
+                width=8,
+                height=8,
+                fx=100.0,
+                fy=100.0,
+                ppx=4.0,
+                ppy=4.0,
+            ),
+            max_depth_m=1.5,
+            min_depth_valid_px=1,
+            mask_depth_erode_px=0,
+            camera_up_offset_mm=0.0,
+            point_z_offset_mm=0.0,
+            camera_to_base=np.eye(4, dtype=float),
+            base_z_offset_mm=0.0,
+        )
+
+        self.assertEqual(errors, {})
+        self.assertAlmostEqual(targets[0].mask_top_u, 3.5)
+        self.assertAlmostEqual(targets[0].mask_top_v, 2.0)
+        self.assertIsNotNone(targets[0].top_point)
+        assert targets[0].top_base_xyz_mm is not None
+        self.assertAlmostEqual(targets[0].top_base_xyz_mm[2], 500.0)
 
     def test_command_carries_mask_metadata_through_protocol(self):
         mask = np.zeros((6, 6), dtype=bool)

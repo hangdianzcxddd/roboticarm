@@ -39,9 +39,14 @@ class CameraPointCommand:
     detected_x_mm: float | None = None
     detected_y_mm: float | None = None
     detected_z_mm: float | None = None
+    detected_top_x_mm: float | None = None
+    detected_top_y_mm: float | None = None
+    detected_top_z_mm: float | None = None
     mask_area_px: int | None = None
     mask_centroid_u: float | None = None
     mask_centroid_v: float | None = None
+    mask_top_u: float | None = None
+    mask_top_v: float | None = None
     mask_depth_median_m: float | None = None
     mask_depth_valid_count: int | None = None
 
@@ -162,6 +167,8 @@ def camera_point_from_message(message: dict[str, Any]) -> CameraPointCommand:
             mask_area_px=_optional_int(payload, "mask_area_px"),
             mask_centroid_u=_optional_float(payload, "mask_centroid_u"),
             mask_centroid_v=_optional_float(payload, "mask_centroid_v"),
+            mask_top_u=_optional_float(payload, "mask_top_u"),
+            mask_top_v=_optional_float(payload, "mask_top_v"),
             mask_depth_median_m=_optional_float(payload, "mask_depth_median_m"),
             mask_depth_valid_count=_optional_int(payload, "mask_depth_valid_count"),
             grasp_mode=cast(GraspMode, grasp_mode),
@@ -172,6 +179,9 @@ def camera_point_from_message(message: dict[str, Any]) -> CameraPointCommand:
             detected_x_mm=_optional_float(payload, "detected_x_mm"),
             detected_y_mm=_optional_float(payload, "detected_y_mm"),
             detected_z_mm=_optional_float(payload, "detected_z_mm"),
+            detected_top_x_mm=_optional_float(payload, "detected_top_x_mm"),
+            detected_top_y_mm=_optional_float(payload, "detected_top_y_mm"),
+            detected_top_z_mm=_optional_float(payload, "detected_top_z_mm"),
         )
     except KeyError as exc:
         raise ValueError(f"missing camera point field: {exc.args[0]}") from exc

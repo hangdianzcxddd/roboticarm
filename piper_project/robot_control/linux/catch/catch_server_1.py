@@ -125,6 +125,7 @@ class DynamicTiming:
     t_wait_s: float
     dynamic_preposition: bool = False
     final_action_time_s: float | None = None
+    wait_placement: Literal["wait", "nowait"] = "wait"
     skipped: bool = False
     skip_reason: str | None = None
 
@@ -320,6 +321,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--dynamic-wait-placement",
+        choices=("wait", "nowait"),
+        default="wait",
+        help=(
+            "dynamic-preposition timing mode: wait keeps the existing wait at "
+            "the target preposition pose; nowait waits at the initial ready pose "
+            "then runs target approach and grasp without the final target wait"
+        ),
+    )
+    parser.add_argument(
         "--dynamic-preposition-clearance-mm",
         type=float,
         default=20.0,
@@ -441,10 +452,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--use-detected-z",
-        action="store_true",
+        nargs="?",
+        const="center",
+        default="off",
+        choices=("center", "top"),
         help=(
-            "use hand-eye mapped base Z for J6 grasp Z instead of --grasp-z-mm. "
-            "Default keeps a fixed grasp plane."
+            "use detected base Z for J6 grasp Z instead of --grasp-z-mm. "
+            "Without a value, uses center for backward compatibility; top uses "
+            "the Windows-provided object top Z. Default keeps a fixed grasp plane."
         ),
     )
     parser.add_argument(
@@ -939,6 +954,17 @@ def clamp(value: float, lower: float, upper: float) -> float:
     return min(upper, max(lower, value))
 
 
+def detected_z_mode(args: argparse.Namespace) -> Literal["off", "center", "top"]:
+    value = getattr(args, "use_detected_z", False)
+    if value is True:
+        return "center"
+    if value in (False, None, "off"):
+        return "off"
+    if value in ("center", "top"):
+        return value
+    raise ValueError("--use-detected-z must be 'center', 'top', or disabled")
+
+
 def dynamic_pitch_control_mode(args: argparse.Namespace) -> DynamicPitchControlMode:
     value = getattr(args, "dynamic_pitch_mode", "joint")
     return "planar_ik" if value == "planar-ik" else value
@@ -1186,16 +1212,27 @@ def target_from_command(
         pick_y_source = "forced_pick_y"
     raw_grasp_z_mm: float | None = None
     grasp_z_source = "fixed_grasp_z"
-    if args.use_detected_z:
-        detected_z_mm = base_xyz_m[2] * 1000.0
-        grasp_z_source = "mapped_command_z_plus_offset"
-        if (
-            command.grasp_mode == "dynamic"
-            and command.detected_z_mm is not None
-            and math.isfinite(float(command.detected_z_mm))
-        ):
-            detected_z_mm = float(command.detected_z_mm)
-            grasp_z_source = "dynamic_detected_z_plus_offset"
+    z_mode = detected_z_mode(args)
+    if z_mode != "off":
+        if z_mode == "top":
+            if command.detected_top_z_mm is None or not math.isfinite(
+                float(command.detected_top_z_mm)
+            ):
+                raise ValueError(
+                    "--use-detected-z top requires detected_top_z_mm in the command payload"
+                )
+            detected_z_mm = float(command.detected_top_z_mm)
+            grasp_z_source = "detected_top_z_plus_offset"
+        else:
+            detected_z_mm = base_xyz_m[2] * 1000.0
+            grasp_z_source = "mapped_command_z_plus_offset"
+            if (
+                command.grasp_mode == "dynamic"
+                and command.detected_z_mm is not None
+                and math.isfinite(float(command.detected_z_mm))
+            ):
+                detected_z_mm = float(command.detected_z_mm)
+                grasp_z_source = "dynamic_detected_z_plus_offset"
         raw_grasp_z_mm = detected_z_mm + args.detected_z_offset_mm
         grasp_z_mm = max(raw_grasp_z_mm, float(args.grasp_z_mm))
         if grasp_z_mm != raw_grasp_z_mm:
@@ -1411,6 +1448,7 @@ def dynamic_timing_from_command(
     else:
         action_time_s = t_robot_s
         action_time_label = "t_robot"
+    wait_placement = str(getattr(args, "dynamic_wait_placement", "wait"))
     if not math.isfinite(action_time_s) or action_time_s < 0.0:
         raise ValueError(f"--{action_time_label.replace('_', '-')} must be finite and >= 0")
     t_wait_s = t_arrive_s - action_time_s
@@ -1424,6 +1462,7 @@ def dynamic_timing_from_command(
             final_action_time_s=(
                 float(args.final_action_time_s) if args.dynamic_preposition else None
             ),
+            wait_placement=wait_placement,
             skipped=True,
             skip_reason=(
                 "dynamic target is too close to the pick line: "
@@ -1440,6 +1479,7 @@ def dynamic_timing_from_command(
         final_action_time_s=(
             float(args.final_action_time_s) if args.dynamic_preposition else None
         ),
+        wait_placement=wait_placement,
     )
 
 
@@ -1472,10 +1512,15 @@ def dynamic_preposition_pose(
     target: YoloCatchTarget,
 ) -> tuple[EndPose, str]:
     command = target.camera_command
-    detected_z_mm = command.detected_z_mm
+    if detected_z_mode(args) == "top":
+        detected_z_mm = command.detected_top_z_mm
+        detected_source = "detected_top_z_plus_clearance"
+    else:
+        detected_z_mm = command.detected_z_mm
+        detected_source = "detected_z_plus_clearance"
     if detected_z_mm is not None and math.isfinite(float(detected_z_mm)):
         requested_z_mm = float(detected_z_mm) + float(args.dynamic_preposition_clearance_mm)
-        source = "detected_z_plus_clearance"
+        source = detected_source
     else:
         requested_z_mm = target.grasp_z_mm + float(args.guarded_descent_zone_mm)
         source = "grasp_z_plus_guarded_zone"
@@ -1643,9 +1688,11 @@ def wait_for_dynamic_final_action(
     *,
     elapsed_s: float,
     final_action_time_s: float,
+    placement: Literal["wait", "nowait"] = "wait",
 ) -> float:
     due_s = timing.t_arrive_s - final_action_time_s
     wait_s = due_s - elapsed_s
+    placement_text = "at initial ready" if placement == "nowait" else "at preposition"
     if wait_s <= 0.0:
         late_s = elapsed_s - due_s
         print(
@@ -1653,6 +1700,7 @@ def wait_for_dynamic_final_action(
             f"(t_arrive={timing.t_arrive_s:.3f}s, "
             f"elapsed={elapsed_s:.3f}s, "
             f"final_action={final_action_time_s:.3f}s, "
+            f"placement={placement} "
             f"due={due_s:.3f}s, "
             f"late={late_s:.3f}s)",
             flush=True,
@@ -1660,15 +1708,23 @@ def wait_for_dynamic_final_action(
         return 0.0
     print(
         "Dynamic final timing: waiting "
-        f"{wait_s:.3f}s at preposition "
+        f"{wait_s:.3f}s {placement_text} "
         f"(t_arrive={timing.t_arrive_s:.3f}s, "
         f"elapsed={elapsed_s:.3f}s, "
         f"final_action={final_action_time_s:.3f}s, "
+        f"placement={placement} "
         f"due={due_s:.3f}s)",
         flush=True,
     )
     time.sleep(wait_s)
     return wait_s
+
+
+def use_dynamic_nowait(args: argparse.Namespace) -> bool:
+    return bool(
+        getattr(args, "dynamic_preposition", False)
+        and getattr(args, "dynamic_wait_placement", "wait") == "nowait"
+    )
 
 
 def execute_guarded_descent(
@@ -1931,8 +1987,13 @@ def yolo_metadata_from_message(message: dict[str, Any]) -> dict[str, Any]:
         "mask_area_px",
         "mask_centroid_u",
         "mask_centroid_v",
+        "mask_top_u",
+        "mask_top_v",
         "mask_depth_median_m",
         "mask_depth_valid_count",
+        "detected_top_x_mm",
+        "detected_top_y_mm",
+        "detected_top_z_mm",
     ):
         if payload.get(key) is not None:
             value = payload[key]
@@ -2053,7 +2114,8 @@ def print_plan(
                 f"z={preposition_pose.z_mm:.3f}mm "
                 f"source={preposition_source} "
                 f"clearance={args.dynamic_preposition_clearance_mm:.3f}mm "
-                f"final_action={args.final_action_time_s:.3f}s",
+                f"final_action={args.final_action_time_s:.3f}s "
+                f"wait_placement={args.dynamic_wait_placement}",
                 flush=True,
             )
     for index, step in enumerate(plan.steps, start=1):
@@ -3163,6 +3225,7 @@ def execute_dynamic_preposition_plan(
         pitch_source_x_mm=preposition_pitch_x_mm,
         planar_ik=use_preposition_ik,
     )
+    nowait = use_dynamic_nowait(args)
 
     counts[ready_step.label] = execute_and_record_step(
         controller,
@@ -3173,6 +3236,19 @@ def execute_dynamic_preposition_plan(
         planar_ik_results,
         planar_ik_reuse_state,
     )
+    ready_elapsed_s = time.monotonic() - started_s
+    final_action_due_s = timing.t_arrive_s - float(args.final_action_time_s)
+    final_wait_s = 0.0
+    final_action_late_s = max(0.0, ready_elapsed_s - final_action_due_s)
+    if nowait:
+        final_wait_s = wait_for_dynamic_final_action(
+            timing,
+            elapsed_s=ready_elapsed_s,
+            final_action_time_s=float(args.final_action_time_s),
+            placement="nowait",
+        )
+        final_action_late_s = max(0.0, ready_elapsed_s - final_action_due_s)
+
     counts[pick_above_step.label] = execute_and_record_step(
         controller,
         args,
@@ -3193,13 +3269,14 @@ def execute_dynamic_preposition_plan(
     )
 
     preposition_elapsed_s = time.monotonic() - started_s
-    final_action_due_s = timing.t_arrive_s - float(args.final_action_time_s)
-    final_wait_s = wait_for_dynamic_final_action(
-        timing,
-        elapsed_s=preposition_elapsed_s,
-        final_action_time_s=float(args.final_action_time_s),
-    )
-    final_action_late_s = max(0.0, preposition_elapsed_s - final_action_due_s)
+    if not nowait:
+        final_wait_s = wait_for_dynamic_final_action(
+            timing,
+            elapsed_s=preposition_elapsed_s,
+            final_action_time_s=float(args.final_action_time_s),
+            placement="wait",
+        )
+        final_action_late_s = max(0.0, preposition_elapsed_s - final_action_due_s)
 
     guarded_result: GuardedDescentResult | None = None
     if args.guarded_descent:
@@ -3462,7 +3539,10 @@ def handle_message(
             "planar_ik_grasp_z_comp_mm_per_deg": (
                 args.planar_ik_grasp_z_comp_mm_per_deg
             ),
-            "fixed_grasp_z_floor_mm": args.grasp_z_mm if args.use_detected_z else None,
+            "detected_z_mode": detected_z_mode(args),
+            "fixed_grasp_z_floor_mm": (
+                args.grasp_z_mm if detected_z_mode(args) != "off" else None
+            ),
             "place_x_mm": args.place_x_mm,
             "place_y_mm": args.place_y_mm,
             "place_pick_pose": pose_to_dict(place_pick_pose(args)),
@@ -3569,6 +3649,7 @@ def handle_message(
             "t_wait_s": timing.t_wait_s,
             "dynamic_preposition": timing.dynamic_preposition,
             "final_action_time_s": timing.final_action_time_s,
+            "wait_placement": timing.wait_placement,
             "skipped": timing.skipped,
             "skip_reason": timing.skip_reason,
             "conveyor_speed_mm_s": command.conveyor_speed_mm_s,
@@ -3577,9 +3658,13 @@ def handle_message(
             "detected_x_mm": command.detected_x_mm,
             "detected_y_mm": command.detected_y_mm,
             "detected_z_mm": command.detected_z_mm,
+            "detected_top_x_mm": command.detected_top_x_mm,
+            "detected_top_y_mm": command.detected_top_y_mm,
+            "detected_top_z_mm": command.detected_top_z_mm,
         }
         dynamic_execution: dict[str, Any] = {
             "preposition_enabled": bool(args.dynamic_preposition),
+            "wait_placement": args.dynamic_wait_placement,
             "guarded_descent_enabled": bool(args.guarded_descent),
             "preposition_z_mm": execution.preposition_z_mm,
             "preposition_source": execution.preposition_source,
