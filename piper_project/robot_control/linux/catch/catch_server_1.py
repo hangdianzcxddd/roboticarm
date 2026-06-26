@@ -207,6 +207,7 @@ class GraspYawAdjustmentResult:
     current_j6_deg: float | None = None
     delta_deg: float | None = None
     clamped: bool = False
+    limit_clamped: bool = False
     start_joints_deg: tuple[float, float, float, float, float, float] | None = None
     target_joints_deg: tuple[float, float, float, float, float, float] | None = None
     send_count: int = 0
@@ -2534,6 +2535,7 @@ def grasp_yaw_adjustment_to_dict(result: GraspYawAdjustmentResult) -> dict[str, 
         "current_j6_deg": result.current_j6_deg,
         "delta_deg": result.delta_deg,
         "clamped": result.clamped,
+        "limit_clamped": result.limit_clamped,
         "start_joints_deg": (
             None if result.start_joints_deg is None else list(result.start_joints_deg)
         ),
@@ -3227,7 +3229,40 @@ def apply_grasp_yaw_adjustment(
 
     max_delta_deg = float(args.grasp_yaw_max_delta_deg)
     delta_deg = min(max_delta_deg, max(-max_delta_deg, raw_delta_deg))
-    clamped = not math.isclose(delta_deg, raw_delta_deg, rel_tol=0.0, abs_tol=1e-9)
+    delta_clamped = not math.isclose(
+        delta_deg,
+        raw_delta_deg,
+        rel_tol=0.0,
+        abs_tol=1e-9,
+    )
+    joint6_limit = controller.config.joint_limits_rad[5]
+    margin_rad = math.radians(0.1)
+    min_j6_deg = math.degrees(joint6_limit.min_value + margin_rad)
+    max_j6_deg = math.degrees(joint6_limit.max_value - margin_rad)
+    requested_j6_deg = current_j6_deg + delta_deg
+    target_j6_deg = min(max_j6_deg, max(min_j6_deg, requested_j6_deg))
+    limit_clamped = not math.isclose(
+        target_j6_deg,
+        requested_j6_deg,
+        rel_tol=0.0,
+        abs_tol=1e-9,
+    )
+    delta_deg = target_j6_deg - current_j6_deg
+    if abs(delta_deg) <= float(args.grasp_yaw_deadband_deg):
+        return GraspYawAdjustmentResult(
+            enabled=True,
+            applied=False,
+            reason="within_joint6_limit_deadband" if limit_clamped else "within_deadband",
+            source_yaw_deg=float(source_yaw),
+            target_yaw_deg=target_yaw_deg,
+            current_j6_deg=current_j6_deg,
+            delta_deg=0.0,
+            clamped=delta_clamped,
+            limit_clamped=limit_clamped,
+            start_joints_deg=start_joints_deg,  # type: ignore[arg-type]
+            target_joints_deg=start_joints_deg,  # type: ignore[arg-type]
+        )
+    clamped = delta_clamped or limit_clamped
     target_joints = list(current_joints)
     target_joints[5] += math.radians(delta_deg)
     controller.validate_joints(target_joints)
@@ -3240,7 +3275,8 @@ def apply_grasp_yaw_adjustment(
         f"current_j6={current_j6_deg:.3f}deg "
         f"delta={delta_deg:.3f}deg "
         f"raw_delta={raw_delta_deg:.3f}deg "
-        f"clamped={clamped}",
+        f"clamped={clamped} "
+        f"limit_clamped={limit_clamped}",
         flush=True,
     )
     send_count = execute_joints_for_duration(
@@ -3258,6 +3294,7 @@ def apply_grasp_yaw_adjustment(
         current_j6_deg=current_j6_deg,
         delta_deg=delta_deg,
         clamped=clamped,
+        limit_clamped=limit_clamped,
         start_joints_deg=start_joints_deg,  # type: ignore[arg-type]
         target_joints_deg=joints_rad_to_deg(target_joints),
         send_count=send_count,

@@ -948,6 +948,41 @@ class TestCatchServer1(unittest.TestCase):
         self.assertTrue(result.applied)
         self.assertAlmostEqual(result.delta_deg, -10.0)
 
+    def test_grasp_yaw_adjustment_clamps_to_joint6_limits(self):
+        args = make_args(
+            grasp_yaw_by_object_short_edge=True,
+            grasp_yaw_max_delta_deg=45.0,
+            grasp_yaw_deadband_deg=0.0,
+            command_duration_s=0.0,
+        )
+        command = CameraPointCommand(
+            x_m=0.35,
+            y_m=0.02,
+            z_m=0.30,
+            command_id="cmd-yaw-limit",
+            object_short_axis_yaw_deg=-150.0,
+        )
+        target = target_from_command(command, np.eye(4, dtype=float), args)
+        controller = make_controller()
+        controller.sdk.joint_feedback = joint_feedback_from_degrees(
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            -119.0,
+        )
+
+        result = apply_grasp_yaw_adjustment(controller, args, target)
+
+        self.assertTrue(result.applied)
+        self.assertTrue(result.clamped)
+        self.assertTrue(result.limit_clamped)
+        self.assertAlmostEqual(result.delta_deg, -0.9)
+        joint_calls = [call for call in controller.sdk.calls if call[0] == "JointCtrl"]
+        self.assertEqual(len(joint_calls), 1)
+        self.assertAlmostEqual(joint_calls[0][1][5], -119900, delta=1)
+
     def test_execute_plan_applies_grasp_yaw_after_grasp_pose_before_close(self):
         args = make_args(
             execute=True,
