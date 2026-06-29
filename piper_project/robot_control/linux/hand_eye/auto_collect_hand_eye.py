@@ -106,6 +106,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--motion-timeout-s", type=float, default=8.0)
     parser.add_argument("--position-tolerance-mm", type=float, default=5.0)
     parser.add_argument("--orientation-tolerance-deg", type=float, default=5.0)
+    parser.add_argument(
+        "--post-move-stabilize-s",
+        type=float,
+        default=0.5,
+        help=(
+            "extra time to wait after a candidate pose is reached before reading "
+            "robot feedback and requesting chessboard detection"
+        ),
+    )
     parser.add_argument("--settle-s", type=float, default=0.4)
     parser.add_argument("--read-timeout-s", type=float, default=2.0)
     parser.add_argument("--min-dof", type=int, default=1)
@@ -185,6 +194,7 @@ def main() -> None:
             print("Dry run only. Add --execute to move and collect samples.")
             return
 
+        initialize_output(args, samples)
         bounds = pose_bounds_from_seed(seed_pose, args)
         step_limits = PoseStepLimits(
             x_mm=args.step_x_mm,
@@ -226,6 +236,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--position-tolerance-mm must be > 0")
     if args.orientation_tolerance_deg <= 0:
         raise SystemExit("--orientation-tolerance-deg must be > 0")
+    if args.post_move_stabilize_s < 0:
+        raise SystemExit("--post-move-stabilize-s must be >= 0")
     if args.settle_s < 0:
         raise SystemExit("--settle-s must be >= 0")
     if args.read_timeout_s <= 0:
@@ -317,6 +329,7 @@ def collect_samples(
         )
         try:
             move_to_pose(controller, candidate.pose, args)
+            wait_after_motion(args)
             actual_pose = read_fresh_end_pose(
                 controller,
                 timeout_s=args.read_timeout_s,
@@ -403,6 +416,30 @@ def collect_samples(
     print(f"Completed automatic hand-eye collection: {args.output}", flush=True)
 
 
+def initialize_output(args: argparse.Namespace, samples: list[HandEyeSample]) -> None:
+    if args.overwrite and not samples:
+        write_json(
+            args.output,
+            make_samples_document(
+                samples,
+                mode=args.mode,
+                can_name=args.can,
+                notes=args.notes,
+            ),
+        )
+        print(f"Initialized fresh sample file: {args.output}", flush=True)
+
+
+def wait_after_motion(args: argparse.Namespace) -> None:
+    if args.post_move_stabilize_s <= 0.0:
+        return
+    print(
+        f"Waiting {args.post_move_stabilize_s:.3f}s for post-move stabilization.",
+        flush=True,
+    )
+    time.sleep(args.post_move_stabilize_s)
+
+
 def random_candidate(
     rng: random.Random,
     base_pose: EndPose,
@@ -414,7 +451,6 @@ def random_candidate(
     shrink: float,
     attempt: int,
 ) -> CandidateResult:
-    del attempt
     fields = tuple(rng.sample(POSE_FIELDS, rng.randint(min_dof, max_dof)))
     values = pose_to_values(base_pose)
     for field in fields:
