@@ -14,6 +14,7 @@ from robot_control.linux.catch.catch_server_2 import (
     handle_message,
     move_to_start_ready,
     ready_pose,
+    resolve_ready_pose_override,
     resolve_initial_pose,
     server_1_motion_args,
     validate_eye_in_hand_args,
@@ -115,6 +116,107 @@ def test_ready_pose_args_source_does_not_recurse_when_patched_into_server_1():
         ry_deg=args.ry_deg,
         rz_deg=args.rz_deg,
     )
+
+
+def test_ready_pose_source_initial_reuses_configured_initial_pose_for_sequence_ready():
+    args = build_parser().parse_args(
+        [
+            "--ready-pose-source",
+            "initial",
+            "--initial-pose-source",
+            "configured",
+            "--initial-pose-x-mm",
+            "272.949",
+            "--initial-pose-y-mm",
+            "0",
+            "--initial-pose-z-mm",
+            "341.089",
+            "--initial-pose-rx-deg",
+            "-160.249",
+            "--initial-pose-ry-deg",
+            "5.355",
+            "--initial-pose-rz-deg",
+            "-104.572",
+            "--capture-pose-source",
+            "configured",
+            "--capture-x-mm",
+            "350",
+            "--capture-y-mm",
+            "0",
+            "--capture-z-mm",
+            "0",
+            "--capture-rx-deg",
+            "0",
+            "--capture-ry-deg",
+            "0",
+            "--capture-rz-deg",
+            "0",
+        ]
+    )
+    validate_eye_in_hand_args(args)
+    ready_override = resolve_ready_pose_override(args, None)
+
+    assert ready_override == EndPose(
+        x_mm=272.949,
+        y_mm=0.0,
+        z_mm=341.089,
+        rx_deg=-160.249,
+        ry_deg=5.355,
+        rz_deg=-104.572,
+    )
+    camera_to_gripper = np.eye(4, dtype=float)
+    validator = make_controller()
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        response = handle_message(
+            make_camera_point_message(
+                CameraPointCommand(
+                    x_m=0.0,
+                    y_m=0.0,
+                    z_m=0.0,
+                    command_id="cmd-ready-initial",
+                )
+            ),
+            args=args,
+            camera_to_gripper=camera_to_gripper,
+            validator=validator,
+            pose_reader=None,
+            controller=None,
+        )
+
+    by_label = {step["label"]: step for step in response["payload"]["steps"]}
+    assert by_label["ready_open"]["pose"] == {
+        "x_mm": 272.949,
+        "y_mm": 0.0,
+        "z_mm": 341.089,
+        "rx_deg": -160.249,
+        "ry_deg": 5.355,
+        "rz_deg": -104.572,
+    }
+    assert by_label["return_ready"]["pose"] == by_label["ready_open"]["pose"]
+    assert response["payload"]["target_orientation_deg"] == {
+        "rx_deg": args.rx_deg,
+        "ry_deg": args.ry_deg,
+        "rz_deg": args.rz_deg,
+    }
+
+
+def test_ready_pose_source_initial_rejects_initial_pose_source_ready_cycle():
+    args = build_parser().parse_args(
+        [
+            "--ready-pose-source",
+            "initial",
+            "--initial-pose-source",
+            "ready",
+        ]
+    )
+
+    try:
+        validate_eye_in_hand_args(args)
+    except ValueError as exc:
+        assert "--ready-pose-source initial" in str(exc)
+    else:
+        raise AssertionError("expected ready/initial cycle validation error")
 
 
 def test_eye_in_hand_parser_rejects_guarded_descent_options():
@@ -295,8 +397,86 @@ def test_eye_in_hand_planar_ik_far_x_uses_planar_ik_pick_steps():
     assert by_label["pick_above"]["planar_ik"] is True
     assert by_label["pick_grasp"]["planar_ik"] is True
     assert by_label["pick_lift"]["planar_ik"] is True
+    assert all(
+        not step["planar_ik"]
+        for step in payload["steps"]
+        if step["label"] in ("return_ready", "return_ready_above")
+    )
     assert "pick_grasp_guard_start" not in by_label
     assert "guarded_execution" not in payload
+
+
+def test_eye_in_hand_far_planar_ik_does_not_use_ik_for_initial_ready_return():
+    args = build_parser().parse_args(
+        [
+            "--ready-pose-source",
+            "initial",
+            "--initial-pose-source",
+            "configured",
+            "--initial-pose-x-mm",
+            "272.949",
+            "--initial-pose-y-mm",
+            "0",
+            "--initial-pose-z-mm",
+            "341.089",
+            "--initial-pose-rx-deg",
+            "-160.249",
+            "--initial-pose-ry-deg",
+            "5.355",
+            "--initial-pose-rz-deg",
+            "-104.572",
+            "--adaptive-joint-pitch-by-x",
+            "--keep-pitch-min-x-mm",
+            "300",
+            "--keep-pitch-max-x-mm",
+            "380",
+            "--max-target-x-mm",
+            "450",
+            "--grasp-only",
+            "--capture-pose-source",
+            "configured",
+            "--capture-x-mm",
+            "400",
+            "--capture-y-mm",
+            "0",
+            "--capture-z-mm",
+            "0",
+            "--capture-rx-deg",
+            "0",
+            "--capture-ry-deg",
+            "0",
+            "--capture-rz-deg",
+            "0",
+        ]
+    )
+    validate_eye_in_hand_args(args)
+    resolve_ready_pose_override(args, None)
+    camera_to_gripper = np.eye(4, dtype=float)
+    validator = make_controller()
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        response = handle_message(
+            make_camera_point_message(
+                CameraPointCommand(
+                    x_m=0.0,
+                    y_m=0.0,
+                    z_m=0.0,
+                    command_id="cmd-far-ready-return",
+                )
+            ),
+            args=args,
+            camera_to_gripper=camera_to_gripper,
+            validator=validator,
+            pose_reader=None,
+            controller=None,
+        )
+
+    by_label = {step["label"]: step for step in response["payload"]["steps"]}
+    assert by_label["pick_above"]["planar_ik"] is True
+    assert by_label["pick_grasp"]["planar_ik"] is True
+    assert by_label["pick_lift"]["planar_ik"] is True
+    assert by_label["return_ready"]["planar_ik"] is False
+    assert by_label["return_ready"]["pose"] == by_label["ready_open"]["pose"]
 
 
 def test_eye_in_hand_use_detected_z_top_uses_command_top_z_plus_offset():

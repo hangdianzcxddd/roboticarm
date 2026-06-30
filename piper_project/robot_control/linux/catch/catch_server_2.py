@@ -81,6 +81,7 @@ _SERVER_1_NO_GUARDED_DESCENT_DEFAULTS = {
     "guarded_progress_min_mm": 1.0,
     "guarded_step_timeout_s": 0.25,
     "guarded_abort_return": "none",
+    "disable_ready_planar_ik_return": True,
 }
 
 
@@ -149,13 +150,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--capture-rz-deg", type=float)
     parser.add_argument(
         "--ready-pose-source",
-        choices=("args", "current", "configured"),
+        choices=("args", "current", "configured", "initial"),
         default="args",
         help=(
             "pose used for ready_open/return_ready, and for startup when "
             "--initial-pose-source=ready. args keeps catch_server_1 --ready-* "
             "plus fixed orientation; current reads the pose at server startup; "
-            "configured uses --ready-pose-* values."
+            "configured uses --ready-pose-* values; initial reuses the resolved "
+            "--initial-pose-source pose as the per-grasp ready pose."
         ),
     )
     parser.add_argument("--ready-pose-read-timeout-s", type=float, default=1.0)
@@ -246,6 +248,11 @@ def validate_eye_in_hand_args(args: argparse.Namespace) -> None:
         raise ValueError("--ready-pose-read-timeout-s must be > 0")
     if args.ready_pose_settle_s < 0.0:
         raise ValueError("--ready-pose-settle-s must be >= 0")
+    if args.ready_pose_source == "initial" and args.initial_pose_source == "ready":
+        raise ValueError(
+            "--ready-pose-source initial requires --initial-pose-source current "
+            "or configured"
+        )
     if args.ready_pose_source == "configured":
         missing = [
             name
@@ -334,7 +341,9 @@ def resolve_ready_pose_override(
     if args.ready_pose_source == "args":
         args.eye_in_hand_ready_pose_override = False
         return None
-    if args.ready_pose_source == "configured":
+    if args.ready_pose_source == "initial":
+        pose, _ = resolve_initial_pose(args, controller)
+    elif args.ready_pose_source == "configured":
         pose = configured_ready_pose(args)
     else:
         if controller is None:
@@ -363,12 +372,14 @@ def ready_pose(args: argparse.Namespace) -> EndPose:
 
 def resolve_initial_pose(
     args: argparse.Namespace,
-    controller: PiperController,
+    controller: PiperController | None,
 ) -> tuple[EndPose, str]:
     if args.initial_pose_source == "ready":
         return ready_pose(args), "ready_pose"
     if args.initial_pose_source == "configured":
         return configured_initial_pose(args), "configured_pose"
+    if controller is None:
+        raise RuntimeError("--initial-pose-source current requires a controller")
     pose = read_fresh_end_pose(
         controller,
         timeout_s=float(args.initial_pose_read_timeout_s),

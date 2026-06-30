@@ -1154,6 +1154,8 @@ def fixed_pitch_source_x_mm(args: argparse.Namespace) -> float:
 
 
 def far_planar_transfer_via_ready(args: argparse.Namespace, pitch_source_x_mm: float) -> bool:
+    if getattr(args, "disable_ready_planar_ik_return", False):
+        return False
     return use_planar_ik(args, pitch_source_x_mm)
 
 
