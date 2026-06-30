@@ -1384,7 +1384,7 @@ class TestCatchServer1(unittest.TestCase):
         self.assertLess(call_order.index("wait"), call_order.index("dynamic_preposition"))
         self.assertLess(call_order.index("dynamic_preposition"), call_order.index("pick_grasp"))
 
-    def test_execute_dynamic_preposition_guarded_descent_abort_returns_above(self):
+    def test_execute_dynamic_preposition_guarded_descent_abort_stops_without_return(self):
         args = make_args(
             execute=True,
             grasp_only=True,
@@ -1434,9 +1434,9 @@ class TestCatchServer1(unittest.TestCase):
             "height did not decrease",
             response["payload"]["protected_abort_reason"],
         )
-        self.assertEqual(
-            response["payload"]["dynamic_execution"]["protected_abort_return"],
-            "pick_above",
+        self.assertIsNone(response["payload"]["dynamic_execution"]["protected_abort_return"])
+        self.assertIsNone(
+            response["payload"]["dynamic_execution"]["protected_abort_return_label"]
         )
         self.assertEqual(
             response["payload"]["dynamic_execution"]["guarded_descent"]["send_count"],
@@ -1449,7 +1449,6 @@ class TestCatchServer1(unittest.TestCase):
                 "pick_above",
                 "dynamic_preposition",
                 "pick_grasp",
-                "protected_abort_return_pick_above",
             },
         )
         gripper_calls = [call for call in controller.sdk.calls if call[0] == "GripperCtrl"]
@@ -1457,18 +1456,15 @@ class TestCatchServer1(unittest.TestCase):
             gripper_calls,
             [
                 ("GripperCtrl", (0, 1000, 0x01, 0)),
-                ("GripperCtrl", (0, 1000, 0x01, 0)),
             ],
         )
-        abort_index = controller.sdk.calls.index(
-            ("EndPoseCtrl", (350000, -30000, 253252, -176794, 889, -105491))
+        self.assertEqual(
+            controller.sdk.calls.count(
+                ("EndPoseCtrl", (350000, -30000, 253252, -176794, 889, -105491))
+            ),
+            1,
         )
-        second_open_index = [
-            index
-            for index, call in enumerate(controller.sdk.calls)
-            if call == ("GripperCtrl", (0, 1000, 0x01, 0))
-        ][1]
-        self.assertLess(abort_index, second_open_index)
+        self.assertEqual(controller.sdk.calls[-1], ("EmergencyStop", (0x01,)))
 
     def test_guarded_descent_progress_check_aborts_when_feedback_z_stalls(self):
         args = make_args(
@@ -1531,7 +1527,6 @@ class TestCatchServer1(unittest.TestCase):
                 "pick_above",
                 "dynamic_preposition",
                 "pick_grasp",
-                "protected_abort_return_pick_above",
             },
         )
 
@@ -2396,9 +2391,9 @@ class TestCatchServer1(unittest.TestCase):
             "height did not decrease",
             response["payload"]["protected_abort_reason"],
         )
-        self.assertEqual(
-            response["payload"]["guarded_execution"]["protected_abort_return"],
-            "pick_above",
+        self.assertIsNone(response["payload"]["guarded_execution"]["protected_abort_return"])
+        self.assertIsNone(
+            response["payload"]["guarded_execution"]["protected_abort_return_label"]
         )
         self.assertEqual(
             set(response["payload"]["send_counts"].keys()),
@@ -2407,7 +2402,6 @@ class TestCatchServer1(unittest.TestCase):
                 "pick_above",
                 "pick_grasp_guard_start",
                 "pick_grasp",
-                "protected_abort_return_pick_above",
             },
         )
         gripper_calls = [call for call in controller.sdk.calls if call[0] == "GripperCtrl"]
@@ -2415,18 +2409,15 @@ class TestCatchServer1(unittest.TestCase):
             gripper_calls,
             [
                 ("GripperCtrl", (0, 1000, 0x01, 0)),
-                ("GripperCtrl", (0, 1000, 0x01, 0)),
             ],
         )
-        abort_index = controller.sdk.calls.index(
-            ("EndPoseCtrl", (250000, 0, 253252, -176794, 889, -105491))
+        self.assertEqual(
+            controller.sdk.calls.count(
+                ("EndPoseCtrl", (250000, 0, 253252, -176794, 889, -105491))
+            ),
+            1,
         )
-        second_open_index = [
-            index
-            for index, call in enumerate(controller.sdk.calls)
-            if call == ("GripperCtrl", (0, 1000, 0x01, 0))
-        ][1]
-        self.assertLess(abort_index, second_open_index)
+        self.assertEqual(controller.sdk.calls[-1], ("EmergencyStop", (0x01,)))
 
     def test_startup_ready_uses_continuous_sequence_initial_pose(self):
         args = make_args()

@@ -153,10 +153,11 @@ class YoloGraspSender:
         grasp_mode: GraspRunMode = "static",
         t_arrive_s: float | None = None,
         conveyor_speed_mm_s: float | None = None,
-        pick_x_mm: float | None = None,
-        pick_y_mm: float | None = None,
-        detected_xyz_mm: tuple[float, float, float] | None = None,
-    ) -> dict[str, Any]:
+    pick_x_mm: float | None = None,
+    pick_y_mm: float | None = None,
+    detected_xyz_mm: tuple[float, float, float] | None = None,
+    detected_top_camera_xyz_m: tuple[float, float, float] | None = None,
+) -> dict[str, Any]:
         task = self.task if task is None else task
         command = camera_point_command_from_target(
             target,
@@ -168,6 +169,7 @@ class YoloGraspSender:
             pick_x_mm=pick_x_mm,
             pick_y_mm=pick_y_mm,
             detected_xyz_mm=detected_xyz_mm,
+            detected_top_camera_xyz_m=detected_top_camera_xyz_m,
         )
         if self.dry_run:
             return {"type": "dry_run", "payload": command_payload(command)}
@@ -753,6 +755,7 @@ def camera_point_command_from_target(
     pick_x_mm: float | None = None,
     pick_y_mm: float | None = None,
     detected_xyz_mm: tuple[float, float, float] | None = None,
+    detected_top_camera_xyz_m: tuple[float, float, float] | None = None,
 ) -> CameraPointCommand:
     detection = target.detection
     detected_x_mm = None
@@ -760,6 +763,15 @@ def camera_point_command_from_target(
     detected_z_mm = None
     if detected_xyz_mm is not None:
         detected_x_mm, detected_y_mm, detected_z_mm = detected_xyz_mm
+    detected_top_camera_x_m = None
+    detected_top_camera_y_m = None
+    detected_top_camera_z_m = None
+    if detected_top_camera_xyz_m is not None:
+        (
+            detected_top_camera_x_m,
+            detected_top_camera_y_m,
+            detected_top_camera_z_m,
+        ) = detected_top_camera_xyz_m
     return CameraPointCommand(
         x_m=target.send_point.x_m,
         y_m=target.send_point.y_m,
@@ -787,6 +799,9 @@ def camera_point_command_from_target(
         detected_x_mm=detected_x_mm,
         detected_y_mm=detected_y_mm,
         detected_z_mm=detected_z_mm,
+        detected_top_camera_x_m=detected_top_camera_x_m,
+        detected_top_camera_y_m=detected_top_camera_y_m,
+        detected_top_camera_z_m=detected_top_camera_z_m,
     )
 
 

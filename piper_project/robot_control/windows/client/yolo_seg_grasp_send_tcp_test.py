@@ -204,6 +204,8 @@ class TestYoloSegGraspSendTcp(unittest.TestCase):
         self.assertAlmostEqual(targets[0].mask_top_u, 3.5)
         self.assertAlmostEqual(targets[0].mask_top_v, 2.0)
         self.assertIsNotNone(targets[0].top_point)
+        assert targets[0].top_point is not None
+        self.assertAlmostEqual(targets[0].top_point.z_m, 0.50)
         assert targets[0].top_base_xyz_mm is not None
         self.assertAlmostEqual(targets[0].top_base_xyz_mm[2], 500.0)
 
@@ -243,6 +245,20 @@ class TestYoloSegGraspSendTcp(unittest.TestCase):
                 ),
             ),
             mask_depth_valid_count=9,
+            top_point=deproject_pixel_with_depth(
+                FakeDepthFrame(np.full((6, 6), 0.42, dtype=np.float32)),
+                3,
+                1,
+                0.42,
+                intrinsics=PinholeIntrinsics(
+                    width=6,
+                    height=6,
+                    fx=100.0,
+                    fy=100.0,
+                    ppx=3.0,
+                    ppy=3.0,
+                ),
+            ),
         )
 
         command = camera_point_command_from_target(
@@ -261,6 +277,7 @@ class TestYoloSegGraspSendTcp(unittest.TestCase):
         self.assertAlmostEqual(parsed.mask_centroid_v, seg.centroid_v)
         self.assertAlmostEqual(parsed.mask_depth_median_m, 0.45)
         self.assertEqual(parsed.mask_depth_valid_count, 9)
+        self.assertAlmostEqual(parsed.detected_top_camera_z_m, 0.42)
 
     def test_sender_dry_run_returns_payload_without_network(self):
         mask = np.zeros((4, 4), dtype=bool)

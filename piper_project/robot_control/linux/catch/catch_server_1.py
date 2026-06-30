@@ -437,8 +437,8 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("pick_above", "preposition", "none"),
         default="pick_above",
         help=(
-            "pose to return to after guarded descent abort; pick_above returns "
-            "to transfer_z, preposition returns to the dynamic preposition pose"
+            "legacy abort-return selection. Guarded descent aborts now stop "
+            "the sequence without issuing an automatic return pose."
         ),
     )
     parser.add_argument(
@@ -1885,11 +1885,7 @@ def execute_guarded_descent(
                 flush=True,
             )
         if aborted:
-            controller.move_to_pose(
-                start_pose,
-                speed_percent=args.speed,
-                move_mode=args.vertical_mode,
-            )
+            controller.emergency_stop()
             return GuardedDescentResult(
                 send_count=send_count,
                 start_z_mm=start_z_mm,
@@ -3372,32 +3368,10 @@ def execute_plan(
             if guarded_result.aborted:
                 reason = guarded_result.reason or "guarded descent aborted"
                 print(f"Protected abort: {reason}", flush=True)
-                abort_step = guarded_abort_return_step(
-                    args,
-                    plan.steps,
-                    index,
-                    guarded_start_pose,
-                )
-                abort_return, abort_return_label = execute_protected_abort_return(
-                    controller,
-                    args,
-                    counts,
-                    gripper_results,
-                    joint_pitch_adjustments,
-                    planar_ik_results,
-                    abort_step,
-                    planar_ik_reuse_state,
-                )
-                record_gripper_result(
-                    gripper_results,
-                    send_gripper(controller, args, "open"),
-                )
                 return DynamicExecutionResult(
                     send_counts=counts,
                     protected_abort=True,
                     protected_abort_reason=reason,
-                    protected_abort_return=abort_return,
-                    protected_abort_return_label=abort_return_label,
                     guarded_descent=guarded_result,
                     safe_gripper_results=tuple(gripper_results),
                     joint_pitch_adjustments=tuple(joint_pitch_adjustments),
@@ -3550,31 +3524,10 @@ def execute_dynamic_preposition_plan(
         if guarded_result.aborted:
             reason = guarded_result.reason or "guarded descent aborted"
             print(f"Protected abort: {reason}", flush=True)
-            abort_step, abort_return_label = dynamic_protected_abort_return_step(
-                args,
-                pick_above_pose=pick_above_step.pose,
-                preposition_pose=preposition_pose,
-            )
-            _, abort_return_step_label = execute_protected_abort_return(
-                controller,
-                args,
-                counts,
-                gripper_results,
-                joint_pitch_adjustments,
-                planar_ik_results,
-                abort_step,
-                planar_ik_reuse_state,
-            )
-            record_gripper_result(
-                gripper_results,
-                send_gripper(controller, args, "open"),
-            )
             return DynamicExecutionResult(
                 send_counts=counts,
                 protected_abort=True,
                 protected_abort_reason=reason,
-                protected_abort_return=abort_return_label,
-                protected_abort_return_label=abort_return_step_label,
                 preposition_z_mm=preposition_pose.z_mm,
                 preposition_source=preposition_source,
                 preposition_elapsed_s=preposition_elapsed_s,

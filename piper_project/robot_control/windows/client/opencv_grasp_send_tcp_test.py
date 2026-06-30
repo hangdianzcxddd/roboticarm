@@ -133,6 +133,8 @@ class TestOpenCVGraspSendTcp(unittest.TestCase):
         self.assertAlmostEqual(payload["mask_depth_median_m"], 0.45, places=3)
         self.assertAlmostEqual(payload["mask_top_u"], 8.5)
         self.assertAlmostEqual(payload["mask_top_v"], 5.0)
+        self.assertIsNone(payload["detected_top_z_mm"])
+        self.assertAlmostEqual(payload["detected_top_camera_z_m"], 0.45, places=3)
 
     def test_segments_include_top_base_z_when_hand_eye_is_available(self):
         frame = green_frame(20, 20)

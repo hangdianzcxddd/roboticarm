@@ -181,6 +181,7 @@ class TestYoloGraspSendTcp(unittest.TestCase):
             target,
             source="yolo_test",
             task="in",
+            detected_top_camera_xyz_m=(0.11, -0.03, 0.50),
         )
 
         self.assertEqual(command.u, 11)
@@ -193,6 +194,9 @@ class TestYoloGraspSendTcp(unittest.TestCase):
         self.assertEqual(command.task, "in")
         self.assertEqual(command.rank, 2)
         self.assertEqual(command.label, "bottle")
+        self.assertAlmostEqual(command.detected_top_camera_x_m, 0.11)
+        self.assertAlmostEqual(command.detected_top_camera_y_m, -0.03)
+        self.assertAlmostEqual(command.detected_top_camera_z_m, 0.50)
         self.assertEqual(command.bbox_xywh, (20.0, 30.0, 60.0, 80.0))
 
     def test_dynamic_arrival_time_uses_y_distance_to_pick_line(self):

@@ -52,10 +52,70 @@ DEFAULT_EYE_IN_HAND_RESULT = (
     / "hand_eye"
     / "eye_in_hand_result_auto.json"
 )
+_CATCH_SERVER_1_READY_POSE = catch_server_1.ready_pose
+_GUARDED_DESCENT_OPTION_STRINGS = (
+    "--guarded-descent",
+    "--no-guarded-descent",
+    "--descent-protection",
+    "--no-descent-protection",
+    "--guarded-descent-zone-mm",
+    "--guarded-descent-step-mm",
+    "--guarded-descent-speed",
+    "--guarded-follow-error-mm",
+    "--guarded-stall-s",
+    "--guarded-start-tolerance-mm",
+    "--guarded-start-timeout-s",
+    "--guarded-progress-min-mm",
+    "--guarded-step-timeout-s",
+    "--guarded-abort-return",
+)
+_SERVER_1_NO_GUARDED_DESCENT_DEFAULTS = {
+    "guarded_descent": False,
+    "guarded_descent_zone_mm": 30.0,
+    "guarded_descent_step_mm": 3.0,
+    "guarded_descent_speed": 20,
+    "guarded_follow_error_mm": 4.0,
+    "guarded_stall_s": 0.2,
+    "guarded_start_tolerance_mm": 2.0,
+    "guarded_start_timeout_s": 1.0,
+    "guarded_progress_min_mm": 1.0,
+    "guarded_step_timeout_s": 0.25,
+    "guarded_abort_return": "none",
+}
+
+
+def remove_parser_option_strings(
+    parser: argparse.ArgumentParser,
+    option_strings: tuple[str, ...],
+) -> None:
+    actions = {
+        parser._option_string_actions[option_string]
+        for option_string in option_strings
+        if option_string in parser._option_string_actions
+    }
+    for action in actions:
+        for option_string in action.option_strings:
+            parser._option_string_actions.pop(option_string, None)
+        if action in parser._actions:
+            parser._actions.remove(action)
+        for group in parser._action_groups:
+            if action in group._group_actions:
+                group._group_actions.remove(action)
+        for group in parser._mutually_exclusive_groups:
+            if action in group._group_actions:
+                group._group_actions.remove(action)
+
+
+def configure_eye_in_hand_parser(parser: argparse.ArgumentParser) -> None:
+    remove_parser_option_strings(parser, _GUARDED_DESCENT_OPTION_STRINGS)
+    parser.set_defaults(
+        dynamic_pitch_mode="planar-ik",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = catch_server_1.build_parser()
+    configure_eye_in_hand_parser(parser)
     parser.description = (
         "Receive camera XYZ over TCP and run catch_server_1's grasp sequence "
         "using an eye-in-hand camera mounted on the gripper."
@@ -92,9 +152,10 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("args", "current", "configured"),
         default="args",
         help=(
-            "pose used for startup_ready/ready_open/return_ready. args keeps "
-            "catch_server_1 --ready-* plus fixed orientation; current reads the "
-            "pose at server startup; configured uses --ready-pose-* values."
+            "pose used for ready_open/return_ready, and for startup when "
+            "--initial-pose-source=ready. args keeps catch_server_1 --ready-* "
+            "plus fixed orientation; current reads the pose at server startup; "
+            "configured uses --ready-pose-* values."
         ),
     )
     parser.add_argument("--ready-pose-read-timeout-s", type=float, default=1.0)
@@ -105,11 +166,62 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ready-pose-rx-deg", type=float)
     parser.add_argument("--ready-pose-ry-deg", type=float)
     parser.add_argument("--ready-pose-rz-deg", type=float)
+    parser.add_argument(
+        "--initial-pose-source",
+        choices=("ready", "current", "configured"),
+        default="ready",
+        help=(
+            "pose used only for the execute-server startup move. ready keeps "
+            "the previous behavior and starts at the resolved ready pose; "
+            "current reads robot feedback at startup; configured uses "
+            "--initial-pose-* values."
+        ),
+    )
+    parser.add_argument("--initial-pose-read-timeout-s", type=float, default=1.0)
+    parser.add_argument("--initial-pose-settle-s", type=float, default=0.0)
+    parser.add_argument("--initial-pose-x-mm", type=float)
+    parser.add_argument("--initial-pose-y-mm", type=float)
+    parser.add_argument("--initial-pose-z-mm", type=float)
+    parser.add_argument("--initial-pose-rx-deg", type=float)
+    parser.add_argument("--initial-pose-ry-deg", type=float)
+    parser.add_argument("--initial-pose-rz-deg", type=float)
+    parser.add_argument(
+        "--target-x-offset-mm",
+        type=float,
+        default=0.0,
+        help="base-frame X offset added after eye-in-hand camera->base mapping",
+    )
+    parser.add_argument(
+        "--target-y-offset-mm",
+        type=float,
+        default=0.0,
+        help="base-frame Y offset added after eye-in-hand camera->base mapping",
+    )
+    parser.add_argument(
+        "--target-z-offset-mm",
+        type=float,
+        default=0.0,
+        help=(
+            "base-frame Z offset added after eye-in-hand camera->base mapping; "
+            "for fixed --grasp-z this affects mapped metadata/probe, not fixed grasp height"
+        ),
+    )
     return parser
 
 
+def server_1_motion_args(args: argparse.Namespace) -> argparse.Namespace:
+    values = vars(args).copy()
+    values.update(_SERVER_1_NO_GUARDED_DESCENT_DEFAULTS)
+    return argparse.Namespace(**values)
+
+
 def validate_eye_in_hand_args(args: argparse.Namespace) -> None:
-    catch_server_1.validate_args(args)
+    catch_server_1.normalize_dynamic_pitch_args(args)
+    catch_server_1.validate_args(server_1_motion_args(args))
+    for name in ("target_x_offset_mm", "target_y_offset_mm", "target_z_offset_mm"):
+        value = float(getattr(args, name))
+        if not np.isfinite(value):
+            raise ValueError(f"--{name.replace('_', '-')} must be finite")
     if args.capture_read_timeout_s <= 0.0:
         raise ValueError("--capture-read-timeout-s must be > 0")
     if args.capture_settle_s < 0.0:
@@ -150,6 +262,37 @@ def validate_eye_in_hand_args(args: argparse.Namespace) -> None:
         if missing:
             options = ", ".join("--" + name.replace("_", "-") for name in missing)
             raise ValueError(f"--ready-pose-source configured requires {options}")
+    if args.initial_pose_read_timeout_s <= 0.0:
+        raise ValueError("--initial-pose-read-timeout-s must be > 0")
+    if args.initial_pose_settle_s < 0.0:
+        raise ValueError("--initial-pose-settle-s must be >= 0")
+    for name in (
+        "initial_pose_x_mm",
+        "initial_pose_y_mm",
+        "initial_pose_z_mm",
+        "initial_pose_rx_deg",
+        "initial_pose_ry_deg",
+        "initial_pose_rz_deg",
+    ):
+        value = getattr(args, name)
+        if value is not None and not np.isfinite(float(value)):
+            raise ValueError(f"--{name.replace('_', '-')} must be finite")
+    if args.initial_pose_source == "configured":
+        missing = [
+            name
+            for name in (
+                "initial_pose_x_mm",
+                "initial_pose_y_mm",
+                "initial_pose_z_mm",
+                "initial_pose_rx_deg",
+                "initial_pose_ry_deg",
+                "initial_pose_rz_deg",
+            )
+            if getattr(args, name) is None
+        ]
+        if missing:
+            options = ", ".join("--" + name.replace("_", "-") for name in missing)
+            raise ValueError(f"--initial-pose-source configured requires {options}")
 
 
 def configured_ready_pose(args: argparse.Namespace) -> EndPose:
@@ -163,10 +306,21 @@ def configured_ready_pose(args: argparse.Namespace) -> EndPose:
     )
 
 
+def configured_initial_pose(args: argparse.Namespace) -> EndPose:
+    return EndPose(
+        float(args.initial_pose_x_mm),
+        float(args.initial_pose_y_mm),
+        float(args.initial_pose_z_mm),
+        float(args.initial_pose_rx_deg),
+        float(args.initial_pose_ry_deg),
+        float(args.initial_pose_rz_deg),
+    )
+
+
 def apply_ready_pose_override(args: argparse.Namespace, ready_pose: EndPose) -> None:
     args.ready_x_mm = float(ready_pose.x_mm)
     args.ready_y_mm = float(ready_pose.y_mm)
-    args.transfer_z_mm = float(ready_pose.z_mm)
+    args.eye_in_hand_ready_z_mm = float(ready_pose.z_mm)
     args.ready_rx_deg = float(ready_pose.rx_deg)
     args.ready_ry_deg = float(ready_pose.ry_deg)
     args.ready_rz_deg = float(ready_pose.rz_deg)
@@ -199,31 +353,50 @@ def ready_pose(args: argparse.Namespace) -> EndPose:
         return EndPose(
             float(args.ready_x_mm),
             float(args.ready_y_mm),
-            float(args.transfer_z_mm),
+            float(args.eye_in_hand_ready_z_mm),
             float(args.ready_rx_deg),
             float(args.ready_ry_deg),
             float(args.ready_rz_deg),
         )
-    return catch_server_1.ready_pose(args)
+    return _CATCH_SERVER_1_READY_POSE(args)
+
+
+def resolve_initial_pose(
+    args: argparse.Namespace,
+    controller: PiperController,
+) -> tuple[EndPose, str]:
+    if args.initial_pose_source == "ready":
+        return ready_pose(args), "ready_pose"
+    if args.initial_pose_source == "configured":
+        return configured_initial_pose(args), "configured_pose"
+    pose = read_fresh_end_pose(
+        controller,
+        timeout_s=float(args.initial_pose_read_timeout_s),
+        settle_s=float(args.initial_pose_settle_s),
+    )
+    return pose, "current_feedback"
 
 
 def move_to_start_ready(controller: PiperController, args: argparse.Namespace) -> int:
+    motion_args = server_1_motion_args(args)
+    pose, pose_source = resolve_initial_pose(args, controller)
     step = catch_server_1.SequenceStep(
         "startup_ready",
-        ready_pose(args),
-        args.transfer_mode,
+        pose,
+        motion_args.transfer_mode,
     )
     catch_server_1.validate_steps(controller, (step,))
     print(
-        "Moving to eye-in-hand startup ready pose: "
+        "Moving to eye-in-hand startup pose "
+        f"({pose_source}): "
         f"{catch_server_1.format_pose(step.pose)}",
         flush=True,
     )
     send_count, _ = catch_server_1.execute_step(
         controller,
-        args,
+        motion_args,
         step,
-        speed=args.startup_speed,
+        speed=motion_args.startup_speed,
     )
     return send_count
 
@@ -233,7 +406,7 @@ def capture_pose_for_message(
     pose_reader: PiperController | None,
 ) -> tuple[EndPose, str]:
     if args.capture_pose_source == "ready":
-        return catch_server_1.ready_pose(args), "ready_pose"
+        return ready_pose(args), "ready_pose"
     if args.capture_pose_source == "configured":
         return (
             EndPose(
@@ -268,7 +441,84 @@ def camera_to_base_for_message(
         capture_pose,
         camera_to_gripper,
     )
+    camera_to_base = apply_target_offset_to_camera_to_base(args, camera_to_base)
     return camera_to_base, capture_pose, capture_pose_source
+
+
+def target_offset_m(args: argparse.Namespace) -> np.ndarray:
+    return np.array(
+        [
+            float(args.target_x_offset_mm) / 1000.0,
+            float(args.target_y_offset_mm) / 1000.0,
+            float(args.target_z_offset_mm) / 1000.0,
+        ],
+        dtype=float,
+    )
+
+
+def apply_target_offset_to_camera_to_base(
+    args: argparse.Namespace,
+    camera_to_base: np.ndarray,
+) -> np.ndarray:
+    offset_m = target_offset_m(args)
+    if np.allclose(offset_m, 0.0):
+        return camera_to_base
+    adjusted = np.array(camera_to_base, dtype=float, copy=True)
+    adjusted[:3, 3] += offset_m
+    return adjusted
+
+
+def target_offset_payload(args: argparse.Namespace) -> dict[str, float]:
+    return {
+        "x_mm": float(args.target_x_offset_mm),
+        "y_mm": float(args.target_y_offset_mm),
+        "z_mm": float(args.target_z_offset_mm),
+    }
+
+
+def mapped_eye_in_hand_top_payload(
+    command: Any,
+    camera_to_base: np.ndarray,
+) -> dict[str, float] | None:
+    if command.detected_top_z_mm is not None:
+        return None
+    values = (
+        command.detected_top_camera_x_m,
+        command.detected_top_camera_y_m,
+        command.detected_top_camera_z_m,
+    )
+    if any(value is None for value in values):
+        return None
+    camera_point_h = np.array(
+        [float(values[0]), float(values[1]), float(values[2]), 1.0],
+        dtype=float,
+    )
+    base_point_m = camera_to_base @ camera_point_h
+    if not np.all(np.isfinite(base_point_m[:3])):
+        raise ValueError("detected top camera point maps to a non-finite base point")
+    return {
+        "detected_top_x_mm": float(base_point_m[0] * 1000.0),
+        "detected_top_y_mm": float(base_point_m[1] * 1000.0),
+        "detected_top_z_mm": float(base_point_m[2] * 1000.0),
+    }
+
+
+def message_with_eye_in_hand_top_mapping(
+    message: dict[str, Any],
+    command: Any,
+    camera_to_base: np.ndarray,
+) -> tuple[dict[str, Any], dict[str, float] | None]:
+    top_payload = mapped_eye_in_hand_top_payload(command, camera_to_base)
+    if top_payload is None:
+        return message, None
+    payload = message.get("payload")
+    if not isinstance(payload, dict):
+        return message, None
+    mapped_message = dict(message)
+    mapped_payload = dict(payload)
+    mapped_payload.update(top_payload)
+    mapped_message["payload"] = mapped_payload
+    return mapped_message, top_payload
 
 
 def handle_message(
@@ -292,8 +542,13 @@ def handle_message(
         pose_reader,
         camera_to_gripper,
     )
-    response = handle_message_with_ready_pose_override(
+    mapped_message, mapped_top_payload = message_with_eye_in_hand_top_mapping(
         message,
+        command,
+        camera_to_base,
+    )
+    response = handle_message_with_ready_pose_override(
+        mapped_message,
         args=args,
         camera_to_base=camera_to_base,
         validator=validator,
@@ -301,6 +556,7 @@ def handle_message(
     )
     payload = response.get("payload")
     if isinstance(payload, dict):
+        payload.pop("guarded_execution", None)
         payload["mapping_source"] = "eye_in_hand"
         payload["eye_in_hand"] = {
             "result_path": str(args.eye_in_hand_result),
@@ -308,6 +564,8 @@ def handle_message(
             "capture_pose": pose_to_dict(capture_pose),
             "camera_to_gripper": matrix_to_nested_list(camera_to_gripper),
             "camera_to_base": matrix_to_nested_list(camera_to_base),
+            "target_offset_mm": target_offset_payload(args),
+            "mapped_top_from_camera": mapped_top_payload,
             "dynamic_ready": False,
         }
     return response
@@ -326,7 +584,7 @@ def handle_message_with_ready_pose_override(
         catch_server_1.ready_pose = ready_pose
         return catch_server_1.handle_message(
             message,
-            args=args,
+            args=server_1_motion_args(args),
             camera_to_base=camera_to_base,
             validator=validator,
             controller=controller,
@@ -412,6 +670,8 @@ def serve(args: argparse.Namespace) -> None:
             print(
                 f"Listening on {args.host}:{args.port}, execute={args.execute}, "
                 f"speed={args.speed}, capture_pose_source={args.capture_pose_source}, "
+                f"planar_ik_speed={catch_server_1.planar_ik_speed(server_1_motion_args(args))}, "
+                f"initial_pose_source={args.initial_pose_source}, "
                 f"fixed_orientation="
                 f"({args.rx_deg:.3f}, {args.ry_deg:.3f}, {args.rz_deg:.3f})",
                 flush=True,

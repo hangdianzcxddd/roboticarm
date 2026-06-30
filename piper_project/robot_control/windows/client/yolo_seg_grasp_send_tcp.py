@@ -677,6 +677,13 @@ def camera_point_command_from_target(
     detected_top_z_mm = None
     if target.top_base_xyz_mm is not None:
         detected_top_x_mm, detected_top_y_mm, detected_top_z_mm = target.top_base_xyz_mm
+    detected_top_camera_x_m = None
+    detected_top_camera_y_m = None
+    detected_top_camera_z_m = None
+    if target.top_point is not None:
+        detected_top_camera_x_m = target.top_point.x_m
+        detected_top_camera_y_m = target.top_point.y_m
+        detected_top_camera_z_m = target.top_point.z_m
     return CameraPointCommand(
         x_m=target.send_point.x_m,
         y_m=target.send_point.y_m,
@@ -719,6 +726,9 @@ def camera_point_command_from_target(
         detected_top_x_mm=detected_top_x_mm,
         detected_top_y_mm=detected_top_y_mm,
         detected_top_z_mm=detected_top_z_mm,
+        detected_top_camera_x_m=detected_top_camera_x_m,
+        detected_top_camera_y_m=detected_top_camera_y_m,
+        detected_top_camera_z_m=detected_top_camera_z_m,
     )
 
 
