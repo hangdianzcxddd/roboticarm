@@ -1,14 +1,13 @@
-"""OpenCV green-conveyor grasp client: mask centroid -> median depth -> TCP.
+"""OpenCV belt-color grasp client: mask centroid -> median depth -> TCP.
 
 Run on Windows from ``piper_project`` after starting the Linux catch server:
 
     python -m robot_control.windows.client.opencv_grasp_send_tcp --host <linux-vm-ip>
 
-The detector assumes the conveyor belt is green. It thresholds the green belt
-in HSV, inverts that mask inside an optional ROI, converts each non-green
-connected component into a mask target, samples median depth inside that mask,
-and sends selected targets to ``catch_server_1`` with the same camera-point
-protocol used by the YOLO clients.
+The detector thresholds the conveyor belt color in HSV, inverts that mask
+inside an optional ROI, converts each non-belt connected component into a mask
+target, samples median depth inside that mask, and sends selected targets to
+``catch_server_1`` with the same camera-point protocol used by the YOLO clients.
 """
 
 from __future__ import annotations
@@ -62,15 +61,20 @@ from robot_control.windows.vision.depth import (
 from robot_control.windows.vision.detector import Detection
 
 
-RGB_WINDOW_NAME = "OpenCV green-conveyor grasp -> catch_server_1"
-MASK_WINDOW_NAME = "OpenCV green/object masks"
+RGB_WINDOW_NAME = "OpenCV belt-color grasp -> catch_server_1"
+MASK_WINDOW_NAME = "OpenCV belt/object masks"
 DEPTH_WINDOW_NAME = "Aligned depth valid map"
 
 
 @dataclass(frozen=True)
 class GreenConveyorDetectorConfig:
-    lower_green_hsv: tuple[int, int, int] = (35, 40, 40)
-    upper_green_hsv: tuple[int, int, int] = (90, 255, 255)
+    lower_belt_hsv: tuple[int, int, int] = (35, 40, 40)
+    upper_belt_hsv: tuple[int, int, int] = (90, 255, 255)
+    reject_highlight: bool = False
+    highlight_max_s: int = 70
+    highlight_min_v: int = 200
+    reject_shadow: bool = False
+    shadow_max_v: int = 35
     min_area_px: float = 500.0
     max_area_px: float | None = None
     min_width_px: int = 1
@@ -129,13 +133,16 @@ class OpenCVGraspSender(YoloSegGraspSender):
 
 
 class GreenConveyorOpenCVDetector:
-    """Detect non-green connected components on a green conveyor belt."""
+    """Detect non-belt-color connected components on a conveyor belt."""
 
     def __init__(self, config: GreenConveyorDetectorConfig | None = None) -> None:
         self.config = config or GreenConveyorDetectorConfig()
+        self.last_belt_mask: np.ndarray | None = None
         self.last_green_mask: np.ndarray | None = None
         self.last_object_mask: np.ndarray | None = None
         self.last_roi_mask: np.ndarray | None = None
+        self.last_highlight_mask: np.ndarray | None = None
+        self.last_shadow_mask: np.ndarray | None = None
 
     def detect(self, frame_bgr: np.ndarray) -> list[SegmentationDetection]:
         if frame_bgr.ndim != 3 or frame_bgr.shape[2] != 3:
@@ -144,11 +151,28 @@ class GreenConveyorOpenCVDetector:
         height, width = frame_bgr.shape[:2]
         roi_mask = make_roi_mask((height, width), self.config.roi_xywh)
         hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
-        green_mask = hsv_in_range(hsv, self.config.lower_green_hsv, self.config.upper_green_hsv)
-        green_mask = cv2.bitwise_and(green_mask, roi_mask)
+        belt_mask = hsv_in_range(hsv, self.config.lower_belt_hsv, self.config.upper_belt_hsv)
+        belt_mask = cv2.bitwise_and(belt_mask, roi_mask)
 
-        object_mask = cv2.bitwise_not(green_mask)
+        object_mask = cv2.bitwise_not(belt_mask)
         object_mask = cv2.bitwise_and(object_mask, roi_mask)
+        highlight_mask = make_highlight_mask(
+            hsv,
+            roi_mask,
+            reject=self.config.reject_highlight,
+            max_s=self.config.highlight_max_s,
+            min_v=self.config.highlight_min_v,
+        )
+        shadow_mask = make_shadow_mask(
+            hsv,
+            roi_mask,
+            reject=self.config.reject_shadow,
+            max_v=self.config.shadow_max_v,
+        )
+        if highlight_mask is not None:
+            object_mask = cv2.bitwise_and(object_mask, cv2.bitwise_not(highlight_mask))
+        if shadow_mask is not None:
+            object_mask = cv2.bitwise_and(object_mask, cv2.bitwise_not(shadow_mask))
         object_mask = clean_binary_mask(
             object_mask,
             kernel_size=self.config.morphology_kernel_size,
@@ -156,8 +180,11 @@ class GreenConveyorOpenCVDetector:
         )
 
         self.last_roi_mask = roi_mask
-        self.last_green_mask = green_mask
+        self.last_belt_mask = belt_mask
+        self.last_green_mask = belt_mask
         self.last_object_mask = object_mask
+        self.last_highlight_mask = highlight_mask
+        self.last_shadow_mask = shadow_mask
 
         contours, _ = cv2.findContours(
             object_mask,
@@ -274,6 +301,36 @@ def hsv_in_range(
         cv2.inRange(hsv, lower_to_max, upper_to_max),
         cv2.inRange(hsv, lower_from_zero, upper_from_zero),
     )
+
+
+def make_highlight_mask(
+    hsv: np.ndarray,
+    roi_mask: np.ndarray,
+    *,
+    reject: bool,
+    max_s: int,
+    min_v: int,
+) -> np.ndarray | None:
+    if not reject:
+        return None
+    saturation = hsv[:, :, 1]
+    value = hsv[:, :, 2]
+    mask = ((saturation <= int(max_s)) & (value >= int(min_v))).astype(np.uint8) * 255
+    return cv2.bitwise_and(mask, roi_mask)
+
+
+def make_shadow_mask(
+    hsv: np.ndarray,
+    roi_mask: np.ndarray,
+    *,
+    reject: bool,
+    max_v: int,
+) -> np.ndarray | None:
+    if not reject:
+        return None
+    value = hsv[:, :, 2]
+    mask = (value <= int(max_v)).astype(np.uint8) * 255
+    return cv2.bitwise_and(mask, roi_mask)
 
 
 def clean_binary_mask(mask: np.ndarray, *, kernel_size: int, iterations: int) -> np.ndarray:
@@ -449,7 +506,7 @@ def attach_object_short_axis_yaw(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Detect non-green objects on a green conveyor with OpenCV, use mask "
+            "Detect non-belt-color objects on a conveyor with OpenCV, use mask "
             "centroid plus mask median depth as the grasp point, and send it to "
             "Linux catch_server_1."
         )
@@ -501,12 +558,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
+        "--belt-lower-hsv",
+        type=int,
+        nargs=3,
+        metavar=("H", "S", "V"),
+        default=None,
+        help="lower HSV threshold for the conveyor belt/background color",
+    )
+    parser.add_argument(
+        "--belt-upper-hsv",
+        type=int,
+        nargs=3,
+        metavar=("H", "S", "V"),
+        default=None,
+        help="upper HSV threshold for the conveyor belt/background color",
+    )
+    parser.add_argument(
         "--green-lower-hsv",
         type=int,
         nargs=3,
         metavar=("H", "S", "V"),
         default=(35, 40, 40),
-        help="lower HSV threshold for the green conveyor belt",
+        help="compatibility alias for --belt-lower-hsv",
     )
     parser.add_argument(
         "--green-upper-hsv",
@@ -514,7 +587,35 @@ def build_parser() -> argparse.ArgumentParser:
         nargs=3,
         metavar=("H", "S", "V"),
         default=(90, 255, 255),
-        help="upper HSV threshold for the green conveyor belt",
+        help="compatibility alias for --belt-upper-hsv",
+    )
+    parser.add_argument(
+        "--reject-highlight",
+        action="store_true",
+        help="remove low-saturation high-value glare pixels from the object mask",
+    )
+    parser.add_argument(
+        "--highlight-max-s",
+        type=int,
+        default=70,
+        help="maximum HSV saturation treated as glare when --reject-highlight is used",
+    )
+    parser.add_argument(
+        "--highlight-min-v",
+        type=int,
+        default=200,
+        help="minimum HSV value treated as glare when --reject-highlight is used",
+    )
+    parser.add_argument(
+        "--reject-shadow",
+        action="store_true",
+        help="remove very dark shadow pixels from the object mask",
+    )
+    parser.add_argument(
+        "--shadow-max-v",
+        type=int,
+        default=35,
+        help="maximum HSV value treated as shadow when --reject-shadow is used",
     )
     parser.add_argument(
         "--roi",
@@ -688,6 +789,7 @@ def validate_args(args: argparse.Namespace) -> None:
     task_option = getattr(args, "task_option", None)
     if task_option is not None:
         args.task = task_option
+    normalize_belt_hsv_args(args)
     mode = getattr(args, "mode", "static")
     if getattr(args, "no_hand_eye_result", False):
         args.hand_eye_result = None
@@ -717,12 +819,15 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--min-depth-valid-px must be >= 1")
     if args.mask_depth_erode_px < 0:
         raise ValueError("--mask-depth-erode-px must be >= 0")
-    validate_hsv_bounds(args.green_lower_hsv, "--green-lower-hsv")
-    validate_hsv_bounds(args.green_upper_hsv, "--green-upper-hsv")
-    if args.green_lower_hsv[1] > args.green_upper_hsv[1]:
-        raise ValueError("green HSV lower S must be <= upper S")
-    if args.green_lower_hsv[2] > args.green_upper_hsv[2]:
-        raise ValueError("green HSV lower V must be <= upper V")
+    validate_hsv_bounds(args.belt_lower_hsv, "--belt-lower-hsv")
+    validate_hsv_bounds(args.belt_upper_hsv, "--belt-upper-hsv")
+    if args.belt_lower_hsv[1] > args.belt_upper_hsv[1]:
+        raise ValueError("belt HSV lower S must be <= upper S")
+    if args.belt_lower_hsv[2] > args.belt_upper_hsv[2]:
+        raise ValueError("belt HSV lower V must be <= upper V")
+    validate_byte_arg(args.highlight_max_s, "--highlight-max-s")
+    validate_byte_arg(args.highlight_min_v, "--highlight-min-v")
+    validate_byte_arg(args.shadow_max_v, "--shadow-max-v")
     if args.roi is not None:
         x, y, width, height = args.roi
         if x < 0 or y < 0 or width <= 0 or height <= 0:
@@ -770,6 +875,13 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError("--dynamic-probe-interval-s must be >= 0")
 
 
+def normalize_belt_hsv_args(args: argparse.Namespace) -> None:
+    if getattr(args, "belt_lower_hsv", None) is None:
+        args.belt_lower_hsv = args.green_lower_hsv
+    if getattr(args, "belt_upper_hsv", None) is None:
+        args.belt_upper_hsv = args.green_upper_hsv
+
+
 def validate_hsv_bounds(values: list[int] | tuple[int, int, int], label: str) -> None:
     if len(values) != 3:
         raise ValueError(f"{label} must contain H S V")
@@ -780,10 +892,20 @@ def validate_hsv_bounds(values: list[int] | tuple[int, int, int], label: str) ->
         raise ValueError(f"{label} S/V must be in [0, 255]")
 
 
+def validate_byte_arg(value: int, label: str) -> None:
+    if int(value) < 0 or int(value) > 255:
+        raise ValueError(f"{label} must be in [0, 255]")
+
+
 def detector_config_from_args(args: argparse.Namespace) -> GreenConveyorDetectorConfig:
     return GreenConveyorDetectorConfig(
-        lower_green_hsv=tuple(int(item) for item in args.green_lower_hsv),
-        upper_green_hsv=tuple(int(item) for item in args.green_upper_hsv),
+        lower_belt_hsv=tuple(int(item) for item in args.belt_lower_hsv),
+        upper_belt_hsv=tuple(int(item) for item in args.belt_upper_hsv),
+        reject_highlight=bool(args.reject_highlight),
+        highlight_max_s=int(args.highlight_max_s),
+        highlight_min_v=int(args.highlight_min_v),
+        reject_shadow=bool(args.reject_shadow),
+        shadow_max_v=int(args.shadow_max_v),
         min_area_px=float(args.min_area_px),
         max_area_px=args.max_area_px,
         min_width_px=int(args.min_width_px),
@@ -935,7 +1057,7 @@ def print_target_table(
     elif errors:
         print(f"\nNo valid OpenCV mask-depth target: {next(iter(errors.values()))}", flush=True)
     else:
-        print("\nNo OpenCV non-green target found.", flush=True)
+        print("\nNo OpenCV non-belt-color target found.", flush=True)
 
 
 def draw_opencv_targets(
@@ -1057,8 +1179,14 @@ def make_mask_debug_image(
     height = int(frame_shape[0])
     width = int(frame_shape[1])
     image = np.zeros((height, width, 3), dtype=np.uint8)
-    if detector.last_green_mask is not None:
+    if detector.last_belt_mask is not None:
+        image[detector.last_belt_mask.astype(bool)] = (0, 90, 0)
+    elif detector.last_green_mask is not None:
         image[detector.last_green_mask.astype(bool)] = (0, 90, 0)
+    if detector.last_shadow_mask is not None:
+        image[detector.last_shadow_mask.astype(bool)] = (80, 40, 0)
+    if detector.last_highlight_mask is not None:
+        image[detector.last_highlight_mask.astype(bool)] = (255, 255, 255)
     if detector.last_object_mask is not None:
         image[detector.last_object_mask.astype(bool)] = (180, 180, 180)
 
@@ -1296,9 +1424,9 @@ def main() -> None:
     if args.mode == "static":
         terminal.start()
     source = (
-        "opencv_green_conveyor_mask_centroid_top_median_depth"
+        "opencv_belt_color_mask_centroid_top_median_depth"
         if args.mode == "static"
-        else "opencv_green_conveyor_dynamic_timed"
+        else "opencv_belt_color_dynamic_timed"
     )
     last_print_time = 0.0
     latest_targets: list[RankedSegTarget] = []
@@ -1313,9 +1441,12 @@ def main() -> None:
     )
 
     print(
-        "OpenCV green threshold HSV "
-        f"lower={tuple(args.green_lower_hsv)} upper={tuple(args.green_upper_hsv)} "
-        f"roi={tuple(args.roi) if args.roi is not None else 'full-frame'}",
+        "OpenCV belt threshold HSV "
+        f"lower={tuple(args.belt_lower_hsv)} upper={tuple(args.belt_upper_hsv)} "
+        f"roi={tuple(args.roi) if args.roi is not None else 'full-frame'} "
+        f"reject_highlight={args.reject_highlight} "
+        f"highlight=(S<={args.highlight_max_s}, V>={args.highlight_min_v}) "
+        f"reject_shadow={args.reject_shadow} shadow=(V<={args.shadow_max_v})",
         flush=True,
     )
     if args.mode == "static":

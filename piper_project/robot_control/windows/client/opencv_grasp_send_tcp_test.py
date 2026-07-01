@@ -11,6 +11,7 @@ from robot_control.windows.client.opencv_grasp_send_tcp import (
     OpenCVGraspSender,
     attach_object_short_axis_yaw,
     build_parser,
+    detector_config_from_args,
     hsv_in_range,
     validate_args,
 )
@@ -44,6 +45,12 @@ def green_frame(width: int = 160, height: int = 120) -> np.ndarray:
     return frame
 
 
+def black_frame(width: int = 160, height: int = 120) -> np.ndarray:
+    frame = np.zeros((height, width, 3), dtype=np.uint8)
+    frame[:] = (8, 8, 8)
+    return frame
+
+
 class TestOpenCVGraspSendTcp(unittest.TestCase):
     def test_detector_finds_non_green_object_on_green_belt(self):
         frame = green_frame()
@@ -62,6 +69,45 @@ class TestOpenCVGraspSendTcp(unittest.TestCase):
         self.assertEqual((detection.x, detection.y, detection.width, detection.height), (60, 40, 40, 40))
         self.assertAlmostEqual(segments[0].centroid_u, 79.5, places=1)
         self.assertAlmostEqual(segments[0].centroid_v, 59.5, places=1)
+
+    def test_detector_finds_non_black_object_on_black_belt(self):
+        frame = black_frame()
+        frame[40:80, 60:100] = (0, 0, 255)
+        detector = GreenConveyorOpenCVDetector(
+            GreenConveyorDetectorConfig(
+                lower_belt_hsv=(0, 0, 0),
+                upper_belt_hsv=(179, 255, 60),
+                min_area_px=100,
+                morphology_kernel_size=3,
+            )
+        )
+
+        segments = detector.detect(frame)
+
+        self.assertEqual(len(segments), 1)
+        detection = segments[0].detection
+        self.assertEqual((detection.x, detection.y, detection.width, detection.height), (60, 40, 40, 40))
+
+    def test_detector_can_reject_low_saturation_high_value_highlight(self):
+        frame = green_frame()
+        frame[20:50, 20:50] = (245, 245, 245)
+        frame[60:95, 70:110] = (0, 0, 255)
+        detector = GreenConveyorOpenCVDetector(
+            GreenConveyorDetectorConfig(
+                min_area_px=100,
+                morphology_kernel_size=1,
+                reject_highlight=True,
+                highlight_max_s=40,
+                highlight_min_v=220,
+            )
+        )
+
+        segments = detector.detect(frame)
+
+        self.assertEqual(len(segments), 1)
+        self.assertEqual((segments[0].detection.x, segments[0].detection.y), (70, 60))
+        self.assertIsNotNone(detector.last_highlight_mask)
+        self.assertEqual(int(detector.last_highlight_mask[25, 25]), 255)
 
     def test_detector_restricts_to_roi_and_can_reject_border_touching_components(self):
         frame = green_frame()
@@ -255,6 +301,48 @@ class TestOpenCVGraspSendTcp(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "H must be in"):
             validate_args(args)
+
+    def test_belt_hsv_arguments_override_green_compatibility_alias(self):
+        args = build_parser().parse_args(
+            [
+                "--dry-run",
+                "--green-lower-hsv",
+                "35",
+                "40",
+                "40",
+                "--green-upper-hsv",
+                "90",
+                "255",
+                "255",
+                "--belt-lower-hsv",
+                "0",
+                "0",
+                "0",
+                "--belt-upper-hsv",
+                "179",
+                "255",
+                "70",
+                "--reject-highlight",
+                "--highlight-max-s",
+                "80",
+                "--highlight-min-v",
+                "190",
+                "--reject-shadow",
+                "--shadow-max-v",
+                "20",
+            ]
+        )
+
+        validate_args(args)
+        config = detector_config_from_args(args)
+
+        self.assertEqual(config.lower_belt_hsv, (0, 0, 0))
+        self.assertEqual(config.upper_belt_hsv, (179, 255, 70))
+        self.assertTrue(config.reject_highlight)
+        self.assertEqual(config.highlight_max_s, 80)
+        self.assertEqual(config.highlight_min_v, 190)
+        self.assertTrue(config.reject_shadow)
+        self.assertEqual(config.shadow_max_v, 20)
 
 
 if __name__ == "__main__":
