@@ -52,6 +52,11 @@ from robot_control.windows.vision.d435i_intrinsics import (
     find_d435i_intrinsics,
     format_intrinsics,
 )
+from robot_control.windows.vision.belt_depth_plane import (
+    BeltDepthPlane,
+    load_belt_depth_plane,
+    mask_depth_percentile,
+)
 from robot_control.windows.vision.depth import (
     CameraPoint,
     create_aligned_rgb_depth_stream,
@@ -610,6 +615,88 @@ def attach_object_short_axis_yaw(
     return updated
 
 
+def apply_belt_depth_plane_compensation(
+    targets: list[RankedSegTarget],
+    depth_frame: Any,
+    *,
+    plane: BeltDepthPlane | None,
+    top_percentile: float,
+    max_depth_m: float,
+    intrinsics: PinholeIntrinsics | None,
+    camera_to_base: np.ndarray | None,
+) -> list[RankedSegTarget]:
+    if plane is None:
+        return targets
+    width = int(depth_frame.get_width())
+    height = int(depth_frame.get_height())
+    plane.validate_resolution(width, height)
+
+    updated: list[RankedSegTarget] = []
+    for target in targets:
+        try:
+            top_depth_m, _ = mask_depth_percentile(
+                depth_frame,
+                target.segment.mask,
+                percentile=top_percentile,
+                max_depth_m=max_depth_m,
+            )
+            u, v = clamp_pixel_from_centroid(
+                target.segment.centroid_u,
+                target.segment.centroid_v,
+                width=width,
+                height=height,
+            )
+            belt_depth_m = plane.depth_at(u, v)
+            ref_u, ref_v = belt_depth_reference_pixel(plane)
+            reference_depth_m = plane.depth_at(ref_u, ref_v)
+            compensated_top_depth_m = max(
+                0.001,
+                top_depth_m - (belt_depth_m - reference_depth_m),
+            )
+            top_point = deproject_pixel_with_depth(
+                depth_frame,
+                u,
+                v,
+                compensated_top_depth_m,
+                intrinsics=intrinsics,
+            )
+            top_base_xyz_mm = None
+            if camera_to_base is not None:
+                top_base_xyz_m = map_camera_point_to_base_xyz_m(
+                    top_point.x_m,
+                    top_point.y_m,
+                    top_point.z_m,
+                    camera_to_base,
+                )
+                top_base_xyz_mm = tuple(float(value) * 1000.0 for value in top_base_xyz_m)
+        except (RuntimeError, ValueError) as exc:
+            print(
+                "Belt depth plane compensation skipped for "
+                f"rank {target.rank}: {exc}",
+                flush=True,
+            )
+            updated.append(target)
+            continue
+
+        updated.append(
+            replace(
+                target,
+                top_point=top_point,
+                top_base_xyz_mm=top_base_xyz_mm,
+                mask_top_u=float(u),
+                mask_top_v=float(v),
+            )
+        )
+    return updated
+
+
+def belt_depth_reference_pixel(plane: BeltDepthPlane) -> tuple[float, float]:
+    if plane.roi_xywh is not None:
+        x, y, width, height = plane.roi_xywh
+        return float(x) + float(width) / 2.0, float(y) + float(height) / 2.0
+    return float(plane.width) / 2.0, float(plane.height) / 2.0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -651,6 +738,23 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=2,
         help="erode object mask by this pixel radius before depth median sampling; 0 disables",
+    )
+    parser.add_argument(
+        "--belt-depth-plane-json",
+        type=Path,
+        help=(
+            "optional JSON from calibrate_belt_depth_plane; flattens tilted belt "
+            "depth before reporting detected_top_z"
+        ),
+    )
+    parser.add_argument(
+        "--belt-depth-top-percentile",
+        type=float,
+        default=20.0,
+        help=(
+            "depth percentile inside the object mask used as the object top "
+            "when --belt-depth-plane-json is enabled"
+        ),
     )
     parser.add_argument(
         "--intrinsics-json",
@@ -946,6 +1050,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--min-depth-valid-px must be >= 1")
     if args.mask_depth_erode_px < 0:
         raise ValueError("--mask-depth-erode-px must be >= 0")
+    if args.belt_depth_top_percentile < 0.0 or args.belt_depth_top_percentile > 100.0:
+        raise ValueError("--belt-depth-top-percentile must be in [0, 100]")
     validate_hsv_bounds(args.belt_lower_hsv, "--belt-lower-hsv")
     validate_hsv_bounds(args.belt_upper_hsv, "--belt-upper-hsv")
     if args.belt_lower_hsv[1] > args.belt_upper_hsv[1]:
@@ -1154,6 +1260,7 @@ def format_target_line(target: RankedSegTarget) -> str:
         if target.top_base_xyz_mm is None
         else f"{target.top_base_xyz_mm[2]:.1f}mm"
     )
+    top_camera_z = "NA" if target.top_point is None else f"{target.top_point.z_m * 1000.0:.1f}mm"
     yaw_text = (
         "NA"
         if target.object_short_axis_yaw_deg is None
@@ -1166,7 +1273,7 @@ def format_target_line(target: RankedSegTarget) -> str:
         f"valid_depth={target.mask_depth_valid_count}px "
         f"bbox=({detection.x},{detection.y},{detection.width},{detection.height}) "
         f"centroid=({target.segment.centroid_u:.1f},{target.segment.centroid_v:.1f}) "
-        f"top={top_pixel} top_base_z={top_base_z} short_yaw={yaw_text} "
+        f"top={top_pixel} top_camera_z={top_camera_z} top_base_z={top_base_z} short_yaw={yaw_text} "
         f"pixel=({target.send_point.u},{target.send_point.v}) "
         f"send=({target.send_point.x_m:.4f},"
         f"{target.send_point.y_m:.4f},{target.send_point.z_m:.4f})m"
@@ -1541,6 +1648,26 @@ def main() -> None:
         camera_to_base = load_camera_to_base_transform(args.hand_eye_result)
         print(f"Using hand-eye camera->base transform: {args.hand_eye_result}", flush=True)
 
+    belt_depth_plane = None
+    if args.belt_depth_plane_json is not None:
+        belt_depth_plane = load_belt_depth_plane(args.belt_depth_plane_json)
+        belt_depth_plane.validate_resolution(args.width, args.height)
+        residual = belt_depth_plane.residuals
+        residual_text = (
+            "NA"
+            if residual is None
+            else f"rms={residual.rms_mm:.2f}mm max={residual.max_abs_mm:.2f}mm"
+        )
+        print(
+            "Using belt depth plane "
+            f"{args.belt_depth_plane_json}: "
+            f"z={belt_depth_plane.a:.9f}*u+"
+            f"{belt_depth_plane.b:.9f}*v+{belt_depth_plane.c:.6f} "
+            f"samples={belt_depth_plane.sample_count} residuals({residual_text}) "
+            f"top_percentile={args.belt_depth_top_percentile:.1f}",
+            flush=True,
+        )
+
     detector = GreenConveyorOpenCVDetector(detector_config_from_args(args))
     pipeline, align = create_aligned_rgb_depth_stream(
         width=args.width,
@@ -1634,6 +1761,15 @@ def main() -> None:
                 point_z_offset_mm=args.point_z_offset_mm,
                 camera_to_base=camera_to_base,
                 base_z_offset_mm=args.base_z_offset_mm,
+            )
+            latest_targets = apply_belt_depth_plane_compensation(
+                latest_targets,
+                depth_frame,
+                plane=belt_depth_plane,
+                top_percentile=args.belt_depth_top_percentile,
+                max_depth_m=args.max_depth_m,
+                intrinsics=intrinsics,
+                camera_to_base=camera_to_base,
             )
             latest_targets = attach_object_short_axis_yaw(
                 latest_targets,

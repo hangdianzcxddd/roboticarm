@@ -9,6 +9,7 @@ from robot_control.windows.client.opencv_grasp_send_tcp import (
     GreenConveyorDetectorConfig,
     GreenConveyorOpenCVDetector,
     OpenCVGraspSender,
+    apply_belt_depth_plane_compensation,
     attach_object_short_axis_yaw,
     build_parser,
     detector_config_from_args,
@@ -16,6 +17,7 @@ from robot_control.windows.client.opencv_grasp_send_tcp import (
     validate_args,
 )
 from robot_control.windows.client.yolo_seg_grasp_send_tcp import segments_to_ranked_targets
+from robot_control.windows.vision.belt_depth_plane import BeltDepthPlane
 from robot_control.windows.vision.d435i_intrinsics import PinholeIntrinsics
 
 
@@ -404,6 +406,77 @@ class TestOpenCVGraspSendTcp(unittest.TestCase):
         self.assertEqual(config.entry_edge, "right")
         self.assertEqual(config.entry_clear_margin_px, 12)
         self.assertEqual(config.entry_clear_frames, 3)
+
+    def test_belt_depth_plane_compensation_updates_top_depth(self):
+        frame = green_frame(20, 20)
+        frame[5:10, 6:12] = (0, 0, 255)
+        detector = GreenConveyorOpenCVDetector(
+            GreenConveyorDetectorConfig(
+                min_area_px=10,
+                morphology_kernel_size=1,
+            )
+        )
+        segments = detector.detect(frame)
+        depth = np.full((20, 20), 0.45, dtype=np.float32)
+        targets, errors = segments_to_ranked_targets(
+            segments,
+            FakeDepthFrame(depth),
+            intrinsics=PinholeIntrinsics(
+                width=20,
+                height=20,
+                fx=100.0,
+                fy=100.0,
+                ppx=10.0,
+                ppy=10.0,
+            ),
+            max_depth_m=1.5,
+            min_depth_valid_px=1,
+            mask_depth_erode_px=0,
+            camera_up_offset_mm=0.0,
+            point_z_offset_mm=0.0,
+            camera_to_base=np.eye(4, dtype=float),
+            base_z_offset_mm=0.0,
+        )
+
+        updated = apply_belt_depth_plane_compensation(
+            targets,
+            FakeDepthFrame(depth),
+            plane=BeltDepthPlane(
+                width=20,
+                height=20,
+                a=0.001,
+                b=0.0,
+                c=0.45,
+                roi_xywh=(0, 0, 20, 20),
+            ),
+            top_percentile=20.0,
+            max_depth_m=1.5,
+            intrinsics=PinholeIntrinsics(
+                width=20,
+                height=20,
+                fx=100.0,
+                fy=100.0,
+                ppx=10.0,
+                ppy=10.0,
+            ),
+            camera_to_base=np.eye(4, dtype=float),
+        )
+
+        self.assertEqual(errors, {})
+        self.assertAlmostEqual(updated[0].top_point.depth_m, 0.452, places=3)
+        self.assertAlmostEqual(updated[0].top_base_xyz_mm[2], 452.0, places=1)
+
+    def test_belt_depth_plane_arguments_are_validated(self):
+        args = build_parser().parse_args(
+            [
+                "--dry-run",
+                "--belt-depth-top-percentile",
+                "20",
+            ]
+        )
+
+        validate_args(args)
+        self.assertEqual(args.belt_depth_top_percentile, 20.0)
 
 
 if __name__ == "__main__":
