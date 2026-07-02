@@ -705,18 +705,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.0,
         help="pause before descending from target-above to target-grasp",
     )
-    parser.add_argument("--place-x-mm", type=float, default=80.0)
-    parser.add_argument("--place-y-mm", type=float, default=260.0)
+    parser.add_argument("--place-x-mm", type=float, default=60.0)
+    parser.add_argument("--place-y-mm", type=float, default=270.0)
     parser.add_argument(
         "--place-pick-x-mm",
         type=float,
-        default=80.0,
+        default=60.0,
         help="X used when picking the object back from the fixed place area",
     )
     parser.add_argument(
         "--place-pick-y-mm",
         type=float,
-        default=-260.0,
+        default=-270.0,
         help="Y used when picking the object back from the fixed place area",
     )
     parser.add_argument(

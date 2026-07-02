@@ -105,10 +105,10 @@ def make_args(**overrides: object) -> argparse.Namespace:
         "planar_ik_joint_tolerance_deg": 2.0,
         "planar_ik_fk_tool_z_offset_mm": 82.0,
         "pick_delay_s": 0.0,
-        "place_x_mm": 80.0,
-        "place_y_mm": 260.0,
-        "place_pick_x_mm": 80.0,
-        "place_pick_y_mm": -260.0,
+        "place_x_mm": 60.0,
+        "place_y_mm": 270.0,
+        "place_pick_x_mm": 60.0,
+        "place_pick_y_mm": -270.0,
         "place_pick_z_mm": None,
         "place_pick_delay_s": 3.0,
         "grasp_only": False,
@@ -280,10 +280,10 @@ class TestCatchServer1(unittest.TestCase):
         self.assertAlmostEqual(args.guarded_step_timeout_s, 0.25)
         self.assertEqual(args.guarded_abort_return, "pick_above")
         self.assertEqual(args.startup_speed, 10)
-        self.assertAlmostEqual(args.place_x_mm, 80.0)
-        self.assertAlmostEqual(args.place_y_mm, 260.0)
-        self.assertAlmostEqual(args.place_pick_x_mm, 80.0)
-        self.assertAlmostEqual(args.place_pick_y_mm, -260.0)
+        self.assertAlmostEqual(args.place_x_mm, 60.0)
+        self.assertAlmostEqual(args.place_y_mm, 270.0)
+        self.assertAlmostEqual(args.place_pick_x_mm, 60.0)
+        self.assertAlmostEqual(args.place_pick_y_mm, -270.0)
         self.assertFalse(args.dynamic_pitch_by_x)
         self.assertEqual(args.dynamic_pitch_mode, "joint")
         self.assertEqual(args.dynamic_wait_placement, "wait")

@@ -199,7 +199,8 @@ lift_tcp.z = grasp_tcp.z + lift_height_mm
 
 | 参数 | 默认值 | 含义 |
 |---|---:|---|
-| `place_x_mm/place_y_mm` | `150/150` | 固定放置 TCP 基座坐标。不传时使用基座前方 150mm、右侧 150mm。 |
+| `place_x_mm/place_y_mm` | `60/270` | `catch_server_1` 固定放置 TCP 基座坐标。 |
+| `place_pick_x_mm/place_pick_y_mm` | `60/-270` | `catch_server_1` 从固定放置区回取时使用的 TCP 基座坐标。 |
 | `place_dx_mm` | `None` | 旧逻辑：放置点相对目标 TCP 的 X 偏移；显式传 `dx/dy` 任一项时启用相对模式。 |
 | `place_dy_mm` | `None` | 旧逻辑：放置点相对目标 TCP 的 Y 偏移；相对模式下未传 Y 时按 `-100` 处理。 |
 | `place_z_mm` | `80` | 放置 TCP Z。 |
