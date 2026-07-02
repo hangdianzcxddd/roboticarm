@@ -13,12 +13,20 @@ from robot_control.windows.client.opencv_grasp_send_tcp import (
     attach_object_short_axis_yaw,
     build_parser,
     detector_config_from_args,
+    dynamic_opencv_target_diagnostic_from_target,
+    format_dynamic_opencv_target_diagnostic,
     hsv_in_range,
     validate_args,
 )
-from robot_control.windows.client.yolo_seg_grasp_send_tcp import segments_to_ranked_targets
+from robot_control.windows.client.yolo_seg_grasp_send_tcp import (
+    RankedSegTarget,
+    SegmentationDetection,
+    segments_to_ranked_targets,
+)
 from robot_control.windows.vision.belt_depth_plane import BeltDepthPlane
 from robot_control.windows.vision.d435i_intrinsics import PinholeIntrinsics
+from robot_control.windows.vision.depth import CameraPoint
+from robot_control.windows.vision.detector import Detection
 
 
 class FakeDepthFrame:
@@ -51,6 +59,42 @@ def black_frame(width: int = 160, height: int = 120) -> np.ndarray:
     frame = np.zeros((height, width, 3), dtype=np.uint8)
     frame[:] = (8, 8, 8)
     return frame
+
+
+def ranked_target_at_camera_point(x_m: float, y_m: float, z_m: float) -> RankedSegTarget:
+    mask = np.ones((4, 4), dtype=np.uint8) * 255
+    detection = Detection(
+        u=2,
+        v=2,
+        x=1,
+        y=1,
+        width=4,
+        height=4,
+        area=16.0,
+        label="opencv_object",
+    )
+    segment = SegmentationDetection(
+        detection=detection,
+        mask=mask,
+        mask_area_px=16,
+        centroid_u=2.0,
+        centroid_v=2.0,
+    )
+    point = CameraPoint(
+        u=2,
+        v=2,
+        depth_m=z_m,
+        x_m=x_m,
+        y_m=y_m,
+        z_m=z_m,
+    )
+    return RankedSegTarget(
+        rank=1,
+        segment=segment,
+        raw_point=point,
+        send_point=point,
+        mask_depth_valid_count=16,
+    )
 
 
 class TestOpenCVGraspSendTcp(unittest.TestCase):
@@ -331,6 +375,54 @@ class TestOpenCVGraspSendTcp(unittest.TestCase):
         validate_args(args)
 
         self.assertIsNotNone(args.hand_eye_result)
+
+    def test_dynamic_debug_candidates_argument_is_stored(self):
+        args = build_parser().parse_args(
+            [
+                "dynamic",
+                "--dry-run",
+                "--conveyor-speed-mm-s",
+                "80",
+                "--dynamic-debug-candidates",
+            ]
+        )
+
+        validate_args(args)
+
+        self.assertTrue(args.dynamic_debug_candidates)
+
+    def test_dynamic_target_diagnostic_reports_candidate_and_reject_reasons(self):
+        candidate_target = ranked_target_at_camera_point(0.30, -0.50, 0.10)
+        past_pick_target = ranked_target_at_camera_point(0.30, 0.05, 0.10)
+
+        candidate = dynamic_opencv_target_diagnostic_from_target(
+            candidate_target,
+            camera_to_base=np.eye(4, dtype=float),
+            min_x_mm=200.0,
+            max_x_mm=450.0,
+            min_y_mm=-550.0,
+            max_y_mm=50.0,
+            pick_y_mm=0.0,
+            conveyor_speed_mm_s=100.0,
+            conveyor_direction="positive-y",
+        )
+        rejected = dynamic_opencv_target_diagnostic_from_target(
+            past_pick_target,
+            camera_to_base=np.eye(4, dtype=float),
+            min_x_mm=200.0,
+            max_x_mm=450.0,
+            min_y_mm=-550.0,
+            max_y_mm=50.0,
+            pick_y_mm=0.0,
+            conveyor_speed_mm_s=100.0,
+            conveyor_direction="positive-y",
+        )
+
+        self.assertEqual(candidate.reject_reasons, ())
+        self.assertAlmostEqual(candidate.t_arrive_s, 5.0)
+        self.assertIn("candidate", format_dynamic_opencv_target_diagnostic(candidate))
+        self.assertEqual(rejected.reject_reasons, ("past-pick-line",))
+        self.assertIn("reject=past-pick-line", format_dynamic_opencv_target_diagnostic(rejected))
 
     def test_static_mode_defaults_to_hand_eye_result_for_top_z_metadata(self):
         args = build_parser().parse_args(["--dry-run"])

@@ -127,6 +127,29 @@ class DynamicOpenCVGraspCandidate:
 
 
 @dataclass(frozen=True)
+class DynamicOpenCVTargetDiagnostic:
+    target: RankedSegTarget
+    center_point: CameraPoint
+    base_xyz_m: tuple[float, float, float]
+    t_arrive_s: float
+    remaining_y_mm: float
+    reject_reasons: tuple[str, ...]
+    suppressed: bool = False
+
+    @property
+    def base_x_mm(self) -> float:
+        return self.base_xyz_m[0] * 1000.0
+
+    @property
+    def base_y_mm(self) -> float:
+        return self.base_xyz_m[1] * 1000.0
+
+    @property
+    def base_z_mm(self) -> float:
+        return self.base_xyz_m[2] * 1000.0
+
+
+@dataclass(frozen=True)
 class SuppressedDynamicTarget:
     x_mm: float
     y_mm: float
@@ -1013,6 +1036,14 @@ def build_parser() -> argparse.ArgumentParser:
             "to Linux for camera->base coordinate logging; 0 disables probes"
         ),
     )
+    parser.add_argument(
+        "--dynamic-debug-candidates",
+        action="store_true",
+        help=(
+            "print per-target dynamic candidate diagnostics, including base XYZ, "
+            "window checks, arrival time, and skip-memory suppression"
+        ),
+    )
     return parser
 
 
@@ -1237,6 +1268,110 @@ def find_dynamic_opencv_candidates(
     return sorted(candidates, key=lambda item: (item.t_arrive_s, item.target.rank))
 
 
+def dynamic_opencv_target_diagnostic_from_target(
+    target: RankedSegTarget,
+    *,
+    camera_to_base: np.ndarray,
+    min_x_mm: float,
+    max_x_mm: float,
+    min_y_mm: float,
+    max_y_mm: float,
+    pick_y_mm: float,
+    conveyor_speed_mm_s: float,
+    conveyor_direction: Literal["negative-y", "positive-y"],
+) -> DynamicOpenCVTargetDiagnostic:
+    center_point = target.raw_point
+    base_xyz_m = map_camera_point_to_base_xyz_m(
+        center_point.x_m,
+        center_point.y_m,
+        center_point.z_m,
+        camera_to_base,
+    )
+    center_x_mm = base_xyz_m[0] * 1000.0
+    center_y_mm = base_xyz_m[1] * 1000.0
+    reject_reasons: list[str] = []
+    if center_x_mm < min_x_mm:
+        reject_reasons.append(f"x<{min_x_mm:.1f}")
+    elif center_x_mm > max_x_mm:
+        reject_reasons.append(f"x>{max_x_mm:.1f}")
+    if center_y_mm < min_y_mm:
+        reject_reasons.append(f"y<{min_y_mm:.1f}")
+    elif center_y_mm > max_y_mm:
+        reject_reasons.append(f"y>{max_y_mm:.1f}")
+
+    t_arrive_s, remaining_y_mm = dynamic_arrival_time_s(
+        center_y_mm,
+        pick_y_mm=pick_y_mm,
+        conveyor_speed_mm_s=conveyor_speed_mm_s,
+        conveyor_direction=conveyor_direction,
+    )
+    if t_arrive_s < 0.0:
+        reject_reasons.append("past-pick-line")
+
+    return DynamicOpenCVTargetDiagnostic(
+        target=target,
+        center_point=center_point,
+        base_xyz_m=base_xyz_m,
+        t_arrive_s=float(t_arrive_s),
+        remaining_y_mm=float(remaining_y_mm),
+        reject_reasons=tuple(reject_reasons),
+    )
+
+
+def dynamic_opencv_diagnostic_is_suppressed(
+    diagnostic: DynamicOpenCVTargetDiagnostic,
+    suppressed: list[SuppressedDynamicTarget],
+    *,
+    radius_mm: float,
+) -> bool:
+    if diagnostic.reject_reasons:
+        return False
+    radius_sq = float(radius_mm) * float(radius_mm)
+    for target in suppressed:
+        dx = diagnostic.base_x_mm - target.x_mm
+        dy = diagnostic.base_y_mm - target.y_mm
+        if dx * dx + dy * dy <= radius_sq:
+            return True
+    return False
+
+
+def dynamic_opencv_target_diagnostics(
+    targets: list[RankedSegTarget],
+    *,
+    camera_to_base: np.ndarray,
+    min_x_mm: float,
+    max_x_mm: float,
+    min_y_mm: float,
+    max_y_mm: float,
+    pick_y_mm: float,
+    conveyor_speed_mm_s: float,
+    conveyor_direction: Literal["negative-y", "positive-y"],
+    suppressed: list[SuppressedDynamicTarget],
+    skip_radius_mm: float,
+) -> list[DynamicOpenCVTargetDiagnostic]:
+    diagnostics: list[DynamicOpenCVTargetDiagnostic] = []
+    for target in targets:
+        diagnostic = dynamic_opencv_target_diagnostic_from_target(
+            target,
+            camera_to_base=camera_to_base,
+            min_x_mm=min_x_mm,
+            max_x_mm=max_x_mm,
+            min_y_mm=min_y_mm,
+            max_y_mm=max_y_mm,
+            pick_y_mm=pick_y_mm,
+            conveyor_speed_mm_s=conveyor_speed_mm_s,
+            conveyor_direction=conveyor_direction,
+        )
+        if dynamic_opencv_diagnostic_is_suppressed(
+            diagnostic,
+            suppressed,
+            radius_mm=skip_radius_mm,
+        ):
+            diagnostic = replace(diagnostic, suppressed=True)
+        diagnostics.append(diagnostic)
+    return diagnostics
+
+
 def find_ranked_target(
     targets: list[RankedSegTarget],
     rank: int,
@@ -1299,6 +1434,63 @@ def print_target_table(
         print(f"\nNo valid OpenCV mask-depth target: {next(iter(errors.values()))}", flush=True)
     else:
         print("\nNo OpenCV non-belt-color target found.", flush=True)
+
+
+def format_dynamic_opencv_target_diagnostic(
+    diagnostic: DynamicOpenCVTargetDiagnostic,
+) -> str:
+    target = diagnostic.target
+    detection = target.detection
+    status = (
+        "candidate"
+        if not diagnostic.reject_reasons
+        else "reject=" + ",".join(diagnostic.reject_reasons)
+    )
+    if diagnostic.suppressed:
+        status = f"{status},suppressed"
+    return (
+        f"rank={target.rank} "
+        f"pixel=({diagnostic.center_point.u},{diagnostic.center_point.v}) "
+        f"bbox=({detection.x},{detection.y},{detection.width},{detection.height}) "
+        "camera="
+        f"({diagnostic.center_point.x_m:.4f},"
+        f"{diagnostic.center_point.y_m:.4f},"
+        f"{diagnostic.center_point.z_m:.4f})m "
+        "base="
+        f"({diagnostic.base_x_mm:.1f},"
+        f"{diagnostic.base_y_mm:.1f},"
+        f"{diagnostic.base_z_mm:.1f})mm "
+        f"remain_y={diagnostic.remaining_y_mm:.1f}mm "
+        f"t_arrive={diagnostic.t_arrive_s:.3f}s "
+        f"{status}"
+    )
+
+
+def print_dynamic_opencv_candidate_debug(
+    diagnostics: list[DynamicOpenCVTargetDiagnostic],
+    *,
+    min_x_mm: float,
+    max_x_mm: float,
+    min_y_mm: float,
+    max_y_mm: float,
+    pick_y_mm: float,
+    conveyor_speed_mm_s: float,
+    conveyor_direction: Literal["negative-y", "positive-y"],
+) -> None:
+    print(
+        "\nDynamic OpenCV candidate debug: "
+        f"X=[{min_x_mm:.1f},{max_x_mm:.1f}]mm "
+        f"Y=[{min_y_mm:.1f},{max_y_mm:.1f}]mm "
+        f"pick_y={pick_y_mm:.1f}mm "
+        f"direction={conveyor_direction} "
+        f"speed={conveyor_speed_mm_s:.1f}mm/s",
+        flush=True,
+    )
+    if not diagnostics:
+        print("  no ranked mask-depth targets", flush=True)
+        return
+    for diagnostic in diagnostics:
+        print("  " + format_dynamic_opencv_target_diagnostic(diagnostic), flush=True)
 
 
 def draw_opencv_targets(
@@ -1695,6 +1887,7 @@ def main() -> None:
     dynamic_sent = False
     suppressed_dynamic_targets: list[SuppressedDynamicTarget] = []
     last_dynamic_probe_time = 0.0
+    last_dynamic_debug_time = 0.0
     dynamic_status = (
         "Dynamic OpenCV mode: waiting for mask centroid in "
         f"X=[{args.dynamic_min_x_mm:.1f},{args.dynamic_max_x_mm:.1f}]mm, "
@@ -1821,6 +2014,37 @@ def main() -> None:
                     conveyor_speed_mm_s=args.conveyor_speed_mm_s,
                     conveyor_direction=args.conveyor_direction,
                 )
+                if (
+                    args.dynamic_debug_candidates
+                    and (
+                        args.print_interval == 0.0
+                        or now - last_dynamic_debug_time >= args.print_interval
+                    )
+                ):
+                    diagnostics = dynamic_opencv_target_diagnostics(
+                        latest_targets,
+                        camera_to_base=camera_to_base,
+                        min_x_mm=args.dynamic_min_x_mm,
+                        max_x_mm=args.dynamic_max_x_mm,
+                        min_y_mm=args.dynamic_min_y_mm,
+                        max_y_mm=args.dynamic_max_y_mm,
+                        pick_y_mm=args.dynamic_pick_y_mm,
+                        conveyor_speed_mm_s=args.conveyor_speed_mm_s,
+                        conveyor_direction=args.conveyor_direction,
+                        suppressed=suppressed_dynamic_targets,
+                        skip_radius_mm=args.dynamic_skip_radius_mm,
+                    )
+                    print_dynamic_opencv_candidate_debug(
+                        diagnostics,
+                        min_x_mm=args.dynamic_min_x_mm,
+                        max_x_mm=args.dynamic_max_x_mm,
+                        min_y_mm=args.dynamic_min_y_mm,
+                        max_y_mm=args.dynamic_max_y_mm,
+                        pick_y_mm=args.dynamic_pick_y_mm,
+                        conveyor_speed_mm_s=args.conveyor_speed_mm_s,
+                        conveyor_direction=args.conveyor_direction,
+                    )
+                    last_dynamic_debug_time = now
                 candidate = None
                 suppressed_count = 0
                 for item in candidates:
