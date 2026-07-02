@@ -127,6 +127,47 @@ class TestOpenCVGraspSendTcp(unittest.TestCase):
         self.assertEqual(len(segments), 1)
         self.assertEqual((segments[0].detection.x, segments[0].detection.y), (25, 25))
 
+    def test_detector_entry_edge_only_rejects_objects_touching_that_edge(self):
+        frame = green_frame()
+        frame[20:40, 40:60] = (0, 0, 255)
+        frame[30:50, 100:120] = (255, 0, 0)
+        detector = GreenConveyorOpenCVDetector(
+            GreenConveyorDetectorConfig(
+                min_area_px=50,
+                morphology_kernel_size=1,
+                roi_xywh=(20, 20, 100, 60),
+                entry_edge="right",
+            )
+        )
+
+        segments = detector.detect(frame)
+
+        self.assertEqual(len(segments), 1)
+        self.assertEqual((segments[0].detection.x, segments[0].detection.y), (40, 20))
+
+    def test_detector_entry_clear_frames_requires_consecutive_clear_frames(self):
+        detector = GreenConveyorOpenCVDetector(
+            GreenConveyorDetectorConfig(
+                min_area_px=50,
+                morphology_kernel_size=1,
+                entry_edge="right",
+                entry_clear_frames=2,
+            )
+        )
+        frame_touching = green_frame()
+        frame_touching[40:60, 140:160] = (0, 0, 255)
+        frame_clear_once = green_frame()
+        frame_clear_once[40:60, 120:140] = (0, 0, 255)
+        frame_clear_twice = green_frame()
+        frame_clear_twice[40:60, 100:120] = (0, 0, 255)
+
+        self.assertEqual(detector.detect(frame_touching), [])
+        self.assertEqual(detector.detect(frame_clear_once), [])
+        segments = detector.detect(frame_clear_twice)
+
+        self.assertEqual(len(segments), 1)
+        self.assertEqual((segments[0].detection.x, segments[0].detection.y), (100, 40))
+
     def test_hsv_range_supports_hue_wraparound(self):
         hsv = np.array([[[178, 200, 200], [5, 200, 200], [90, 200, 200]]], dtype=np.uint8)
 
@@ -343,6 +384,26 @@ class TestOpenCVGraspSendTcp(unittest.TestCase):
         self.assertEqual(config.highlight_min_v, 190)
         self.assertTrue(config.reject_shadow)
         self.assertEqual(config.shadow_max_v, 20)
+
+    def test_entry_edge_arguments_are_stored_in_detector_config(self):
+        args = build_parser().parse_args(
+            [
+                "--dry-run",
+                "--entry-edge",
+                "right",
+                "--entry-clear-margin-px",
+                "12",
+                "--entry-clear-frames",
+                "3",
+            ]
+        )
+
+        validate_args(args)
+        config = detector_config_from_args(args)
+
+        self.assertEqual(config.entry_edge, "right")
+        self.assertEqual(config.entry_clear_margin_px, 12)
+        self.assertEqual(config.entry_clear_frames, 3)
 
 
 if __name__ == "__main__":

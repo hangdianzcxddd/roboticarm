@@ -138,7 +138,38 @@ python -m robot_control.windows.hand_eye.capture_chessboard ^
 - 每次角度变化 10-25 度，避免角点太斜导致识别不稳。
 - 不要让棋盘格部分出画、反光、模糊或被夹爪遮挡。
 
-## 5. 求解
+## 5. 自动采集
+
+自动采集脚本会主动小范围移动机械臂、查询 Windows 视觉服务，并保存合格样本。
+默认使用关节空间小步随机移动，避免 `EndPoseCtrl` 的 IK 分支切换导致腕部突然
+翻转。
+
+```bash
+python3 -m robot_control.linux.hand_eye.auto_collect_hand_eye \
+  --vision-host <windows-ip> \
+  --vision-port 5011 \
+  --can can0 \
+  --mode eye_to_hand \
+  --output robot_control/linux/hand_eye/eye_to_hand_samples_auto.json \
+  --samples 25 \
+  --speed 5 \
+  --post-move-stabilize-s 4.0 \
+  --overwrite \
+  --execute
+```
+
+安全相关默认值：
+
+- `--motion-space joint`：默认值，使用 `JointCtrl` 小步采样。
+- `--step-base-joint-deg 3`、`--step-wrist-joint-deg 4`：每次随机候选的最大步长。
+- `--range-base-joint-deg 15`、`--range-wrist-joint-deg 18`：相对 seed 的最大采样范围。
+- `--max-joint-delta-deg 12`、`--max-wrist-joint-delta-deg 8`：单段运动的反馈跳变上限。
+
+脚本会在每段运动期间读取关节反馈；如果 J4/J5/J6 等关节跳变超过阈值，会停止
+自动采集并要求人工确认安全姿态。不要在现场使用 `--motion-space pose`，除非只是
+复现实验；该模式仍有跳变监控，但无法从源头避免 IK 换解。
+
+## 6. 求解
 
 Linux 侧运行：
 
@@ -159,7 +190,7 @@ robot_control/linux/hand_eye/hand_eye_result.json
 `eye_to_hand` 下结果 `transform` 是 `camera -> base`。后续把相机坐标系下的点
 变换到机械臂基坐标系时使用这个矩阵。
 
-## 6. 验证矩阵
+## 7. 验证矩阵
 
 矩阵准确性的直接验证方式是：在 Windows 相机画面里点击一个 base 坐标已知的
 物理点，用 `camera -> base` 反推它的机械臂基坐标，然后和真实坐标比较。

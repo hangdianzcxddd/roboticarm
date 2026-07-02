@@ -312,6 +312,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--transfer-mode", choices=("P", "L"), default="P")
     parser.add_argument("--vertical-mode", choices=("P", "L"), default="L")
+    parser.add_argument(
+        "--lift-mode",
+        choices=("P", "L"),
+        default="P",
+        help=(
+            "motion mode for pick_lift/return_pick_lift after grasping; defaults "
+            "to P to avoid MOVE_L lift limit failures"
+        ),
+    )
     parser.add_argument("--command-duration-s", type=float, default=1.0)
     parser.add_argument("--command-period-s", type=float, default=0.02)
     parser.add_argument("--motion-timeout-s", type=float, default=8.0)
@@ -696,18 +705,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.0,
         help="pause before descending from target-above to target-grasp",
     )
-    parser.add_argument("--place-x-mm", type=float, default=130.0)
-    parser.add_argument("--place-y-mm", type=float, default=200.0)
+    parser.add_argument("--place-x-mm", type=float, default=80.0)
+    parser.add_argument("--place-y-mm", type=float, default=260.0)
     parser.add_argument(
         "--place-pick-x-mm",
         type=float,
-        default=-130.0,
+        default=80.0,
         help="X used when picking the object back from the fixed place area",
     )
     parser.add_argument(
         "--place-pick-y-mm",
         type=float,
-        default=200.0,
+        default=-260.0,
         help="Y used when picking the object back from the fixed place area",
     )
     parser.add_argument(
@@ -1386,7 +1395,7 @@ def build_out_steps(
         SequenceStep(
             "pick_lift",
             pick_above,
-            args.vertical_mode,
+            args.lift_mode,
             joint_pitch_after_pose=use_joint_pitch,
             pitch_source_x_mm=pitch_x_mm,
             planar_ik=use_ik,
@@ -1465,7 +1474,7 @@ def build_in_steps(
         SequenceStep(
             "return_pick_lift",
             pick_above,
-            args.vertical_mode,
+            args.lift_mode,
             joint_pitch_after_pose=use_joint_pitch,
             pitch_source_x_mm=pitch_x_mm,
             planar_ik=use_ik,

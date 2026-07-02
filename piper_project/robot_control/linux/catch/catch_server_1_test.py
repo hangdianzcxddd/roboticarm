@@ -37,6 +37,7 @@ def make_args(**overrides: object) -> argparse.Namespace:
         "startup_speed": 10,
         "transfer_mode": "P",
         "vertical_mode": "L",
+        "lift_mode": "P",
         "command_duration_s": 0.0,
         "command_period_s": 0.02,
         "motion_timeout_s": 0.0,
@@ -104,10 +105,10 @@ def make_args(**overrides: object) -> argparse.Namespace:
         "planar_ik_joint_tolerance_deg": 2.0,
         "planar_ik_fk_tool_z_offset_mm": 82.0,
         "pick_delay_s": 0.0,
-        "place_x_mm": 130.0,
-        "place_y_mm": 200.0,
-        "place_pick_x_mm": -130.0,
-        "place_pick_y_mm": 200.0,
+        "place_x_mm": 80.0,
+        "place_y_mm": 260.0,
+        "place_pick_x_mm": 80.0,
+        "place_pick_y_mm": -260.0,
         "place_pick_z_mm": None,
         "place_pick_delay_s": 3.0,
         "grasp_only": False,
@@ -279,10 +280,10 @@ class TestCatchServer1(unittest.TestCase):
         self.assertAlmostEqual(args.guarded_step_timeout_s, 0.25)
         self.assertEqual(args.guarded_abort_return, "pick_above")
         self.assertEqual(args.startup_speed, 10)
-        self.assertAlmostEqual(args.place_x_mm, 130.0)
-        self.assertAlmostEqual(args.place_y_mm, 200.0)
-        self.assertAlmostEqual(args.place_pick_x_mm, -130.0)
-        self.assertAlmostEqual(args.place_pick_y_mm, 200.0)
+        self.assertAlmostEqual(args.place_x_mm, 80.0)
+        self.assertAlmostEqual(args.place_y_mm, 260.0)
+        self.assertAlmostEqual(args.place_pick_x_mm, 80.0)
+        self.assertAlmostEqual(args.place_pick_y_mm, -260.0)
         self.assertFalse(args.dynamic_pitch_by_x)
         self.assertEqual(args.dynamic_pitch_mode, "joint")
         self.assertEqual(args.dynamic_wait_placement, "wait")
@@ -397,7 +398,7 @@ class TestCatchServer1(unittest.TestCase):
         )
         self.assertEqual(
             [step.mode for step in steps],
-            ["P", "P", "L", "L", "P", "P", "P"],
+            ["P", "P", "L", "P", "P", "P", "P"],
         )
         self.assertAlmostEqual(steps[1].pose.x_mm, 300.0)
         self.assertAlmostEqual(steps[1].pose.y_mm, 20.0)
@@ -412,6 +413,20 @@ class TestCatchServer1(unittest.TestCase):
         )
         self.assertEqual(steps[2].delay_before_s, 1.25)
         self.assertTrue(all(step.delay_before_s == 0.0 for step in steps[3:]))
+        self.assertEqual(steps[2].mode, args.vertical_mode)
+        self.assertEqual(steps[3].mode, args.lift_mode)
+
+    def test_lift_mode_can_be_overridden_to_linear(self):
+        args = make_args(lift_mode="L")
+        command = CameraPointCommand(x_m=0.0, y_m=0.0, z_m=0.0, command_id="cmd")
+        camera_to_base = np.eye(4, dtype=float)
+        camera_to_base[:3, 3] = np.array([0.30, 0.02, 0.10])
+
+        target = target_from_command(command, camera_to_base, args)
+        steps = build_steps(args, target)
+
+        self.assertEqual(steps[3].label, "pick_lift")
+        self.assertEqual(steps[3].mode, "L")
 
     def test_force_pick_y_and_adaptive_pitch_marks_only_outside_keep_band(self):
         args = make_args(
@@ -571,6 +586,8 @@ class TestCatchServer1(unittest.TestCase):
         self.assertAlmostEqual(steps[2].pose.x_mm, 220.0)
         self.assertAlmostEqual(steps[2].pose.y_mm, -40.0)
         self.assertAlmostEqual(steps[2].pose.z_mm, args.grasp_z_mm)
+        self.assertEqual(steps[2].mode, args.vertical_mode)
+        self.assertEqual(steps[3].mode, args.lift_mode)
         self.assertAlmostEqual(steps[5].pose.x_mm, args.ready_x_mm)
         self.assertAlmostEqual(steps[5].pose.y_mm, args.ready_y_mm)
         self.assertAlmostEqual(steps[5].pose.z_mm, args.transfer_z_mm)
@@ -2045,7 +2062,7 @@ class TestCatchServer1(unittest.TestCase):
             call for call in controller.sdk.calls if call[0] == "EndPoseCtrl"
         ]
         self.assertIn(
-            ("EndPoseCtrl", (130000, 200000, 253252, -176794, 889, -105491)),
+            ("EndPoseCtrl", (80000, 260000, 253252, -176794, 889, -105491)),
             end_pose_calls,
         )
         gripper_calls = [call for call in controller.sdk.calls if call[0] == "GripperCtrl"]

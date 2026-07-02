@@ -87,7 +87,16 @@ class GreenConveyorDetectorConfig:
     morphology_iterations: int = 1
     roi_xywh: tuple[int, int, int, int] | None = None
     reject_roi_border_touching: bool = False
+    entry_edge: Literal["left", "right", "top", "bottom"] | None = None
+    entry_clear_margin_px: int = 0
+    entry_clear_frames: int = 1
     label: str = "opencv_object"
+
+
+@dataclass(frozen=True)
+class _EntryClearTrack:
+    bbox_xywh: tuple[int, int, int, int]
+    clear_frames: int
 
 
 @dataclass(frozen=True)
@@ -143,6 +152,7 @@ class GreenConveyorOpenCVDetector:
         self.last_roi_mask: np.ndarray | None = None
         self.last_highlight_mask: np.ndarray | None = None
         self.last_shadow_mask: np.ndarray | None = None
+        self._entry_clear_tracks: list[_EntryClearTrack] = []
 
     def detect(self, frame_bgr: np.ndarray) -> list[SegmentationDetection]:
         if frame_bgr.ndim != 3 or frame_bgr.shape[2] != 3:
@@ -192,6 +202,9 @@ class GreenConveyorOpenCVDetector:
             cv2.CHAIN_APPROX_SIMPLE,
         )
         roi_bounds = roi_bounds_for_frame((height, width), self.config.roi_xywh)
+        previous_entry_tracks = self._entry_clear_tracks
+        next_entry_tracks: list[_EntryClearTrack] = []
+        used_entry_track_indexes: set[int] = set()
 
         segments: list[SegmentationDetection] = []
         for contour in contours:
@@ -210,6 +223,34 @@ class GreenConveyorOpenCVDetector:
                 roi_bounds,
             ):
                 continue
+
+            if self.config.entry_edge is not None:
+                track_index, previous_track = find_matching_entry_clear_track(
+                    (int(x), int(y), int(bbox_width), int(bbox_height)),
+                    previous_entry_tracks,
+                    used_entry_track_indexes,
+                )
+                if track_index is not None:
+                    used_entry_track_indexes.add(track_index)
+                touches_entry = bbox_touches_entry_border(
+                    x,
+                    y,
+                    bbox_width,
+                    bbox_height,
+                    roi_bounds,
+                    edge=self.config.entry_edge,
+                    margin_px=self.config.entry_clear_margin_px,
+                )
+                previous_clear_frames = 0 if previous_track is None else previous_track.clear_frames
+                clear_frames = 0 if touches_entry else previous_clear_frames + 1
+                next_entry_tracks.append(
+                    _EntryClearTrack(
+                        bbox_xywh=(int(x), int(y), int(bbox_width), int(bbox_height)),
+                        clear_frames=clear_frames,
+                    )
+                )
+                if clear_frames < self.config.entry_clear_frames:
+                    continue
 
             fill_ratio = area / float(max(1, bbox_width * bbox_height))
             if fill_ratio < self.config.min_fill_ratio:
@@ -250,6 +291,11 @@ class GreenConveyorOpenCVDetector:
                     centroid_v=centroid_v,
                 )
             )
+
+        if self.config.entry_edge is not None:
+            self._entry_clear_tracks = next_entry_tracks
+        else:
+            self._entry_clear_tracks = []
 
         segments.sort(key=lambda item: (item.mask_area_px, item.detection.area), reverse=True)
         if self.config.max_results > 0:
@@ -380,6 +426,67 @@ def bbox_touches_roi_border(
 ) -> bool:
     x0, y0, x1, y1 = roi_bounds
     return x <= x0 or y <= y0 or x + width >= x1 or y + height >= y1
+
+
+def bbox_touches_entry_border(
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+    roi_bounds: tuple[int, int, int, int],
+    *,
+    edge: Literal["left", "right", "top", "bottom"],
+    margin_px: int,
+) -> bool:
+    x0, y0, x1, y1 = roi_bounds
+    margin = max(0, int(margin_px))
+    if edge == "left":
+        return x <= x0 + margin
+    if edge == "right":
+        return x + width >= x1 - margin
+    if edge == "top":
+        return y <= y0 + margin
+    if edge == "bottom":
+        return y + height >= y1 - margin
+    raise ValueError(f"unsupported entry edge: {edge!r}")
+
+
+def bbox_center_distance_px(
+    bbox_a: tuple[int, int, int, int],
+    bbox_b: tuple[int, int, int, int],
+) -> float:
+    ax, ay, aw, ah = bbox_a
+    bx, by, bw, bh = bbox_b
+    acx = float(ax) + float(aw) / 2.0
+    acy = float(ay) + float(ah) / 2.0
+    bcx = float(bx) + float(bw) / 2.0
+    bcy = float(by) + float(bh) / 2.0
+    return float(math.hypot(acx - bcx, acy - bcy))
+
+
+def find_matching_entry_clear_track(
+    bbox_xywh: tuple[int, int, int, int],
+    tracks: list[_EntryClearTrack],
+    used_track_indexes: set[int],
+) -> tuple[int | None, _EntryClearTrack | None]:
+    if not tracks:
+        return None, None
+    _, _, width, height = bbox_xywh
+    max_distance_px = max(20.0, float(max(width, height)))
+    best_index: int | None = None
+    best_track: _EntryClearTrack | None = None
+    best_distance = float("inf")
+    for index, track in enumerate(tracks):
+        if index in used_track_indexes:
+            continue
+        distance = bbox_center_distance_px(bbox_xywh, track.bbox_xywh)
+        if distance < best_distance:
+            best_index = index
+            best_track = track
+            best_distance = distance
+    if best_distance > max_distance_px:
+        return None, None
+    return best_index, best_track
 
 
 def normalize_degrees(angle_deg: float) -> float:
@@ -645,6 +752,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="ignore components touching the ROI/image border, useful for complete-object gating",
     )
     parser.add_argument(
+        "--entry-edge",
+        choices=("left", "right", "top", "bottom"),
+        help=(
+            "only gate objects touching this ROI/image entry edge; use this when "
+            "objects should be detected after fully entering from one side"
+        ),
+    )
+    parser.add_argument(
+        "--entry-clear-margin-px",
+        type=int,
+        default=0,
+        help="pixel margin inside --entry-edge that must be clear before accepting an object",
+    )
+    parser.add_argument(
+        "--entry-clear-frames",
+        type=int,
+        default=1,
+        help="consecutive frames an object must stay clear of --entry-edge before detection",
+    )
+    parser.add_argument(
         "--label",
         default="opencv_object",
         help="label stored in the TCP payload for OpenCV detections",
@@ -852,6 +979,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--morphology-kernel-size must be >= 1")
     if args.morphology_iterations < 1:
         raise ValueError("--morphology-iterations must be >= 1")
+    if args.entry_clear_margin_px < 0:
+        raise ValueError("--entry-clear-margin-px must be >= 0")
+    if args.entry_clear_frames < 1:
+        raise ValueError("--entry-clear-frames must be >= 1")
     if args.print_interval < 0.0:
         raise ValueError("--print-interval must be >= 0")
     if args.base_z_offset_mm != 0.0 and args.hand_eye_result is None:
@@ -918,6 +1049,9 @@ def detector_config_from_args(args: argparse.Namespace) -> GreenConveyorDetector
         morphology_iterations=int(args.morphology_iterations),
         roi_xywh=tuple(int(item) for item in args.roi) if args.roi is not None else None,
         reject_roi_border_touching=bool(args.reject_roi_border_touching),
+        entry_edge=args.entry_edge,
+        entry_clear_margin_px=int(args.entry_clear_margin_px),
+        entry_clear_frames=int(args.entry_clear_frames),
         label=str(args.label),
     )
 
