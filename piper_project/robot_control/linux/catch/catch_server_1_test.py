@@ -24,6 +24,7 @@ from robot_control.linux.catch.catch_server_1 import (
     PlanarIkSolution,
     target_from_command,
     validate_args,
+    wait_for_dynamic_timing,
     yolo_metadata_from_message,
 )
 from robot_control.linux.config.robot_config import RobotConfig
@@ -47,6 +48,15 @@ def make_args(**overrides: object) -> argparse.Namespace:
         "print_feedback": False,
         "debug_plan": False,
         "t_robot_s": 1.7,
+        "dynamic_t_robot_by_x": False,
+        "dynamic_t_robot_reference_x_mm": None,
+        "dynamic_t_robot_s_per_mm": 0.0,
+        "dynamic_t_robot_planar_far_s_per_mm": 0.0,
+        "dynamic_t_robot_planar_near_s_per_mm": 0.0,
+        "dynamic_t_robot_margin_s": 0.0,
+        "dynamic_t_robot_min_s": None,
+        "dynamic_t_robot_max_s": None,
+        "dynamic_too_close_skip": False,
         "dynamic_preposition": False,
         "dynamic_wait_placement": "wait",
         "dynamic_preposition_clearance_mm": 20.0,
@@ -169,11 +179,13 @@ class FeedbackPiperSdk(FakePiperSdk):
         pose: EndPose,
         *,
         freeze_pose: bool = False,
+        freeze_below_z_mm: float | None = None,
         stall_z_mm: float | None = None,
     ) -> None:
         super().__init__()
         self.pose = pose
         self.freeze_pose = freeze_pose
+        self.freeze_below_z_mm = freeze_below_z_mm
         self.stall_z_mm = stall_z_mm
         self.gripper_feedbacks: list[FakeGripperFeedback] = []
 
@@ -182,6 +194,8 @@ class FeedbackPiperSdk(FakePiperSdk):
         if self.freeze_pose:
             return
         next_z_mm = Z / 1000.0
+        if self.freeze_below_z_mm is not None and next_z_mm < self.freeze_below_z_mm:
+            return
         if self.stall_z_mm is not None and next_z_mm < self.stall_z_mm:
             next_z_mm = self.stall_z_mm
         self.pose = EndPose(
@@ -191,6 +205,12 @@ class FeedbackPiperSdk(FakePiperSdk):
             RX / 1000.0,
             RY / 1000.0,
             RZ / 1000.0,
+        )
+
+    def JointCtrl(self, joint_1, joint_2, joint_3, joint_4, joint_5, joint_6):
+        super().JointCtrl(joint_1, joint_2, joint_3, joint_4, joint_5, joint_6)
+        self.joint_feedback = FakeJointFeedback(
+            (joint_1, joint_2, joint_3, joint_4, joint_5, joint_6)
         )
 
     def GetArmEndPoseMsgs(self):
@@ -236,10 +256,16 @@ def make_feedback_controller(
     pose: EndPose,
     *,
     freeze_pose: bool = False,
+    freeze_below_z_mm: float | None = None,
     stall_z_mm: float | None = None,
     gripper_efforts_nm: list[float] | None = None,
 ) -> PiperController:
-    sdk = FeedbackPiperSdk(pose, freeze_pose=freeze_pose, stall_z_mm=stall_z_mm)
+    sdk = FeedbackPiperSdk(
+        pose,
+        freeze_pose=freeze_pose,
+        freeze_below_z_mm=freeze_below_z_mm,
+        stall_z_mm=stall_z_mm,
+    )
     sdk.gripper_feedbacks = [
         FakeGripperFeedback(position_mm=0.0, effort_nm=effort)
         for effort in (gripper_efforts_nm or [])
@@ -310,6 +336,15 @@ class TestCatchServer1(unittest.TestCase):
         self.assertAlmostEqual(args.grasp_yaw_deadband_deg, 5.0)
         self.assertEqual(args.grasp_yaw_speed, 20)
         self.assertAlmostEqual(args.pick_x_offset_mm, 0.0)
+        self.assertFalse(args.dynamic_t_robot_by_x)
+        self.assertIsNone(args.dynamic_t_robot_reference_x_mm)
+        self.assertAlmostEqual(args.dynamic_t_robot_s_per_mm, 0.0)
+        self.assertAlmostEqual(args.dynamic_t_robot_planar_far_s_per_mm, 0.0)
+        self.assertAlmostEqual(args.dynamic_t_robot_planar_near_s_per_mm, 0.0)
+        self.assertAlmostEqual(args.dynamic_t_robot_margin_s, 0.0)
+        self.assertIsNone(args.dynamic_t_robot_min_s)
+        self.assertIsNone(args.dynamic_t_robot_max_s)
+        self.assertFalse(args.dynamic_too_close_skip)
 
         args = build_parser().parse_args(["--use-detected-z"])
         self.assertEqual(args.use_detected_z, "center")
@@ -330,6 +365,22 @@ class TestCatchServer1(unittest.TestCase):
                 "25",
                 "--dynamic-wait-placement",
                 "nowait",
+                "--dynamic-t-robot-by-x",
+                "--dynamic-t-robot-reference-x-mm",
+                "300",
+                "--dynamic-t-robot-s-per-mm",
+                "0.002",
+                "--dynamic-t-robot-planar-far-s-per-mm",
+                "0.006",
+                "--dynamic-t-robot-planar-near-s-per-mm",
+                "0.004",
+                "--dynamic-t-robot-margin-s",
+                "0.1",
+                "--dynamic-t-robot-min-s",
+                "1.4",
+                "--dynamic-t-robot-max-s",
+                "3.2",
+                "--dynamic-too-close-skip",
             ]
         )
 
@@ -339,6 +390,15 @@ class TestCatchServer1(unittest.TestCase):
         self.assertEqual(args.startup_speed, 9)
         self.assertEqual(args.planar_ik_speed, 25)
         self.assertEqual(args.dynamic_wait_placement, "nowait")
+        self.assertTrue(args.dynamic_t_robot_by_x)
+        self.assertAlmostEqual(args.dynamic_t_robot_reference_x_mm, 300.0)
+        self.assertAlmostEqual(args.dynamic_t_robot_s_per_mm, 0.002)
+        self.assertAlmostEqual(args.dynamic_t_robot_planar_far_s_per_mm, 0.006)
+        self.assertAlmostEqual(args.dynamic_t_robot_planar_near_s_per_mm, 0.004)
+        self.assertAlmostEqual(args.dynamic_t_robot_margin_s, 0.1)
+        self.assertAlmostEqual(args.dynamic_t_robot_min_s, 1.4)
+        self.assertAlmostEqual(args.dynamic_t_robot_max_s, 3.2)
+        self.assertTrue(args.dynamic_too_close_skip)
 
     def test_parser_accepts_adaptive_joint_pitch_alias_and_slope_defaults(self):
         args = build_parser().parse_args(["--adaptive-joint-pitch-by-x"])
@@ -401,8 +461,10 @@ class TestCatchServer1(unittest.TestCase):
         )
         self.assertEqual(
             [step.mode for step in steps],
-            ["P", "P", "L", args.lift_mode, "P", "P", "P"],
+            ["P", "L", "L", args.lift_mode, "P", "P", "P"],
         )
+        self.assertTrue(steps[1].require_reached)
+        self.assertFalse(steps[2].require_reached)
         self.assertAlmostEqual(steps[1].pose.x_mm, 300.0)
         self.assertAlmostEqual(steps[1].pose.y_mm, 20.0)
         self.assertAlmostEqual(steps[1].pose.z_mm, args.transfer_z_mm)
@@ -642,6 +704,8 @@ class TestCatchServer1(unittest.TestCase):
             ],
         )
         self.assertEqual([step.gripper_after for step in steps], ["open", None, "close", None, None, "open"])
+        self.assertEqual(steps[1].mode, "L")
+        self.assertTrue(steps[1].require_reached)
         self.assertEqual(steps[1].delay_before_s, 2.5)
         self.assertAlmostEqual(steps[2].pose.x_mm, 220.0)
         self.assertAlmostEqual(steps[2].pose.y_mm, -40.0)
@@ -815,6 +879,59 @@ class TestCatchServer1(unittest.TestCase):
         self.assertAlmostEqual(response["payload"]["dynamic_timing"]["t_robot_s"], 0.30)
         self.assertAlmostEqual(response["payload"]["dynamic_timing"]["action_time_s"], 0.30)
         self.assertAlmostEqual(response["payload"]["dynamic_timing"]["t_wait_s"], 0.50)
+        self.assertEqual(response["payload"]["dynamic_timing"]["t_robot_source"], "constant")
+
+    def test_handle_dynamic_message_reports_x_based_robot_timing_from_raw_x(self):
+        args = make_args(
+            debug_plan=True,
+            t_robot_s=1.8,
+            dynamic_t_robot_by_x=True,
+            dynamic_t_robot_reference_x_mm=300.0,
+            dynamic_t_robot_s_per_mm=0.002,
+            dynamic_t_robot_planar_far_s_per_mm=0.006,
+            dynamic_t_robot_margin_s=0.1,
+            dynamic_pitch_by_x=True,
+            dynamic_pitch_mode="planar-ik",
+            keep_pitch_min_x_mm=220.0,
+            keep_pitch_max_x_mm=355.0,
+            pick_x_offset_mm=-30.0,
+            min_target_x_mm=200.0,
+        )
+        camera_to_base = np.eye(4, dtype=float)
+        message = make_camera_point_message(
+            CameraPointCommand(
+                x_m=0.0,
+                y_m=0.0,
+                z_m=0.30,
+                command_id="cmd-dynamic-x-time",
+                grasp_mode="dynamic",
+                t_arrive_s=4.0,
+                conveyor_speed_mm_s=100.0,
+                pick_x_mm=420.0,
+                pick_y_mm=0.0,
+                detected_z_mm=120.0,
+            )
+        )
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            response = handle_message(
+                message,
+                args=args,
+                camera_to_base=camera_to_base,
+                validator=make_controller(),
+            )
+
+        timing = response["payload"]["dynamic_timing"]
+        expected = 1.8 + (300.0 - 420.0) * 0.002 + 0.1
+        self.assertAlmostEqual(response["payload"]["raw_pick_x_mm"], 420.0)
+        self.assertAlmostEqual(response["payload"]["pick_x_mm"], 390.0)
+        self.assertAlmostEqual(timing["t_robot_s"], expected)
+        self.assertEqual(timing["t_robot_source"], "x_linear")
+        self.assertIsNone(timing["t_robot_segment"])
+        self.assertAlmostEqual(timing["t_robot_source_x_mm"], 420.0)
+        self.assertAlmostEqual(timing["t_robot_reference_x_mm"], 300.0)
+        self.assertAlmostEqual(timing["t_robot_base_s"], 1.8)
+        self.assertAlmostEqual(timing["t_robot_margin_s"], 0.1)
 
     def test_dynamic_preposition_pose_uses_detected_object_height_clearance(self):
         args = make_args(
@@ -1266,6 +1383,148 @@ class TestCatchServer1(unittest.TestCase):
         self.assertEqual(timing.wait_placement, "nowait")
         self.assertAlmostEqual(timing.final_action_time_s, 0.55)
 
+    def test_dynamic_t_robot_by_x_disabled_keeps_constant_robot_time(self):
+        args = make_args(
+            dynamic_preposition=True,
+            dynamic_wait_placement="nowait",
+            t_robot_s=2.0,
+            dynamic_t_robot_by_x=False,
+            dynamic_t_robot_s_per_mm=0.01,
+            dynamic_t_robot_planar_far_s_per_mm=0.02,
+        )
+        command = CameraPointCommand(
+            x_m=0.0,
+            y_m=0.0,
+            z_m=0.0,
+            command_id="cmd-dynamic-constant-time",
+            grasp_mode="dynamic",
+            t_arrive_s=3.0,
+            pick_x_mm=450.0,
+            pick_y_mm=0.0,
+        )
+
+        timing = dynamic_timing_from_command(command, args, source_x_mm=450.0)
+
+        assert timing is not None
+        self.assertAlmostEqual(timing.t_robot_s, 2.0)
+        self.assertEqual(timing.t_robot_source, "constant")
+        self.assertIsNone(timing.t_robot_segment)
+        self.assertAlmostEqual(timing.action_time_s, 2.0)
+
+    def test_dynamic_t_robot_by_x_linear_uses_reference_distance(self):
+        args = make_args(
+            dynamic_preposition=True,
+            dynamic_wait_placement="nowait",
+            t_robot_s=1.8,
+            dynamic_t_robot_by_x=True,
+            dynamic_t_robot_reference_x_mm=300.0,
+            dynamic_t_robot_s_per_mm=0.002,
+            dynamic_t_robot_margin_s=0.1,
+        )
+        command = CameraPointCommand(
+            x_m=0.0,
+            y_m=0.0,
+            z_m=0.0,
+            command_id="cmd-dynamic-ordinary-time",
+            grasp_mode="dynamic",
+            t_arrive_s=4.0,
+            pick_x_mm=340.0,
+            pick_y_mm=0.0,
+        )
+
+        timing = dynamic_timing_from_command(command, args, source_x_mm=340.0)
+
+        assert timing is not None
+        self.assertAlmostEqual(timing.t_robot_s, 1.8 + (300.0 - 340.0) * 0.002 + 0.1)
+        self.assertEqual(timing.t_robot_source, "x_linear")
+        self.assertIsNone(timing.t_robot_segment)
+        self.assertAlmostEqual(timing.t_robot_reference_x_mm, 300.0)
+        self.assertAlmostEqual(timing.t_robot_base_s, 1.8)
+        self.assertAlmostEqual(timing.t_wait_s, 4.0 - timing.t_robot_s)
+
+    def test_dynamic_t_robot_by_x_positive_slope_makes_smaller_x_slower(self):
+        args = make_args(
+            dynamic_preposition=True,
+            dynamic_wait_placement="nowait",
+            t_robot_s=2.1,
+            dynamic_t_robot_by_x=True,
+            dynamic_t_robot_reference_x_mm=300.0,
+            dynamic_t_robot_s_per_mm=0.002,
+        )
+        near_command = CameraPointCommand(
+            x_m=0.0,
+            y_m=0.0,
+            z_m=0.0,
+            command_id="cmd-dynamic-near-x-time",
+            grasp_mode="dynamic",
+            t_arrive_s=4.0,
+            pick_x_mm=260.0,
+            pick_y_mm=0.0,
+        )
+        far_command = CameraPointCommand(
+            x_m=0.0,
+            y_m=0.0,
+            z_m=0.0,
+            command_id="cmd-dynamic-far-x-time",
+            grasp_mode="dynamic",
+            t_arrive_s=4.0,
+            pick_x_mm=340.0,
+            pick_y_mm=0.0,
+        )
+
+        near_timing = dynamic_timing_from_command(
+            near_command,
+            args,
+            source_x_mm=260.0,
+        )
+        far_timing = dynamic_timing_from_command(
+            far_command,
+            args,
+            source_x_mm=340.0,
+        )
+
+        assert near_timing is not None
+        assert far_timing is not None
+        self.assertAlmostEqual(near_timing.t_robot_s, 2.1 + 40.0 * 0.002)
+        self.assertAlmostEqual(far_timing.t_robot_s, 2.1 - 40.0 * 0.002)
+        self.assertGreater(near_timing.t_robot_s, far_timing.t_robot_s)
+
+    def test_dynamic_t_robot_by_x_ignores_legacy_planar_slopes(self):
+        args = make_args(
+            dynamic_preposition=True,
+            dynamic_wait_placement="nowait",
+            t_robot_s=1.8,
+            dynamic_t_robot_by_x=True,
+            dynamic_t_robot_reference_x_mm=300.0,
+            dynamic_t_robot_s_per_mm=0.002,
+            dynamic_t_robot_planar_far_s_per_mm=0.006,
+            dynamic_t_robot_planar_near_s_per_mm=0.004,
+            dynamic_t_robot_margin_s=0.1,
+            dynamic_pitch_by_x=True,
+            dynamic_pitch_mode="planar-ik",
+            keep_pitch_min_x_mm=220.0,
+            keep_pitch_max_x_mm=355.0,
+        )
+        command = CameraPointCommand(
+            x_m=0.0,
+            y_m=0.0,
+            z_m=0.0,
+            command_id="cmd-dynamic-planar-far-time",
+            grasp_mode="dynamic",
+            t_arrive_s=4.0,
+            pick_x_mm=390.0,
+            pick_y_mm=0.0,
+        )
+
+        timing = dynamic_timing_from_command(command, args, source_x_mm=420.0)
+
+        assert timing is not None
+        expected = 1.8 + (300.0 - 420.0) * 0.002 + 0.1
+        self.assertAlmostEqual(timing.t_robot_s, expected)
+        self.assertEqual(timing.t_robot_source, "x_linear")
+        self.assertIsNone(timing.t_robot_segment)
+        self.assertAlmostEqual(timing.t_robot_source_x_mm, 420.0)
+
     def test_execute_dynamic_preposition_guarded_descent_success(self):
         args = make_args(
             execute=True,
@@ -1704,8 +1963,8 @@ class TestCatchServer1(unittest.TestCase):
         end_pose_calls = [call for call in controller.sdk.calls if call[0] == "EndPoseCtrl"]
         self.assertEqual(end_pose_calls, [])
 
-    def test_handle_dynamic_message_skips_when_target_is_too_close(self):
-        args = make_args(execute=True, t_robot_s=0.30)
+    def test_handle_dynamic_message_skips_when_target_is_too_close_if_enabled(self):
+        args = make_args(execute=True, t_robot_s=0.30, dynamic_too_close_skip=True)
         camera_to_base = np.eye(4, dtype=float)
         message = make_camera_point_message(
             CameraPointCommand(
@@ -1739,6 +1998,69 @@ class TestCatchServer1(unittest.TestCase):
         end_pose_calls = [call for call in controller.sdk.calls if call[0] == "EndPoseCtrl"]
         self.assertEqual(end_pose_calls, [])
 
+    def test_handle_dynamic_message_accepts_late_target_when_skip_disabled(self):
+        args = make_args(
+            execute=False,
+            t_robot_s=0.30,
+        )
+        camera_to_base = np.eye(4, dtype=float)
+        message = make_camera_point_message(
+            CameraPointCommand(
+                x_m=0.35,
+                y_m=0.02,
+                z_m=0.30,
+                command_id="cmd-dynamic-late-allowed",
+                grasp_mode="dynamic",
+                t_arrive_s=0.10,
+                conveyor_speed_mm_s=100.0,
+                pick_x_mm=350.0,
+                pick_y_mm=-30.0,
+            )
+        )
+        controller = make_controller()
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            response = handle_message(
+                message,
+                args=args,
+                camera_to_base=camera_to_base,
+                validator=controller,
+                controller=controller,
+            )
+
+        self.assertEqual(response["type"], "ack")
+        self.assertFalse(response["payload"]["executed"])
+        self.assertFalse(response["payload"]["skipped"])
+        timing = response["payload"]["dynamic_timing"]
+        self.assertFalse(timing["skipped"])
+        self.assertFalse(timing["too_close_skip_enabled"])
+        self.assertLess(timing["t_wait_s"], 0.0)
+
+    def test_wait_for_dynamic_timing_starts_immediately_when_late_skip_disabled(self):
+        args = make_args(t_robot_s=0.30, dynamic_too_close_skip=False)
+        command = CameraPointCommand(
+            x_m=0.35,
+            y_m=0.02,
+            z_m=0.30,
+            command_id="cmd-dynamic-late-allowed",
+            grasp_mode="dynamic",
+            t_arrive_s=0.10,
+            conveyor_speed_mm_s=100.0,
+            pick_x_mm=350.0,
+            pick_y_mm=-30.0,
+        )
+        timing = dynamic_timing_from_command(command, args, source_x_mm=350.0)
+
+        self.assertIsNotNone(timing)
+        assert timing is not None
+        self.assertFalse(timing.skipped)
+        self.assertLess(timing.t_wait_s, 0.0)
+        with mock.patch("robot_control.linux.catch.catch_server_1.time.sleep") as sleep:
+            with contextlib.redirect_stdout(io.StringIO()):
+                wait_for_dynamic_timing(timing)
+
+        sleep.assert_not_called()
+
     def test_execute_default_runs_out_only(self):
         args = make_args(
             execute=True,
@@ -1750,7 +2072,9 @@ class TestCatchServer1(unittest.TestCase):
         message = make_camera_point_message(
             CameraPointCommand(x_m=0.0, y_m=0.0, z_m=0.30, command_id="cmd-2")
         )
-        controller = make_controller()
+        controller = make_feedback_controller(
+            EndPose(350.0, 0.0, 253.252, -176.794223, 0.889438, -105.490597)
+        )
 
         with contextlib.redirect_stdout(io.StringIO()):
             response = handle_message(
@@ -1787,6 +2111,45 @@ class TestCatchServer1(unittest.TestCase):
             ],
         )
 
+    def test_pick_above_requires_reached_even_when_no_wait_waypoints(self):
+        args = make_args(
+            execute=True,
+            no_wait_waypoints=True,
+            guarded_descent=False,
+            motion_timeout_s=0.0,
+            command_duration_s=0.0,
+        )
+        camera_to_base = np.eye(4, dtype=float)
+        camera_to_base[:3, 3] = np.array([0.30, 0.02, 0.00])
+        message = make_camera_point_message(
+            CameraPointCommand(x_m=0.0, y_m=0.0, z_m=0.30, command_id="cmd-stop")
+        )
+        controller = make_feedback_controller(
+            EndPose(350.0, 0.0, 253.252, -176.794223, 0.889438, -105.490597),
+            freeze_pose=True,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "waypoint pick_above not reached"):
+            with contextlib.redirect_stdout(io.StringIO()):
+                handle_message(
+                    message,
+                    args=args,
+                    camera_to_base=camera_to_base,
+                    validator=controller,
+                    controller=controller,
+                )
+
+        end_pose_calls = [call for call in controller.sdk.calls if call[0] == "EndPoseCtrl"]
+        self.assertEqual(
+            end_pose_calls,
+            [
+                ("EndPoseCtrl", (350000, 0, 253252, -176794, 889, -105491)),
+                ("EndPoseCtrl", (300000, 20000, 253252, -176794, 889, -105491)),
+            ],
+        )
+        gripper_calls = [call for call in controller.sdk.calls if call[0] == "GripperCtrl"]
+        self.assertEqual(gripper_calls, [("GripperCtrl", (0, 1000, 0x01, 0))])
+
     def test_dynamic_pitch_execution_only_changes_allowed_joints(self):
         args = make_args(
             execute=True,
@@ -1806,7 +2169,9 @@ class TestCatchServer1(unittest.TestCase):
         message = make_camera_point_message(
             CameraPointCommand(x_m=0.0, y_m=0.0, z_m=0.30, command_id="cmd-pitch")
         )
-        controller = make_controller()
+        controller = make_feedback_controller(
+            EndPose(350.0, 0.0, 253.252, -176.794223, 0.889438, -105.490597)
+        )
         controller.sdk.joint_feedbacks = [
             joint_feedback_from_degrees(10.0, 20.0, -30.0, 40.0, 5.0, 60.0),
             joint_feedback_from_degrees(10.0, 20.0, -30.0, 40.0, 5.0, 60.0),
@@ -1894,7 +2259,9 @@ class TestCatchServer1(unittest.TestCase):
         message = make_camera_point_message(
             CameraPointCommand(x_m=0.0, y_m=0.0, z_m=0.30, command_id="cmd-pitch-keep")
         )
-        controller = make_controller()
+        controller = make_feedback_controller(
+            EndPose(350.0, 0.0, 253.252, -176.794223, 0.889438, -105.490597)
+        )
 
         with contextlib.redirect_stdout(io.StringIO()):
             response = handle_message(
@@ -1939,14 +2306,11 @@ class TestCatchServer1(unittest.TestCase):
         message = make_camera_point_message(
             CameraPointCommand(x_m=0.0, y_m=0.0, z_m=0.30, command_id="cmd-cart-pitch")
         )
-        controller = make_controller()
+        controller = make_feedback_controller(
+            EndPose(350.0, 0.0, 253.252, -176.794223, 0.889438, -105.490597)
+        )
         controller.sdk.joint_feedbacks = [
             joint_feedback_from_degrees(0.0, 114.592, -94.538, 0.0, 68.755, -77.349),
-            joint_feedback_from_degrees(0.0, 114.592, -94.538, 0.0, 68.755, -77.349),
-            joint_feedback_from_degrees(0.0, 108.170, -70.384, 0.0, 41.558, -77.349),
-            joint_feedback_from_degrees(0.0, 108.170, -70.384, 0.0, 41.558, -77.349),
-            joint_feedback_from_degrees(0.0, 123.570, -62.773, 0.0, 18.543, -77.349),
-            joint_feedback_from_degrees(0.0, 123.570, -62.773, 0.0, 18.543, -77.349),
         ]
 
         with contextlib.redirect_stdout(io.StringIO()):
@@ -2157,7 +2521,9 @@ class TestCatchServer1(unittest.TestCase):
         message = make_camera_point_message(
             CameraPointCommand(x_m=0.0, y_m=0.0, z_m=0.30, command_id="cmd-pitch-limit")
         )
-        controller = make_controller()
+        controller = make_feedback_controller(
+            EndPose(350.0, 0.0, 253.252, -176.794223, 0.889438, -105.490597)
+        )
         controller.sdk.joint_feedbacks = [
             joint_feedback_from_degrees(10.0, 20.0, -30.0, 40.0, 69.5, 60.0),
             joint_feedback_from_degrees(10.0, 20.0, -30.0, 40.0, 69.5, 60.0),
@@ -2195,7 +2561,9 @@ class TestCatchServer1(unittest.TestCase):
         message = make_camera_point_message(
             CameraPointCommand(x_m=0.0, y_m=0.0, z_m=0.30, command_id="cmd-2")
         )
-        controller = make_controller()
+        controller = make_feedback_controller(
+            EndPose(350.0, 0.0, 253.252, -176.794223, 0.889438, -105.490597)
+        )
 
         with contextlib.redirect_stdout(io.StringIO()):
             response = handle_message(
@@ -2237,7 +2605,9 @@ class TestCatchServer1(unittest.TestCase):
         message = make_camera_point_message(
             CameraPointCommand(x_m=0.0, y_m=0.0, z_m=0.30, command_id="cmd-effort")
         )
-        controller = make_controller()
+        controller = make_feedback_controller(
+            EndPose(350.0, 0.0, 253.252, -176.794223, 0.889438, -105.490597)
+        )
 
         with contextlib.redirect_stdout(io.StringIO()):
             response = handle_message(
@@ -2397,8 +2767,8 @@ class TestCatchServer1(unittest.TestCase):
             CameraPointCommand(x_m=0.0, y_m=0.0, z_m=0.30, command_id="cmd-guard-start")
         )
         controller = make_feedback_controller(
-            EndPose(250.0, 0.0, 180.0, -176.794223, 0.889438, -105.490597),
-            freeze_pose=True,
+            EndPose(350.0, 0.0, 253.252, -176.794223, 0.889438, -105.490597),
+            freeze_below_z_mm=args.transfer_z_mm,
         )
 
         with contextlib.redirect_stdout(io.StringIO()):

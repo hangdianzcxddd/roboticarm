@@ -13,12 +13,14 @@ target, samples median depth inside that mask, and sends selected targets to
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import Future, ThreadPoolExecutor
+from functools import partial
 import math
 import sys
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 import cv2
 import numpy as np
@@ -157,6 +159,25 @@ class SuppressedDynamicTarget:
 
 
 @dataclass(frozen=True)
+class OpenCVAsyncSendRequest:
+    kind: Literal["dynamic", "probe"]
+    started_at_s: float
+    task: CameraPointTask
+    target_rank: int
+    candidate: DynamicOpenCVGraspCandidate | None = None
+    pick_x_mm: float | None = None
+    pick_y_mm: float | None = None
+
+
+@dataclass(frozen=True)
+class OpenCVAsyncSendCompletion:
+    request: OpenCVAsyncSendRequest
+    response: dict[str, Any] | None
+    error: Exception | None
+    elapsed_s: float
+
+
+@dataclass(frozen=True)
 class ObjectShortAxisYaw:
     yaw_deg: float
     source: str
@@ -167,6 +188,60 @@ class ObjectShortAxisYaw:
 
 class OpenCVGraspSender(YoloSegGraspSender):
     """Camera-point sender using the mask-compatible payload fields."""
+
+
+class OpenCVAsyncSendWorker:
+    """Run one blocking catch_server request without stalling the vision loop."""
+
+    def __init__(self) -> None:
+        self._executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="opencv-catch-send",
+        )
+        self._future: Future[dict[str, Any]] | None = None
+        self._request: OpenCVAsyncSendRequest | None = None
+
+    def busy(self) -> bool:
+        return self._future is not None
+
+    def pending_request(self) -> OpenCVAsyncSendRequest | None:
+        return self._request
+
+    def start(
+        self,
+        request: OpenCVAsyncSendRequest,
+        send_call: Callable[[], dict[str, Any]],
+    ) -> bool:
+        if self._future is not None:
+            return False
+        self._request = request
+        self._future = self._executor.submit(send_call)
+        return True
+
+    def poll(self, now_s: float) -> OpenCVAsyncSendCompletion | None:
+        if self._future is None or self._request is None or not self._future.done():
+            return None
+
+        future = self._future
+        request = self._request
+        self._future = None
+        self._request = None
+
+        try:
+            response = future.result()
+            error = None
+        except Exception as exc:  # noqa: BLE001 - returned to the hardware UI
+            response = None
+            error = exc
+        return OpenCVAsyncSendCompletion(
+            request=request,
+            response=response,
+            error=error,
+            elapsed_s=max(0.0, now_s - request.started_at_s),
+        )
+
+    def shutdown(self) -> None:
+        self._executor.shutdown(wait=False, cancel_futures=True)
 
 
 class GreenConveyorOpenCVDetector:
@@ -1898,6 +1973,93 @@ def send_dynamic_opencv_probe(
     return response
 
 
+def format_pending_async_send(
+    request: OpenCVAsyncSendRequest,
+    *,
+    now_s: float,
+) -> str:
+    elapsed_s = max(0.0, now_s - request.started_at_s)
+    if request.kind == "dynamic" and request.candidate is not None:
+        pick_y_mm = request.pick_y_mm
+        candidate = request.candidate
+        pick_x_text = (
+            "NA" if request.pick_x_mm is None else f"{request.pick_x_mm:.1f}mm"
+        )
+        return (
+            "Dynamic OpenCV send in progress "
+            f"elapsed={elapsed_s:.3f}s "
+            f"{format_dynamic_opencv_candidate(candidate, pick_y_mm=pick_y_mm)} "
+            f"pick_x={pick_x_text}"
+        )
+    return (
+        "Dynamic OpenCV probe in progress "
+        f"rank={request.target_rank} elapsed={elapsed_s:.3f}s"
+    )
+
+
+def start_async_dynamic_opencv_candidate(
+    worker: OpenCVAsyncSendWorker,
+    sender: OpenCVGraspSender,
+    candidate: DynamicOpenCVGraspCandidate,
+    *,
+    source: str,
+    task: CameraPointTask,
+    conveyor_speed_mm_s: float,
+    pick_x_mm: float,
+    pick_y_mm: float,
+    now_s: float,
+) -> bool:
+    request = OpenCVAsyncSendRequest(
+        kind="dynamic",
+        started_at_s=now_s,
+        task=task,
+        target_rank=candidate.target.rank,
+        candidate=candidate,
+        pick_x_mm=pick_x_mm,
+        pick_y_mm=pick_y_mm,
+    )
+    return worker.start(
+        request,
+        partial(
+            send_dynamic_opencv_candidate,
+            sender,
+            candidate,
+            source=source,
+            task=task,
+            conveyor_speed_mm_s=conveyor_speed_mm_s,
+            pick_x_mm=pick_x_mm,
+            pick_y_mm=pick_y_mm,
+        ),
+    )
+
+
+def start_async_dynamic_opencv_probe(
+    worker: OpenCVAsyncSendWorker,
+    sender: OpenCVGraspSender,
+    target: RankedSegTarget,
+    *,
+    source: str,
+    task: CameraPointTask,
+    now_s: float,
+) -> bool:
+    request = OpenCVAsyncSendRequest(
+        kind="probe",
+        started_at_s=now_s,
+        task=task,
+        target_rank=target.rank,
+    )
+    return worker.start(
+        request,
+        partial(
+            send_dynamic_opencv_probe,
+            sender,
+            target,
+            source=source,
+            task=task,
+        ),
+    )
+
+
 def prune_suppressed_dynamic_targets(
     suppressed: list[SuppressedDynamicTarget],
     now_s: float,
@@ -2042,6 +2204,7 @@ def main() -> None:
     latest_targets: list[RankedSegTarget] = []
     latest_errors: dict[int, str] = {}
     dynamic_sent = False
+    async_sender = OpenCVAsyncSendWorker()
     suppressed_dynamic_targets: list[SuppressedDynamicTarget] = []
     last_dynamic_probe_time = 0.0
     last_dynamic_debug_time = 0.0
@@ -2131,6 +2294,77 @@ def main() -> None:
             )
 
             now = time.monotonic()
+            async_completion = async_sender.poll(now)
+            if async_completion is not None:
+                request = async_completion.request
+                if async_completion.error is not None:
+                    dynamic_status = (
+                        "Dynamic OpenCV "
+                        f"{request.kind} failed after {async_completion.elapsed_s:.3f}s: "
+                        f"{async_completion.error}"
+                    )
+                    print(dynamic_status, flush=True)
+                elif request.kind == "dynamic":
+                    response = async_completion.response or {}
+                    skip_reason = dynamic_skip_reason_from_response(response)
+                    if skip_reason is not None:
+                        if request.candidate is not None:
+                            suppressed_dynamic_targets = remember_suppressed_dynamic_target(
+                                suppressed_dynamic_targets,
+                                request.candidate,
+                                now_s=now,
+                                memory_s=args.dynamic_skip_memory_s,
+                            )
+                        dynamic_status = (
+                            "Dynamic OpenCV candidate skipped and remembered "
+                            f"after {async_completion.elapsed_s:.3f}s: {skip_reason}"
+                        )
+                        print(dynamic_status, flush=True)
+                    elif response.get("type") == "error":
+                        dynamic_status = (
+                            "Dynamic OpenCV send failed "
+                            f"after {async_completion.elapsed_s:.3f}s: {response}"
+                        )
+                        print(dynamic_status, flush=True)
+                    else:
+                        dynamic_sent = True
+                        if args.dynamic_keep_running and request.candidate is not None:
+                            suppressed_dynamic_targets = remember_suppressed_dynamic_target(
+                                suppressed_dynamic_targets,
+                                request.candidate,
+                                now_s=now,
+                                memory_s=args.dynamic_skip_memory_s,
+                            )
+                        dynamic_status = (
+                            "Dynamic OpenCV send completed "
+                            f"after {async_completion.elapsed_s:.3f}s"
+                        )
+                        print(dynamic_status, flush=True)
+                        if not args.dynamic_keep_running:
+                            running = False
+                else:
+                    response = async_completion.response or {}
+                    if response.get("type") == "ack":
+                        payload = response.get("payload", {})
+                        if isinstance(payload, dict):
+                            base_xyz = payload.get("base_xyz_m")
+                            if isinstance(base_xyz, dict) and all(
+                                key in base_xyz for key in ("x_m", "y_m", "z_m")
+                            ):
+                                dynamic_status = (
+                                    "Dynamic OpenCV probe base="
+                                    f"({float(base_xyz['x_m']) * 1000.0:.1f},"
+                                    f"{float(base_xyz['y_m']) * 1000.0:.1f},"
+                                    f"{float(base_xyz['z_m']) * 1000.0:.1f})mm "
+                                    f"after {async_completion.elapsed_s:.3f}s"
+                                )
+                    elif response.get("type") == "error":
+                        dynamic_status = (
+                            "Dynamic OpenCV probe failed "
+                            f"after {async_completion.elapsed_s:.3f}s: {response}"
+                        )
+                        print(dynamic_status, flush=True)
+
             if args.print_interval == 0.0 or now - last_print_time >= args.print_interval:
                 print_target_table(
                     latest_targets,
@@ -2158,29 +2392,19 @@ def main() -> None:
             elif not dynamic_sent or args.dynamic_keep_running:
                 if camera_to_base is None:
                     raise ValueError("dynamic mode requires --hand-eye-result")
-                suppressed_dynamic_targets = prune_suppressed_dynamic_targets(
-                    suppressed_dynamic_targets,
-                    now,
-                )
-                candidates = find_dynamic_opencv_candidates(
-                    latest_targets,
-                    camera_to_base=camera_to_base,
-                    min_x_mm=args.dynamic_min_x_mm,
-                    max_x_mm=args.dynamic_max_x_mm,
-                    min_y_mm=args.dynamic_min_y_mm,
-                    max_y_mm=args.dynamic_max_y_mm,
-                    pick_y_mm=args.dynamic_pick_y_mm,
-                    conveyor_speed_mm_s=args.conveyor_speed_mm_s,
-                    conveyor_direction=args.conveyor_direction,
-                )
-                if (
-                    args.dynamic_debug_candidates
-                    and (
-                        args.print_interval == 0.0
-                        or now - last_dynamic_debug_time >= args.print_interval
+                if async_sender.busy():
+                    pending_request = async_sender.pending_request()
+                    if pending_request is not None:
+                        dynamic_status = format_pending_async_send(
+                            pending_request,
+                            now_s=now,
+                        )
+                else:
+                    suppressed_dynamic_targets = prune_suppressed_dynamic_targets(
+                        suppressed_dynamic_targets,
+                        now,
                     )
-                ):
-                    diagnostics = dynamic_opencv_target_diagnostics(
+                    candidates = find_dynamic_opencv_candidates(
                         latest_targets,
                         camera_to_base=camera_to_base,
                         min_x_mm=args.dynamic_min_x_mm,
@@ -2190,48 +2414,58 @@ def main() -> None:
                         pick_y_mm=args.dynamic_pick_y_mm,
                         conveyor_speed_mm_s=args.conveyor_speed_mm_s,
                         conveyor_direction=args.conveyor_direction,
-                        suppressed=suppressed_dynamic_targets,
-                        skip_radius_mm=args.dynamic_skip_radius_mm,
                     )
-                    print_dynamic_opencv_candidate_debug(
-                        diagnostics,
-                        min_x_mm=args.dynamic_min_x_mm,
-                        max_x_mm=args.dynamic_max_x_mm,
-                        min_y_mm=args.dynamic_min_y_mm,
-                        max_y_mm=args.dynamic_max_y_mm,
-                        pick_y_mm=args.dynamic_pick_y_mm,
-                        conveyor_speed_mm_s=args.conveyor_speed_mm_s,
-                        conveyor_direction=args.conveyor_direction,
-                    )
-                    last_dynamic_debug_time = now
-                candidate = None
-                suppressed_count = 0
-                for item in candidates:
-                    if dynamic_opencv_candidate_is_suppressed(
-                        item,
-                        suppressed_dynamic_targets,
-                        radius_mm=args.dynamic_skip_radius_mm,
-                    ):
-                        suppressed_count += 1
-                        continue
-                    candidate = item
-                    break
-                if candidate is not None:
-                    pick_x_mm = dynamic_pick_x_mm_for_candidate(
-                        candidate,
-                        fixed_pick_x_mm=args.dynamic_pick_x_mm,
-                        use_mask_centroid_x=args.dynamic_pick_x_from_bbox_center,
-                    )
-                    dynamic_status = (
-                        "Dynamic OpenCV candidate "
-                        + format_dynamic_opencv_candidate(
-                            candidate,
-                            pick_y_mm=args.dynamic_pick_y_mm,
+                    if (
+                        args.dynamic_debug_candidates
+                        and (
+                            args.print_interval == 0.0
+                            or now - last_dynamic_debug_time >= args.print_interval
                         )
-                        + f" pick_x={pick_x_mm:.1f}mm"
-                    )
-                    try:
-                        response = send_dynamic_opencv_candidate(
+                    ):
+                        diagnostics = dynamic_opencv_target_diagnostics(
+                            latest_targets,
+                            camera_to_base=camera_to_base,
+                            min_x_mm=args.dynamic_min_x_mm,
+                            max_x_mm=args.dynamic_max_x_mm,
+                            min_y_mm=args.dynamic_min_y_mm,
+                            max_y_mm=args.dynamic_max_y_mm,
+                            pick_y_mm=args.dynamic_pick_y_mm,
+                            conveyor_speed_mm_s=args.conveyor_speed_mm_s,
+                            conveyor_direction=args.conveyor_direction,
+                            suppressed=suppressed_dynamic_targets,
+                            skip_radius_mm=args.dynamic_skip_radius_mm,
+                        )
+                        print_dynamic_opencv_candidate_debug(
+                            diagnostics,
+                            min_x_mm=args.dynamic_min_x_mm,
+                            max_x_mm=args.dynamic_max_x_mm,
+                            min_y_mm=args.dynamic_min_y_mm,
+                            max_y_mm=args.dynamic_max_y_mm,
+                            pick_y_mm=args.dynamic_pick_y_mm,
+                            conveyor_speed_mm_s=args.conveyor_speed_mm_s,
+                            conveyor_direction=args.conveyor_direction,
+                        )
+                        last_dynamic_debug_time = now
+                    candidate = None
+                    suppressed_count = 0
+                    for item in candidates:
+                        if dynamic_opencv_candidate_is_suppressed(
+                            item,
+                            suppressed_dynamic_targets,
+                            radius_mm=args.dynamic_skip_radius_mm,
+                        ):
+                            suppressed_count += 1
+                            continue
+                        candidate = item
+                        break
+                    if candidate is not None:
+                        pick_x_mm = dynamic_pick_x_mm_for_candidate(
+                            candidate,
+                            fixed_pick_x_mm=args.dynamic_pick_x_mm,
+                            use_mask_centroid_x=args.dynamic_pick_x_from_bbox_center,
+                        )
+                        started = start_async_dynamic_opencv_candidate(
+                            async_sender,
                             sender,
                             candidate,
                             source=source,
@@ -2239,83 +2473,73 @@ def main() -> None:
                             conveyor_speed_mm_s=args.conveyor_speed_mm_s,
                             pick_x_mm=pick_x_mm,
                             pick_y_mm=args.dynamic_pick_y_mm,
+                            now_s=now,
                         )
-                        skip_reason = dynamic_skip_reason_from_response(response)
-                        if skip_reason is not None:
-                            suppressed_dynamic_targets = remember_suppressed_dynamic_target(
-                                suppressed_dynamic_targets,
-                                candidate,
+                        if started:
+                            dynamic_status = format_pending_async_send(
+                                OpenCVAsyncSendRequest(
+                                    kind="dynamic",
+                                    started_at_s=now,
+                                    task=args.task,
+                                    target_rank=candidate.target.rank,
+                                    candidate=candidate,
+                                    pick_x_mm=pick_x_mm,
+                                    pick_y_mm=args.dynamic_pick_y_mm,
+                                ),
                                 now_s=now,
-                                memory_s=args.dynamic_skip_memory_s,
                             )
-                            dynamic_status = (
-                                "Dynamic OpenCV candidate skipped and remembered: "
-                                f"{skip_reason}"
-                            )
-                            print(dynamic_status, flush=True)
-                        elif response.get("type") == "error":
-                            dynamic_status = f"Dynamic OpenCV send failed: {response}"
-                            print(dynamic_status, flush=True)
                         else:
-                            dynamic_sent = True
-                            if args.dynamic_keep_running:
-                                suppressed_dynamic_targets = remember_suppressed_dynamic_target(
-                                    suppressed_dynamic_targets,
-                                    candidate,
-                                    now_s=now,
-                                    memory_s=args.dynamic_skip_memory_s,
-                                )
-                        if dynamic_sent and not args.dynamic_keep_running:
-                            running = False
-                    except Exception as exc:  # noqa: BLE001 - hardware UI should keep context
-                        dynamic_status = f"Dynamic OpenCV send failed: {exc}"
-                        print(dynamic_status, flush=True)
-                elif suppressed_count > 0:
-                    dynamic_status = (
-                        "Dynamic OpenCV mode: "
-                        f"{suppressed_count} repeated skipped target(s) ignored."
-                    )
-                else:
-                    dynamic_status = (
-                        "Dynamic OpenCV mode: no mask centroid inside configured "
-                        "base-coordinate window yet."
-                    )
-                    if (
-                        args.dynamic_probe_interval_s > 0.0
-                        and latest_targets
-                        and (
-                            last_dynamic_probe_time == 0.0
-                            or now - last_dynamic_probe_time >= args.dynamic_probe_interval_s
+                            pending_request = async_sender.pending_request()
+                            dynamic_status = (
+                                format_pending_async_send(pending_request, now_s=now)
+                                if pending_request is not None
+                                else "Dynamic OpenCV send already in progress."
+                            )
+                    elif suppressed_count > 0:
+                        dynamic_status = (
+                            "Dynamic OpenCV mode: "
+                            f"{suppressed_count} repeated skipped target(s) ignored."
                         )
-                    ):
-                        try:
-                            response = send_dynamic_opencv_probe(
+                    else:
+                        dynamic_status = (
+                            "Dynamic OpenCV mode: no mask centroid inside configured "
+                            "base-coordinate window yet."
+                        )
+                        if (
+                            args.dynamic_probe_interval_s > 0.0
+                            and latest_targets
+                            and (
+                                last_dynamic_probe_time == 0.0
+                                or now - last_dynamic_probe_time
+                                >= args.dynamic_probe_interval_s
+                            )
+                        ):
+                            started = start_async_dynamic_opencv_probe(
+                                async_sender,
                                 sender,
                                 latest_targets[0],
                                 source=source,
                                 task=args.task,
+                                now_s=now,
                             )
-                            if response.get("type") == "ack":
-                                payload = response.get("payload", {})
-                                if isinstance(payload, dict):
-                                    base_xyz = payload.get("base_xyz_m")
-                                    if isinstance(base_xyz, dict) and all(
-                                        key in base_xyz for key in ("x_m", "y_m", "z_m")
-                                    ):
-                                        dynamic_status = (
-                                            "Dynamic OpenCV probe base="
-                                            f"({float(base_xyz['x_m']) * 1000.0:.1f},"
-                                            f"{float(base_xyz['y_m']) * 1000.0:.1f},"
-                                            f"{float(base_xyz['z_m']) * 1000.0:.1f})mm"
-                                        )
-                            elif response.get("type") == "error":
-                                dynamic_status = f"Dynamic OpenCV probe failed: {response}"
-                                print(dynamic_status, flush=True)
-                        except Exception as exc:  # noqa: BLE001 - hardware UI should keep context
-                            dynamic_status = f"Dynamic OpenCV probe failed: {exc}"
-                            print(dynamic_status, flush=True)
-                        finally:
-                            last_dynamic_probe_time = now
+                            if started:
+                                last_dynamic_probe_time = now
+                                dynamic_status = format_pending_async_send(
+                                    OpenCVAsyncSendRequest(
+                                        kind="probe",
+                                        started_at_s=now,
+                                        task=args.task,
+                                        target_rank=latest_targets[0].rank,
+                                    ),
+                                    now_s=now,
+                                )
+                            else:
+                                pending_request = async_sender.pending_request()
+                                if pending_request is not None:
+                                    dynamic_status = format_pending_async_send(
+                                        pending_request,
+                                        now_s=now,
+                                    )
 
             if not args.no_display:
                 if args.mode == "static":
@@ -2388,6 +2612,7 @@ def main() -> None:
                 if key == 27:
                     running = False
     finally:
+        async_sender.shutdown()
         pipeline.stop()
         if not args.no_display:
             cv2.destroyAllWindows()

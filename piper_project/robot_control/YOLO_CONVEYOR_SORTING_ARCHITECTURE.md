@@ -596,7 +596,8 @@ python3 -m robot_control.linux.catch.catch_server_1 \
 - `--dynamic-min-x-mm/--dynamic-max-x-mm` 应覆盖传送带上可抓区域的 X 范围。
 - `--dynamic-min-y-mm/--dynamic-max-y-mm` 应覆盖从检测到抓取线前的有效窗口。
 - `--dynamic-pick-y-mm` 应设置为机械臂实际下降抓取的固定 Y 线。
-- 如果 ACK 中经常出现 `target is too close to the pick line`，说明检测窗口太靠近抓取线、传送带太快或 `t_robot_s/final_action_time_s` 估计偏大。
+- `--dynamic-t-robot-by-x` 会按单一线性函数补偿动作时间：`t_robot = t_robot_s + (reference_x - source_x) * dynamic_t_robot_s_per_mm + margin`。正斜率表示 X 越小预估抓取时间越长、X 越大越快。
+- 过近目标跳过保护默认关闭，`t_wait_s < 0` 的动态目标会立即执行；如需恢复跳过保护，可在 Linux 端启动参数中加入 `--dynamic-too-close-skip`。
 
 ### 11.3 Linux 执行侧
 
@@ -661,6 +662,7 @@ task=... mode=...
 - `payload.steps`
 - `payload.dynamic_timing.skipped`
 - `payload.dynamic_timing.skip_reason`
+- `payload.dynamic_timing.too_close_skip_enabled`
 - `payload.guarded_execution.protected_abort`
 - `payload.safe_gripper.triggered`
 
@@ -684,4 +686,3 @@ task=... mode=...
 - 引入传送带编码器或光电触发器，替代纯视觉速度估计。
 - 增加任务队列，让 Linux 端支持连续多目标排队抓取。
 - 增加 Web 或桌面监控界面，实时显示检测结果、基座坐标、抓取计划和执行状态。
-

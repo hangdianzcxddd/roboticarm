@@ -90,6 +90,7 @@ class SequenceStep:
     joint_pitch_after_pose: bool = False
     pitch_source_x_mm: float | None = None
     planar_ik: bool = False
+    require_reached: bool = False
 
 
 @dataclass(frozen=True)
@@ -123,9 +124,19 @@ class DynamicTiming:
     t_robot_s: float
     action_time_s: float
     t_wait_s: float
+    t_robot_source: str = "constant"
+    t_robot_source_x_mm: float | None = None
+    t_robot_reference_x_mm: float | None = None
+    t_robot_segment: str | None = None
+    t_robot_base_s: float | None = None
+    t_robot_unclamped_s: float | None = None
+    t_robot_margin_s: float = 0.0
+    t_robot_min_s: float | None = None
+    t_robot_max_s: float | None = None
     dynamic_preposition: bool = False
     final_action_time_s: float | None = None
     wait_placement: Literal["wait", "nowait"] = "wait"
+    too_close_skip_enabled: bool = True
     skipped: bool = False
     skip_reason: str | None = None
 
@@ -336,6 +347,75 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "dynamic mode measured robot reaction time from grasp command to "
             "gripper closed at the pick point"
+        ),
+    )
+    parser.add_argument(
+        "--dynamic-t-robot-by-x",
+        action="store_true",
+        help=(
+            "in dynamic mode, replace the constant --t-robot-s with a linear "
+            "estimate based on raw pick X"
+        ),
+    )
+    parser.add_argument(
+        "--dynamic-t-robot-reference-x-mm",
+        type=float,
+        help=(
+            "raw X where --t-robot-s is measured; defaults to --ready-x-mm"
+        ),
+    )
+    parser.add_argument(
+        "--dynamic-t-robot-s-per-mm",
+        type=float,
+        default=0.0,
+        help=(
+            "linear timing slope in seconds per raw-X millimeter when "
+            "--dynamic-t-robot-by-x is enabled; positive means smaller X takes "
+            "longer and larger X is faster"
+        ),
+    )
+    parser.add_argument(
+        "--dynamic-t-robot-planar-far-s-per-mm",
+        type=float,
+        default=0.0,
+        help=(
+            "legacy option accepted for compatibility; linear dynamic timing "
+            "uses --dynamic-t-robot-s-per-mm"
+        ),
+    )
+    parser.add_argument(
+        "--dynamic-t-robot-planar-near-s-per-mm",
+        type=float,
+        default=0.0,
+        help=(
+            "legacy option accepted for compatibility; linear dynamic timing "
+            "uses --dynamic-t-robot-s-per-mm"
+        ),
+    )
+    parser.add_argument(
+        "--dynamic-t-robot-margin-s",
+        type=float,
+        default=0.0,
+        help="extra safety margin added after X-based dynamic robot timing",
+    )
+    parser.add_argument(
+        "--dynamic-t-robot-min-s",
+        type=float,
+        help="optional lower clamp for X-based dynamic robot timing",
+    )
+    parser.add_argument(
+        "--dynamic-t-robot-max-s",
+        type=float,
+        help="optional upper clamp for X-based dynamic robot timing",
+    )
+    parser.add_argument(
+        "--dynamic-too-close-skip",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "skip dynamic targets whose estimated arrival time is earlier than "
+            "the robot action time; disabled by default, so late targets start "
+            "immediately"
         ),
     )
     parser.add_argument(
@@ -848,6 +928,7 @@ def validate_args(args: argparse.Namespace) -> None:
         "position_tolerance_mm",
         "orientation_tolerance_deg",
         "t_robot_s",
+        "dynamic_t_robot_margin_s",
         "final_action_time_s",
         "pick_delay_s",
         "place_pick_delay_s",
@@ -958,6 +1039,12 @@ def validate_args(args: argparse.Namespace) -> None:
         "force_pick_x_mm",
         "pick_x_offset_mm",
         "force_pick_y_mm",
+        "dynamic_t_robot_reference_x_mm",
+        "dynamic_t_robot_s_per_mm",
+        "dynamic_t_robot_planar_far_s_per_mm",
+        "dynamic_t_robot_planar_near_s_per_mm",
+        "dynamic_t_robot_min_s",
+        "dynamic_t_robot_max_s",
         "pitch_x_ref_mm",
         "pitch_deg_per_mm",
         "keep_pitch_min_x_mm",
@@ -984,6 +1071,14 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError(f"--{name.replace('_', '-')} must be finite")
     if args.planar_ik_grasp_z_comp_mm_per_deg < 0.0:
         raise ValueError("--planar-ik-grasp-z-comp-mm-per-deg must be >= 0")
+    if args.dynamic_t_robot_margin_s < 0.0:
+        raise ValueError("--dynamic-t-robot-margin-s must be >= 0")
+    if (
+        args.dynamic_t_robot_min_s is not None
+        and args.dynamic_t_robot_max_s is not None
+        and args.dynamic_t_robot_min_s > args.dynamic_t_robot_max_s
+    ):
+        raise ValueError("--dynamic-t-robot-min-s must be <= --dynamic-t-robot-max-s")
     if args.grasp_yaw_max_delta_deg < 0.0:
         raise ValueError("--grasp-yaw-max-delta-deg must be >= 0")
     if args.grasp_yaw_deadband_deg < 0.0:
@@ -1259,6 +1354,58 @@ def planar_ik_grasp_z_compensation(
     return abs(pitch_delta_deg) * coefficient, pitch_delta_deg
 
 
+def dynamic_t_robot_reference_x_mm(args: argparse.Namespace) -> float:
+    explicit = getattr(args, "dynamic_t_robot_reference_x_mm", None)
+    if explicit is not None:
+        return float(explicit)
+    return float(args.ready_x_mm)
+
+
+def dynamic_t_robot_s_for_x(
+    args: argparse.Namespace,
+    source_x_mm: float | None,
+) -> tuple[float, dict[str, Any]]:
+    base_s = float(args.t_robot_s)
+    source = "constant"
+    if not getattr(args, "dynamic_t_robot_by_x", False) or source_x_mm is None:
+        return base_s, {
+            "source": source,
+            "source_x_mm": source_x_mm,
+            "reference_x_mm": None,
+            "segment": None,
+            "base_s": base_s,
+            "unclamped_s": base_s,
+            "margin_s": 0.0,
+            "min_s": None,
+            "max_s": None,
+        }
+
+    source_x = float(source_x_mm)
+    reference_x = dynamic_t_robot_reference_x_mm(args)
+    slope_s_per_mm = float(args.dynamic_t_robot_s_per_mm)
+    margin_s = float(args.dynamic_t_robot_margin_s)
+    t_robot_s = base_s + (reference_x - source_x) * slope_s_per_mm
+    t_robot_s += margin_s
+    unclamped_s = t_robot_s
+    min_s = getattr(args, "dynamic_t_robot_min_s", None)
+    max_s = getattr(args, "dynamic_t_robot_max_s", None)
+    if min_s is not None:
+        t_robot_s = max(t_robot_s, float(min_s))
+    if max_s is not None:
+        t_robot_s = min(t_robot_s, float(max_s))
+    return t_robot_s, {
+        "source": "x_linear",
+        "source_x_mm": source_x,
+        "reference_x_mm": reference_x,
+        "segment": None,
+        "base_s": base_s,
+        "unclamped_s": unclamped_s,
+        "margin_s": margin_s,
+        "min_s": min_s,
+        "max_s": max_s,
+    }
+
+
 def target_from_command(
     command: CameraPointCommand,
     camera_to_base: Any,
@@ -1393,11 +1540,12 @@ def build_out_steps(
         SequenceStep(
             "pick_above",
             pick_above,
-            args.transfer_mode,
+            "L",
             joint_pitch_before_pose=use_joint_pitch,
             joint_pitch_after_pose=use_joint_pitch,
             pitch_source_x_mm=pitch_x_mm,
             planar_ik=use_ik,
+            require_reached=True,
         ),
         SequenceStep(
             label="pick_grasp",
@@ -1472,12 +1620,13 @@ def build_in_steps(
         SequenceStep(
             label="return_pick_above",
             pose=pick_above,
-            mode=args.transfer_mode,
+            mode="L",
             delay_before_s=args.place_pick_delay_s,
             joint_pitch_before_pose=use_joint_pitch,
             joint_pitch_after_pose=use_joint_pitch,
             pitch_source_x_mm=pitch_x_mm,
             planar_ik=use_ik,
+            require_reached=True,
         ),
         SequenceStep(
             label="return_pick_grasp",
@@ -1520,17 +1669,19 @@ def validate_steps(controller: PiperController, steps: tuple[SequenceStep, ...])
 def dynamic_timing_from_command(
     command: CameraPointCommand,
     args: argparse.Namespace,
+    *,
+    source_x_mm: float | None = None,
 ) -> DynamicTiming | None:
     if command.grasp_mode != "dynamic":
         return None
     if command.t_arrive_s is None:
         raise ValueError("dynamic grasp command requires t_arrive_s")
     t_arrive_s = float(command.t_arrive_s)
-    t_robot_s = float(args.t_robot_s)
+    t_robot_s, t_robot_meta = dynamic_t_robot_s_for_x(args, source_x_mm)
     if not math.isfinite(t_arrive_s) or t_arrive_s < 0.0:
         raise ValueError("dynamic t_arrive_s must be finite and >= 0")
     if not math.isfinite(t_robot_s) or t_robot_s < 0.0:
-        raise ValueError("--t-robot-s must be finite and >= 0")
+        raise ValueError("dynamic t_robot_s must be finite and >= 0")
     wait_placement = str(getattr(args, "dynamic_wait_placement", "wait"))
     if args.dynamic_preposition and wait_placement == "nowait":
         action_time_s = t_robot_s
@@ -1544,17 +1695,28 @@ def dynamic_timing_from_command(
     if not math.isfinite(action_time_s) or action_time_s < 0.0:
         raise ValueError(f"--{action_time_label.replace('_', '-')} must be finite and >= 0")
     t_wait_s = t_arrive_s - action_time_s
-    if t_wait_s < 0.0:
+    too_close_skip_enabled = bool(getattr(args, "dynamic_too_close_skip", True))
+    if t_wait_s < 0.0 and too_close_skip_enabled:
         return DynamicTiming(
             t_arrive_s=t_arrive_s,
             t_robot_s=t_robot_s,
             action_time_s=action_time_s,
             t_wait_s=t_wait_s,
+            t_robot_source=str(t_robot_meta["source"]),
+            t_robot_source_x_mm=t_robot_meta["source_x_mm"],
+            t_robot_reference_x_mm=t_robot_meta["reference_x_mm"],
+            t_robot_segment=t_robot_meta["segment"],
+            t_robot_base_s=t_robot_meta["base_s"],
+            t_robot_unclamped_s=t_robot_meta["unclamped_s"],
+            t_robot_margin_s=t_robot_meta["margin_s"],
+            t_robot_min_s=t_robot_meta["min_s"],
+            t_robot_max_s=t_robot_meta["max_s"],
             dynamic_preposition=bool(args.dynamic_preposition),
             final_action_time_s=(
                 float(args.final_action_time_s) if args.dynamic_preposition else None
             ),
             wait_placement=wait_placement,
+            too_close_skip_enabled=too_close_skip_enabled,
             skipped=True,
             skip_reason=(
                 "dynamic target is too close to the pick line: "
@@ -1567,11 +1729,21 @@ def dynamic_timing_from_command(
         t_robot_s=t_robot_s,
         action_time_s=action_time_s,
         t_wait_s=t_wait_s,
+        t_robot_source=str(t_robot_meta["source"]),
+        t_robot_source_x_mm=t_robot_meta["source_x_mm"],
+        t_robot_reference_x_mm=t_robot_meta["reference_x_mm"],
+        t_robot_segment=t_robot_meta["segment"],
+        t_robot_base_s=t_robot_meta["base_s"],
+        t_robot_unclamped_s=t_robot_meta["unclamped_s"],
+        t_robot_margin_s=t_robot_meta["margin_s"],
+        t_robot_min_s=t_robot_meta["min_s"],
+        t_robot_max_s=t_robot_meta["max_s"],
         dynamic_preposition=bool(args.dynamic_preposition),
         final_action_time_s=(
             float(args.final_action_time_s) if args.dynamic_preposition else None
         ),
         wait_placement=wait_placement,
+        too_close_skip_enabled=too_close_skip_enabled,
     )
 
 
@@ -2204,6 +2376,9 @@ def print_plan(
             f"t_robot={timing.t_robot_s:.3f}s "
             f"action_time={timing.action_time_s:.3f}s "
             f"t_wait={timing.t_wait_s:.3f}s "
+            f"t_robot_source={timing.t_robot_source} "
+            f"source_x={timing.t_robot_source_x_mm}mm "
+            f"segment={timing.t_robot_segment} "
             f"preposition={timing.dynamic_preposition} "
             f"skipped={timing.skipped}",
             flush=True,
@@ -2473,7 +2648,8 @@ def execute_step(
         args.command_duration_s,
         args.command_period_s,
     )
-    if not args.no_wait_waypoints:
+    should_wait = step.require_reached or not args.no_wait_waypoints
+    if should_wait:
         wait_until_pose_reached(
             controller,
             step.label,
@@ -3043,7 +3219,8 @@ def execute_planar_ik_step(
     final_joints: tuple[float, ...] | None = None
     final_joint_errors: tuple[float, ...] | None = None
     max_joint_error: float | None = None
-    if not args.no_wait_waypoints:
+    should_wait = step.require_reached or not args.no_wait_waypoints
+    if should_wait:
         final_joints, final_joint_errors, max_joint_error = (
             wait_until_planar_ik_joints_reached(
                 controller,
@@ -3683,7 +3860,11 @@ def handle_message(
             camera_to_base=camera_to_base,
             args=args,
         )
-    timing = dynamic_timing_from_command(command, args)
+    timing = dynamic_timing_from_command(
+        command,
+        args,
+        source_x_mm=command.pick_x_mm,
+    )
     target = target_from_command(
         command,
         camera_to_base,
@@ -3805,6 +3986,7 @@ def handle_message(
                     "joint_pitch_after_pose": step.joint_pitch_after_pose,
                     "pitch_source_x_mm": step.pitch_source_x_mm,
                     "planar_ik": step.planar_ik,
+                    "require_reached": step.require_reached,
                 }
                 for step in plan.steps
             ],
@@ -3897,11 +4079,21 @@ def handle_message(
         response["payload"]["dynamic_timing"] = {
             "t_arrive_s": timing.t_arrive_s,
             "t_robot_s": timing.t_robot_s,
+            "t_robot_source": timing.t_robot_source,
+            "t_robot_source_x_mm": timing.t_robot_source_x_mm,
+            "t_robot_reference_x_mm": timing.t_robot_reference_x_mm,
+            "t_robot_segment": timing.t_robot_segment,
+            "t_robot_base_s": timing.t_robot_base_s,
+            "t_robot_unclamped_s": timing.t_robot_unclamped_s,
+            "t_robot_margin_s": timing.t_robot_margin_s,
+            "t_robot_min_s": timing.t_robot_min_s,
+            "t_robot_max_s": timing.t_robot_max_s,
             "action_time_s": timing.action_time_s,
             "t_wait_s": timing.t_wait_s,
             "dynamic_preposition": timing.dynamic_preposition,
             "final_action_time_s": timing.final_action_time_s,
             "wait_placement": timing.wait_placement,
+            "too_close_skip_enabled": timing.too_close_skip_enabled,
             "skipped": timing.skipped,
             "skip_reason": timing.skip_reason,
             "conveyor_speed_mm_s": command.conveyor_speed_mm_s,

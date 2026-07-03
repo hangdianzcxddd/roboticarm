@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+import time
 
 import cv2
 import numpy as np
@@ -8,6 +9,8 @@ import numpy as np
 from robot_control.windows.client.opencv_grasp_send_tcp import (
     GreenConveyorDetectorConfig,
     GreenConveyorOpenCVDetector,
+    OpenCVAsyncSendRequest,
+    OpenCVAsyncSendWorker,
     OpenCVGraspSender,
     apply_belt_depth_plane_compensation,
     attach_object_short_axis_yaw,
@@ -102,6 +105,38 @@ def ranked_target_at_camera_point(x_m: float, y_m: float, z_m: float) -> RankedS
 
 
 class TestOpenCVGraspSendTcp(unittest.TestCase):
+    def test_async_send_worker_returns_without_blocking_caller(self):
+        worker = OpenCVAsyncSendWorker()
+        try:
+            started = worker.start(
+                OpenCVAsyncSendRequest(
+                    kind="probe",
+                    started_at_s=10.0,
+                    task="out",
+                    target_rank=1,
+                ),
+                lambda: {"type": "ack"},
+            )
+
+            self.assertTrue(started)
+            self.assertTrue(worker.busy())
+
+            completion = None
+            deadline = time.monotonic() + 1.0
+            while completion is None and time.monotonic() < deadline:
+                completion = worker.poll(10.25)
+                if completion is None:
+                    time.sleep(0.01)
+
+            self.assertIsNotNone(completion)
+            assert completion is not None
+            self.assertEqual(completion.response, {"type": "ack"})
+            self.assertIsNone(completion.error)
+            self.assertAlmostEqual(completion.elapsed_s, 0.25)
+            self.assertFalse(worker.busy())
+        finally:
+            worker.shutdown()
+
     def test_detector_finds_non_green_object_on_green_belt(self):
         frame = green_frame()
         frame[40:80, 60:100] = (0, 0, 255)
