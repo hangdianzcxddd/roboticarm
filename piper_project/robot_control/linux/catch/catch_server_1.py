@@ -315,10 +315,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--lift-mode",
         choices=("P", "L"),
-        default="P",
+        default="L",
         help=(
             "motion mode for pick_lift/return_pick_lift after grasping; defaults "
-            "to P to avoid MOVE_L lift limit failures"
+            "to L to lift along the same Cartesian line used for descent"
         ),
     )
     parser.add_argument("--command-duration-s", type=float, default=1.0)
@@ -535,6 +535,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "force the Cartesian pick X coordinate while keeping the raw mapped "
             "or dynamic-command X for dynamic joint pitch calculation"
+        ),
+    )
+    parser.add_argument(
+        "--pick-x-offset-mm",
+        type=float,
+        default=0.0,
+        help=(
+            "add this X offset to the final pick coordinate only when the target "
+            "uses planar-IK dynamic pitch; raw X is still used for pitch selection"
         ),
     )
     parser.add_argument(
@@ -947,6 +956,7 @@ def validate_args(args: argparse.Namespace) -> None:
         "grasp_yaw_max_delta_deg",
         "grasp_yaw_deadband_deg",
         "force_pick_x_mm",
+        "pick_x_offset_mm",
         "force_pick_y_mm",
         "pitch_x_ref_mm",
         "pitch_deg_per_mm",
@@ -1279,6 +1289,13 @@ def target_from_command(
     if args.force_pick_x_mm is not None:
         pick_x_mm = float(args.force_pick_x_mm)
         pick_x_source = "forced_pick_x"
+    pick_x_offset_mm = float(getattr(args, "pick_x_offset_mm", 0.0))
+    if (
+        not math.isclose(pick_x_offset_mm, 0.0, rel_tol=0.0, abs_tol=1e-9)
+        and use_planar_ik(args, float(raw_pick_x_mm))
+    ):
+        pick_x_mm = float(pick_x_mm) + pick_x_offset_mm
+        pick_x_source = f"{pick_x_source}_planar_ik_offset"
     if args.force_pick_y_mm is not None:
         pick_y_mm = float(args.force_pick_y_mm)
         pick_y_source = "forced_pick_y"

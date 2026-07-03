@@ -37,7 +37,7 @@ def make_args(**overrides: object) -> argparse.Namespace:
         "startup_speed": 10,
         "transfer_mode": "P",
         "vertical_mode": "L",
-        "lift_mode": "P",
+        "lift_mode": "L",
         "command_duration_s": 0.0,
         "command_period_s": 0.02,
         "motion_timeout_s": 0.0,
@@ -79,6 +79,7 @@ def make_args(**overrides: object) -> argparse.Namespace:
         "grasp_yaw_deadband_deg": 5.0,
         "grasp_yaw_speed": 20,
         "force_pick_x_mm": None,
+        "pick_x_offset_mm": 0.0,
         "force_pick_y_mm": None,
         "dynamic_pitch_by_x": False,
         "dynamic_pitch_mode": "joint",
@@ -284,6 +285,7 @@ class TestCatchServer1(unittest.TestCase):
         self.assertAlmostEqual(args.place_y_mm, 270.0)
         self.assertAlmostEqual(args.place_pick_x_mm, 60.0)
         self.assertAlmostEqual(args.place_pick_y_mm, -270.0)
+        self.assertEqual(args.lift_mode, "L")
         self.assertFalse(args.dynamic_pitch_by_x)
         self.assertEqual(args.dynamic_pitch_mode, "joint")
         self.assertEqual(args.dynamic_wait_placement, "wait")
@@ -307,6 +309,7 @@ class TestCatchServer1(unittest.TestCase):
         self.assertAlmostEqual(args.grasp_yaw_max_delta_deg, 45.0)
         self.assertAlmostEqual(args.grasp_yaw_deadband_deg, 5.0)
         self.assertEqual(args.grasp_yaw_speed, 20)
+        self.assertAlmostEqual(args.pick_x_offset_mm, 0.0)
 
         args = build_parser().parse_args(["--use-detected-z"])
         self.assertEqual(args.use_detected_z, "center")
@@ -398,7 +401,7 @@ class TestCatchServer1(unittest.TestCase):
         )
         self.assertEqual(
             [step.mode for step in steps],
-            ["P", "P", "L", "P", "P", "P", "P"],
+            ["P", "P", "L", args.lift_mode, "P", "P", "P"],
         )
         self.assertAlmostEqual(steps[1].pose.x_mm, 300.0)
         self.assertAlmostEqual(steps[1].pose.y_mm, 20.0)
@@ -416,8 +419,8 @@ class TestCatchServer1(unittest.TestCase):
         self.assertEqual(steps[2].mode, args.vertical_mode)
         self.assertEqual(steps[3].mode, args.lift_mode)
 
-    def test_lift_mode_can_be_overridden_to_linear(self):
-        args = make_args(lift_mode="L")
+    def test_lift_mode_can_be_overridden_to_point(self):
+        args = make_args(lift_mode="P")
         command = CameraPointCommand(x_m=0.0, y_m=0.0, z_m=0.0, command_id="cmd")
         camera_to_base = np.eye(4, dtype=float)
         camera_to_base[:3, 3] = np.array([0.30, 0.02, 0.10])
@@ -426,7 +429,7 @@ class TestCatchServer1(unittest.TestCase):
         steps = build_steps(args, target)
 
         self.assertEqual(steps[3].label, "pick_lift")
-        self.assertEqual(steps[3].mode, "L")
+        self.assertEqual(steps[3].mode, "P")
 
     def test_force_pick_y_and_adaptive_pitch_marks_only_outside_keep_band(self):
         args = make_args(
@@ -466,6 +469,63 @@ class TestCatchServer1(unittest.TestCase):
         self.assertFalse(steps[0].joint_pitch_after_pose)
         self.assertFalse(steps[4].joint_pitch_after_pose)
         self.assertFalse(steps[6].joint_pitch_after_pose)
+
+    def test_pick_x_offset_only_applies_to_planar_ik_adjust_targets(self):
+        base_args = dict(
+            pick_x_offset_mm=-10.0,
+            dynamic_pitch_by_x=True,
+            keep_pitch_min_x_mm=300.0,
+            keep_pitch_max_x_mm=380.0,
+            pitch_deg_per_mm_far=0.04,
+            pitch_deg_per_mm_near=0.03,
+        )
+        camera_to_base = np.eye(4, dtype=float)
+        camera_to_base[:3, 3] = np.array([0.46, 0.06, 0.10])
+        command = CameraPointCommand(x_m=0.0, y_m=0.0, z_m=0.0, command_id="cmd")
+
+        joint_args = make_args(**base_args, dynamic_pitch_mode="joint")
+        joint_target = target_from_command(command, camera_to_base, joint_args)
+
+        self.assertAlmostEqual(joint_target.raw_pick_x_mm, 460.0)
+        self.assertAlmostEqual(joint_target.pick_x_mm, 460.0)
+        self.assertEqual(joint_target.pick_x_source, "mapped_command_x")
+
+        planar_args = make_args(**base_args, dynamic_pitch_mode="planar-ik")
+        planar_target = target_from_command(command, camera_to_base, planar_args)
+        planar_steps = build_steps(planar_args, planar_target)
+
+        self.assertAlmostEqual(planar_target.raw_pick_x_mm, 460.0)
+        self.assertAlmostEqual(planar_target.pick_x_mm, 450.0)
+        self.assertEqual(
+            planar_target.pick_x_source,
+            "mapped_command_x_planar_ik_offset",
+        )
+        for index in (1, 2, 3):
+            self.assertAlmostEqual(planar_steps[index].pose.x_mm, 450.0)
+            self.assertAlmostEqual(planar_steps[index].pitch_source_x_mm, 460.0)
+            self.assertTrue(planar_steps[index].planar_ik)
+
+    def test_pick_x_offset_does_not_apply_inside_planar_ik_keep_band(self):
+        args = make_args(
+            pick_x_offset_mm=-10.0,
+            dynamic_pitch_by_x=True,
+            dynamic_pitch_mode="planar-ik",
+            keep_pitch_min_x_mm=300.0,
+            keep_pitch_max_x_mm=380.0,
+        )
+        camera_to_base = np.eye(4, dtype=float)
+        camera_to_base[:3, 3] = np.array([0.35, 0.06, 0.10])
+        command = CameraPointCommand(x_m=0.0, y_m=0.0, z_m=0.0, command_id="cmd")
+
+        target = target_from_command(command, camera_to_base, args)
+        steps = build_steps(args, target)
+
+        self.assertAlmostEqual(target.raw_pick_x_mm, 350.0)
+        self.assertAlmostEqual(target.pick_x_mm, 350.0)
+        self.assertEqual(target.pick_x_source, "mapped_command_x")
+        for index in (1, 2, 3):
+            self.assertAlmostEqual(steps[index].pose.x_mm, 350.0)
+            self.assertFalse(steps[index].planar_ik)
 
     def test_adaptive_pitch_keep_band_keeps_cartesian_orientation_and_no_joint_pitch(self):
         args = make_args(

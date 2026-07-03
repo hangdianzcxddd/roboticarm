@@ -720,6 +720,147 @@ def belt_depth_reference_pixel(plane: BeltDepthPlane) -> tuple[float, float]:
     return float(plane.width) / 2.0, float(plane.height) / 2.0
 
 
+def intrinsics_from_depth_frame(depth_frame: Any) -> PinholeIntrinsics:
+    rs_intrinsics = depth_frame.profile.as_video_stream_profile().intrinsics
+    return PinholeIntrinsics(
+        width=int(rs_intrinsics.width),
+        height=int(rs_intrinsics.height),
+        fx=float(rs_intrinsics.fx),
+        fy=float(rs_intrinsics.fy),
+        ppx=float(rs_intrinsics.ppx),
+        ppy=float(rs_intrinsics.ppy),
+        source="realsense_frame",
+    )
+
+
+def project_base_point_to_pixel(
+    camera_to_base: np.ndarray,
+    base_xyz_m: tuple[float, float, float],
+    intrinsics: PinholeIntrinsics,
+) -> tuple[int, int, float] | None:
+    if camera_to_base.shape != (4, 4):
+        raise ValueError("camera_to_base transform must be 4x4")
+
+    base_to_camera = np.linalg.inv(camera_to_base)
+    point_camera = base_to_camera @ np.array(
+        [base_xyz_m[0], base_xyz_m[1], base_xyz_m[2], 1.0],
+        dtype=float,
+    )
+    x_m, y_m, z_m = (float(value) for value in point_camera[:3])
+    if z_m <= 0.0 or not np.isfinite(z_m):
+        return None
+
+    u = intrinsics.fx * x_m / z_m + intrinsics.ppx
+    v = intrinsics.fy * y_m / z_m + intrinsics.ppy
+    if not (np.isfinite(u) and np.isfinite(v)):
+        return None
+    return int(round(u)), int(round(v)), z_m
+
+
+def project_dynamic_base_roi_to_pixels(
+    *,
+    camera_to_base: np.ndarray,
+    intrinsics: PinholeIntrinsics,
+    min_x_mm: float,
+    max_x_mm: float,
+    min_y_mm: float,
+    max_y_mm: float,
+    z_mm: float,
+) -> list[tuple[int, int]] | None:
+    corners_m = [
+        (float(min_x_mm) / 1000.0, float(min_y_mm) / 1000.0, float(z_mm) / 1000.0),
+        (float(max_x_mm) / 1000.0, float(min_y_mm) / 1000.0, float(z_mm) / 1000.0),
+        (float(max_x_mm) / 1000.0, float(max_y_mm) / 1000.0, float(z_mm) / 1000.0),
+        (float(min_x_mm) / 1000.0, float(max_y_mm) / 1000.0, float(z_mm) / 1000.0),
+    ]
+    pixels: list[tuple[int, int]] = []
+    for corner in corners_m:
+        projected = project_base_point_to_pixel(camera_to_base, corner, intrinsics)
+        if projected is None:
+            return None
+        u, v, _ = projected
+        if abs(u) > 1_000_000 or abs(v) > 1_000_000:
+            return None
+        pixels.append((u, v))
+    return pixels
+
+
+def dynamic_roi_overlay_z_mm(
+    targets: list[RankedSegTarget],
+    *,
+    camera_to_base: np.ndarray,
+    configured_z_mm: float | None,
+) -> float:
+    if configured_z_mm is not None:
+        return float(configured_z_mm)
+
+    z_values_mm: list[float] = []
+    for target in targets:
+        base_xyz_m = map_camera_point_to_base_xyz_m(
+            target.raw_point.x_m,
+            target.raw_point.y_m,
+            target.raw_point.z_m,
+            camera_to_base,
+        )
+        z_mm = float(base_xyz_m[2]) * 1000.0
+        if np.isfinite(z_mm):
+            z_values_mm.append(z_mm)
+    if z_values_mm:
+        return float(np.median(np.asarray(z_values_mm, dtype=float)))
+    return 0.0
+
+
+def draw_dynamic_base_roi(
+    image: np.ndarray,
+    *,
+    camera_to_base: np.ndarray,
+    intrinsics: PinholeIntrinsics,
+    min_x_mm: float,
+    max_x_mm: float,
+    min_y_mm: float,
+    max_y_mm: float,
+    z_mm: float,
+) -> bool:
+    pixels = project_dynamic_base_roi_to_pixels(
+        camera_to_base=camera_to_base,
+        intrinsics=intrinsics,
+        min_x_mm=min_x_mm,
+        max_x_mm=max_x_mm,
+        min_y_mm=min_y_mm,
+        max_y_mm=max_y_mm,
+        z_mm=z_mm,
+    )
+    if pixels is None:
+        return False
+
+    return draw_dynamic_base_roi_pixels(image, pixels)
+
+
+def draw_dynamic_base_roi_pixels(
+    image: np.ndarray,
+    pixels: list[tuple[int, int]],
+) -> bool:
+    if len(pixels) != 4:
+        return False
+
+    points = np.asarray(pixels, dtype=np.int32).reshape((-1, 1, 2))
+    overlay = image.copy()
+    cv2.fillPoly(overlay, [points], (255, 0, 255), lineType=cv2.LINE_AA)
+    cv2.addWeighted(overlay, 0.10, image, 0.90, 0.0, dst=image)
+    cv2.polylines(
+        image,
+        [points],
+        isClosed=True,
+        color=(255, 0, 255),
+        thickness=2,
+        lineType=cv2.LINE_AA,
+    )
+    for point in pixels:
+        cv2.circle(image, point, 4, (255, 255, 255), -1, lineType=cv2.LINE_AA)
+        cv2.circle(image, point, 4, (255, 0, 255), 1, lineType=cv2.LINE_AA)
+    return True
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -1008,6 +1149,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="fixed robot base Y line used to compute dynamic T_arrive",
     )
     parser.add_argument(
+        "--dynamic-roi-z-mm",
+        type=float,
+        help=(
+            "base Z height used to project the dynamic base-X/Y ROI into the "
+            "image; default auto-estimates from detected targets and falls back "
+            "to 0mm"
+        ),
+    )
+    parser.add_argument(
+        "--hide-dynamic-roi",
+        action="store_true",
+        help="hide the projected dynamic base-coordinate ROI overlay",
+    )
+    parser.add_argument(
         "--dynamic-keep-running",
         action="store_true",
         help="continue after a dynamic send instead of exiting after the first target",
@@ -1141,6 +1296,8 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError("--dynamic-skip-radius-mm must be > 0")
         if args.dynamic_probe_interval_s < 0.0:
             raise ValueError("--dynamic-probe-interval-s must be >= 0")
+        if args.dynamic_roi_z_mm is not None and not math.isfinite(args.dynamic_roi_z_mm):
+            raise ValueError("--dynamic-roi-z-mm must be finite")
 
 
 def normalize_belt_hsv_args(args: argparse.Namespace) -> None:
@@ -1920,6 +2077,8 @@ def main() -> None:
             f"speed={args.conveyor_speed_mm_s:.3f}mm/s "
             f"direction={args.conveyor_direction} "
             f"pick=(x={pick_x_text}, y={args.dynamic_pick_y_mm:.1f}mm). "
+            f"physical_roi=X=[{args.dynamic_min_x_mm:.1f},{args.dynamic_max_x_mm:.1f}]mm "
+            f"Y=[{args.dynamic_min_y_mm:.1f},{args.dynamic_max_y_mm:.1f}]mm "
             "Press Esc to exit.",
             flush=True,
         )
@@ -2164,6 +2323,32 @@ def main() -> None:
                 else:
                     status = dynamic_status
                 display_image = color_image.copy()
+                dynamic_roi_pixels: list[tuple[int, int]] | None = None
+                if (
+                    args.mode == "dynamic"
+                    and not args.hide_dynamic_roi
+                    and camera_to_base is not None
+                ):
+                    current_intrinsics = intrinsics or intrinsics_from_depth_frame(depth_frame)
+                    dynamic_roi_z_mm = dynamic_roi_overlay_z_mm(
+                        latest_targets,
+                        camera_to_base=camera_to_base,
+                        configured_z_mm=args.dynamic_roi_z_mm,
+                    )
+                    dynamic_roi_pixels = project_dynamic_base_roi_to_pixels(
+                        camera_to_base=camera_to_base,
+                        intrinsics=current_intrinsics,
+                        min_x_mm=args.dynamic_min_x_mm,
+                        max_x_mm=args.dynamic_max_x_mm,
+                        min_y_mm=args.dynamic_min_y_mm,
+                        max_y_mm=args.dynamic_max_y_mm,
+                        z_mm=dynamic_roi_z_mm,
+                    )
+                    status = f"{status} | " + (
+                        f"physical ROI z={dynamic_roi_z_mm:.1f}mm"
+                        if dynamic_roi_pixels is not None
+                        else "physical ROI outside camera view"
+                    )
                 draw_opencv_targets(
                     display_image,
                     segments,
@@ -2172,6 +2357,8 @@ def main() -> None:
                     status,
                     detector.config.roi_xywh,
                 )
+                if dynamic_roi_pixels is not None:
+                    draw_dynamic_base_roi_pixels(display_image, dynamic_roi_pixels)
                 cv2.imshow(RGB_WINDOW_NAME, display_image)
 
                 if not args.hide_mask:
@@ -2193,6 +2380,8 @@ def main() -> None:
                         status,
                         detector.config.roi_xywh,
                     )
+                    if dynamic_roi_pixels is not None:
+                        draw_dynamic_base_roi_pixels(depth_debug, dynamic_roi_pixels)
                     cv2.imshow(DEPTH_WINDOW_NAME, depth_debug)
 
                 key = cv2.waitKey(1) & 0xFF

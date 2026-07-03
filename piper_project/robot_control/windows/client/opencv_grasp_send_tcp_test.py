@@ -13,9 +13,13 @@ from robot_control.windows.client.opencv_grasp_send_tcp import (
     attach_object_short_axis_yaw,
     build_parser,
     detector_config_from_args,
+    draw_dynamic_base_roi,
     dynamic_opencv_target_diagnostic_from_target,
+    dynamic_roi_overlay_z_mm,
     format_dynamic_opencv_target_diagnostic,
     hsv_in_range,
+    project_base_point_to_pixel,
+    project_dynamic_base_roi_to_pixels,
     validate_args,
 )
 from robot_control.windows.client.yolo_seg_grasp_send_tcp import (
@@ -115,6 +119,84 @@ class TestOpenCVGraspSendTcp(unittest.TestCase):
         self.assertEqual((detection.x, detection.y, detection.width, detection.height), (60, 40, 40, 40))
         self.assertAlmostEqual(segments[0].centroid_u, 79.5, places=1)
         self.assertAlmostEqual(segments[0].centroid_v, 59.5, places=1)
+
+    def test_project_base_point_to_pixel_uses_inverse_hand_eye(self):
+        camera_to_base = np.eye(4, dtype=float)
+        camera_to_base[:3, 3] = np.array([0.10, -0.20, 0.0])
+        intrinsics = PinholeIntrinsics(
+            width=100,
+            height=100,
+            fx=100.0,
+            fy=100.0,
+            ppx=50.0,
+            ppy=50.0,
+        )
+
+        projected = project_base_point_to_pixel(
+            camera_to_base,
+            (0.10, -0.20, 1.0),
+            intrinsics,
+        )
+
+        self.assertEqual(projected, (50, 50, 1.0))
+
+    def test_project_dynamic_base_roi_to_pixels_and_draws_overlay(self):
+        image = np.zeros((100, 100, 3), dtype=np.uint8)
+        intrinsics = PinholeIntrinsics(
+            width=100,
+            height=100,
+            fx=100.0,
+            fy=100.0,
+            ppx=50.0,
+            ppy=50.0,
+        )
+
+        pixels = project_dynamic_base_roi_to_pixels(
+            camera_to_base=np.eye(4, dtype=float),
+            intrinsics=intrinsics,
+            min_x_mm=-100.0,
+            max_x_mm=100.0,
+            min_y_mm=-100.0,
+            max_y_mm=100.0,
+            z_mm=1000.0,
+        )
+        drawn = draw_dynamic_base_roi(
+            image,
+            camera_to_base=np.eye(4, dtype=float),
+            intrinsics=intrinsics,
+            min_x_mm=-100.0,
+            max_x_mm=100.0,
+            min_y_mm=-100.0,
+            max_y_mm=100.0,
+            z_mm=1000.0,
+        )
+
+        self.assertEqual(pixels, [(40, 40), (60, 40), (60, 60), (40, 60)])
+        self.assertTrue(drawn)
+        self.assertGreater(int(np.count_nonzero(image)), 0)
+
+    def test_dynamic_roi_overlay_z_uses_configured_or_target_median(self):
+        camera_to_base = np.eye(4, dtype=float)
+
+        self.assertEqual(
+            dynamic_roi_overlay_z_mm(
+                [ranked_target_at_camera_point(0.0, 0.0, 0.3)],
+                camera_to_base=camera_to_base,
+                configured_z_mm=12.0,
+            ),
+            12.0,
+        )
+        self.assertAlmostEqual(
+            dynamic_roi_overlay_z_mm(
+                [
+                    ranked_target_at_camera_point(0.0, 0.0, 0.3),
+                    ranked_target_at_camera_point(0.0, 0.0, 0.5),
+                ],
+                camera_to_base=camera_to_base,
+                configured_z_mm=None,
+            ),
+            400.0,
+        )
 
     def test_detector_finds_non_black_object_on_black_belt(self):
         frame = black_frame()
@@ -498,6 +580,24 @@ class TestOpenCVGraspSendTcp(unittest.TestCase):
         self.assertEqual(config.entry_edge, "right")
         self.assertEqual(config.entry_clear_margin_px, 12)
         self.assertEqual(config.entry_clear_frames, 3)
+
+    def test_dynamic_roi_visualization_arguments_are_parsed(self):
+        args = build_parser().parse_args(
+            [
+                "dynamic",
+                "--dry-run",
+                "--conveyor-speed-mm-s",
+                "140",
+                "--dynamic-roi-z-mm",
+                "25",
+                "--hide-dynamic-roi",
+            ]
+        )
+
+        validate_args(args)
+
+        self.assertEqual(args.dynamic_roi_z_mm, 25.0)
+        self.assertTrue(args.hide_dynamic_roi)
 
     def test_belt_depth_plane_compensation_updates_top_depth(self):
         frame = green_frame(20, 20)
