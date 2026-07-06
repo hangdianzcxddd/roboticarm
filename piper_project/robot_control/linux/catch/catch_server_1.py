@@ -77,6 +77,9 @@ DEFAULT_KEEP_PITCH_MAX_X_MM = 380.0
 DEFAULT_PITCH_DEG_PER_MM_FAR = 0.04
 DEFAULT_PITCH_DEG_PER_MM_NEAR = 0.03
 PLANAR_IK_JOINT_INDICES = (1, 2, 4)
+PLANAR_IK_YAW_JOINT_INDICES = (1, 2, 3, 4, 5)
+PLANAR_IK_YAW_DELTA_LIMIT_JOINT_INDICES = (3, 5)
+PLANAR_IK_YAW_DELTA_LIMIT_DEG = 90.0
 
 
 @dataclass(frozen=True)
@@ -91,6 +94,7 @@ class SequenceStep:
     pitch_source_x_mm: float | None = None
     planar_ik: bool = False
     require_reached: bool = False
+    planar_ik_include_j6_yaw: bool = False
 
 
 @dataclass(frozen=True)
@@ -241,13 +245,16 @@ class PlanarIkExecutionResult:
     position_error_mm: float
     ry_error_deg: float
     send_count: int
+    rx_error_deg: float = 0.0
+    rz_error_deg: float = 0.0
     solved_fk_pose: EndPose | None = None
     final_joints_deg: tuple[float, float, float, float, float, float] | None = None
-    joint_errors_deg: tuple[float, float, float] | None = None
+    joint_errors_deg: tuple[float, ...] | None = None
     max_joint_error_deg: float | None = None
     final_pose: EndPose | None = None
     reused: bool = False
     reused_from_step_label: str | None = None
+    joint_indices: tuple[int, ...] = PLANAR_IK_JOINT_INDICES
 
 
 @dataclass(frozen=True)
@@ -263,6 +270,9 @@ class PlanarIkSolution:
     z_error_mm: float
     position_error_mm: float
     ry_error_deg: float
+    rx_error_deg: float = 0.0
+    rz_error_deg: float = 0.0
+    joint_indices: tuple[int, ...] = PLANAR_IK_JOINT_INDICES
 
 
 PlanarIkCacheKey = tuple[float, ...]
@@ -651,14 +661,38 @@ def build_parser() -> argparse.ArgumentParser:
         default="joint",
         help=(
             "joint keeps the legacy J2/J3/J5 trim after Cartesian waypoints; "
-            "planar-ik fixes J1/J4/J6 and solves J2/J3/J5 for target X/Z/RY"
+            "planar-ik normally fixes J1/J4/J6 and solves J2/J3/J5 for target "
+            "X/Z/RY; with object-short-edge yaw it solves J2/J3/J4/J5/J6 "
+            "for X/Z/RX/RY/RZ"
         ),
     )
     parser.add_argument("--planar-ik-max-iterations", type=int, default=40)
     parser.add_argument("--planar-ik-position-tolerance-mm", type=float, default=3.0)
+    parser.add_argument(
+        "--planar-ik-rx-tolerance-deg",
+        type=float,
+        default=5.0,
+        help="RX tolerance for planar IK when J4 wrist roll is included",
+    )
     parser.add_argument("--planar-ik-ry-tolerance-deg", type=float, default=1.0)
+    parser.add_argument(
+        "--planar-ik-rz-tolerance-deg",
+        type=float,
+        default=3.0,
+        help="RZ tolerance for planar IK when J6 yaw is included",
+    )
     parser.add_argument("--planar-ik-max-step-deg", type=float, default=8.0)
     parser.add_argument("--planar-ik-damping", type=float, default=1e-3)
+    parser.add_argument(
+        "--planar-ik-include-j6-yaw",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "when object-short-edge yaw is enabled, solve planar IK with "
+            "J2/J3/J4/J5/J6 for X/Z/RX/RY/RZ instead of rotating J6 before the "
+            "planar-IK descent"
+        ),
+    )
     parser.add_argument(
         "--planar-ik-speed",
         type=int,
@@ -935,7 +969,9 @@ def validate_args(args: argparse.Namespace) -> None:
         "safe_gripper_monitor_s",
         "gripper_settle_s",
         "planar_ik_position_tolerance_mm",
+        "planar_ik_rx_tolerance_deg",
         "planar_ik_ry_tolerance_deg",
+        "planar_ik_rz_tolerance_deg",
         "planar_ik_max_step_deg",
         "planar_ik_damping",
         "planar_ik_grasp_z_comp_mm_per_deg",
@@ -949,8 +985,12 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--planar-ik-max-iterations must be an integer >= 1")
     if args.planar_ik_position_tolerance_mm <= 0.0:
         raise ValueError("--planar-ik-position-tolerance-mm must be > 0")
+    if args.planar_ik_rx_tolerance_deg <= 0.0:
+        raise ValueError("--planar-ik-rx-tolerance-deg must be > 0")
     if args.planar_ik_ry_tolerance_deg <= 0.0:
         raise ValueError("--planar-ik-ry-tolerance-deg must be > 0")
+    if args.planar_ik_rz_tolerance_deg <= 0.0:
+        raise ValueError("--planar-ik-rz-tolerance-deg must be > 0")
     if args.planar_ik_max_step_deg <= 0.0:
         raise ValueError("--planar-ik-max-step-deg must be > 0")
     if args.planar_ik_damping <= 0.0:
@@ -1273,6 +1313,13 @@ def far_planar_transfer_via_ready(args: argparse.Namespace, pitch_source_x_mm: f
     return use_planar_ik(args, pitch_source_x_mm)
 
 
+def use_planar_ik_yaw(args: argparse.Namespace) -> bool:
+    return bool(
+        getattr(args, "planar_ik_include_j6_yaw", False)
+        and getattr(args, "grasp_yaw_by_object_short_edge", False)
+    )
+
+
 def dynamic_pitch_summary(
     args: argparse.Namespace,
     target: YoloCatchTarget,
@@ -1287,7 +1334,11 @@ def dynamic_pitch_summary(
         "enabled": decision.enabled,
         "mode": decision.mode,
         "method": (
-            "planar_ik_j2_j3_j5"
+            (
+                "planar_ik_j2_j3_j4_j5_j6_yaw"
+                if use_planar_ik_yaw(args)
+                else "planar_ik_j2_j3_j5"
+            )
             if control_mode == "planar_ik"
             else "joint_space_j2_j3_j5"
         ),
@@ -2569,7 +2620,6 @@ def execute_step(
     speed: int | None = None,
     joint_pitch_adjustments: list[JointPitchAdjustmentResult] | None = None,
     grasp_yaw_adjustments: list[GraspYawAdjustmentResult] | None = None,
-    grasp_yaw_target: YoloCatchTarget | None = None,
     planar_ik_results: list[PlanarIkExecutionResult] | None = None,
     planar_ik_reuse_state: PlanarIkReuseState | None = None,
 ) -> tuple[int, SafeGripperResult | None]:
@@ -2601,14 +2651,6 @@ def execute_step(
             )
             if planar_ik_results is not None:
                 planar_ik_results.append(planar_result)
-            if (
-                step.label in ("pick_grasp", "return_pick_grasp")
-                and grasp_yaw_target is not None
-                and grasp_yaw_adjustments is not None
-            ):
-                grasp_yaw_adjustments.append(
-                    apply_grasp_yaw_adjustment(controller, args, grasp_yaw_target)
-                )
             gripper_result = send_gripper(controller, args, step.gripper_after)
             return send_count, gripper_result
         send_count, planar_result = execute_planar_ik_step(controller, args, step)
@@ -2620,14 +2662,6 @@ def execute_step(
             )
         if planar_ik_results is not None:
             planar_ik_results.append(planar_result)
-        if (
-            step.label in ("pick_grasp", "return_pick_grasp")
-            and grasp_yaw_target is not None
-            and grasp_yaw_adjustments is not None
-        ):
-            grasp_yaw_adjustments.append(
-                apply_grasp_yaw_adjustment(controller, args, grasp_yaw_target)
-            )
         gripper_result = send_gripper(controller, args, step.gripper_after)
         return send_count, gripper_result
     if step.joint_pitch_before_pose:
@@ -2667,14 +2701,6 @@ def execute_step(
         )
         if pitch_adjustment is not None and joint_pitch_adjustments is not None:
             joint_pitch_adjustments.append(pitch_adjustment)
-    if (
-        step.label in ("pick_grasp", "return_pick_grasp")
-        and grasp_yaw_target is not None
-        and grasp_yaw_adjustments is not None
-    ):
-        grasp_yaw_adjustments.append(
-            apply_grasp_yaw_adjustment(controller, args, grasp_yaw_target)
-        )
     gripper_result = send_gripper(controller, args, step.gripper_after)
     return send_count, gripper_result
 
@@ -2814,6 +2840,7 @@ def wait_until_planar_ik_joints_reached(
     timeout_s: float,
     joint_tolerance_deg: float,
     *,
+    joint_indices: tuple[int, ...] = PLANAR_IK_JOINT_INDICES,
     initial_feedback_stamp: float | None = None,
 ) -> tuple[tuple[float, ...], tuple[float, ...], float]:
     deadline = time.monotonic() + timeout_s
@@ -2831,7 +2858,11 @@ def wait_until_planar_ik_joints_reached(
         )
         if current_joints is not None:
             last_joints = current_joints
-            last_errors = joint_errors_deg(current_joints, target_joints_rad)
+            last_errors = joint_errors_deg(
+                current_joints,
+                target_joints_rad,
+                joint_indices,
+            )
             max_error = max(abs(value) for value in last_errors)
             if fresh_feedback and max_error <= joint_tolerance_deg:
                 return current_joints, last_errors, max_error
@@ -2842,9 +2873,10 @@ def wait_until_planar_ik_joints_reached(
     last_deg = None if last_joints is None else joints_rad_to_deg(last_joints)
     raise RuntimeError(
         f"planar IK joints for {label} not reached: "
-        f"target_j2_j3_j5=({target_deg[1]:.3f}, {target_deg[2]:.3f}, {target_deg[4]:.3f}) "
-        f"last_j2_j3_j5="
-        f"{'unavailable' if last_deg is None else f'({last_deg[1]:.3f}, {last_deg[2]:.3f}, {last_deg[4]:.3f})'} "
+        f"target_{planar_ik_joint_label(joint_indices).lower()}="
+        f"{tuple(round(target_deg[index], 3) for index in joint_indices)} "
+        f"last_{planar_ik_joint_label(joint_indices).lower()}="
+        f"{'unavailable' if last_deg is None else tuple(round(last_deg[index], 3) for index in joint_indices)} "
         f"max_joint_err={max_error:.3f}deg "
         f"tol={joint_tolerance_deg:.3f}deg "
         f"{format_status(controller)}"
@@ -2879,8 +2911,11 @@ def planar_ik_result_to_dict(result: PlanarIkExecutionResult) -> dict[str, Any]:
         "y_error_mm": result.y_error_mm,
         "z_error_mm": result.z_error_mm,
         "position_error_mm": result.position_error_mm,
+        "rx_error_deg": result.rx_error_deg,
         "ry_error_deg": result.ry_error_deg,
+        "rz_error_deg": result.rz_error_deg,
         "send_count": result.send_count,
+        "joint_indices": [index + 1 for index in result.joint_indices],
     }
     return payload
 
@@ -2908,6 +2943,18 @@ def planar_ik_speed(args: argparse.Namespace) -> int:
     return int(args.speed if value is None else value)
 
 
+def planar_ik_joint_indices_for_step(step: SequenceStep) -> tuple[int, ...]:
+    return (
+        PLANAR_IK_YAW_JOINT_INDICES
+        if getattr(step, "planar_ik_include_j6_yaw", False)
+        else PLANAR_IK_JOINT_INDICES
+    )
+
+
+def planar_ik_joint_label(joint_indices: tuple[int, ...]) -> str:
+    return "/".join(f"J{index + 1}" for index in joint_indices)
+
+
 def planar_ik_cache_key(
     args: argparse.Namespace,
     step: SequenceStep,
@@ -2924,6 +2971,7 @@ def planar_ik_cache_key(
         round(float(pitch_source_x_mm), 3),
         round(float(decision.requested_pitch_delta_deg), 6),
         round(float(args.planar_ik_fk_tool_z_offset_mm), 3),
+        *tuple(float(index) for index in planar_ik_joint_indices_for_step(step)),
     )
 
 
@@ -2949,8 +2997,9 @@ def execute_reused_planar_ik_step(
 ) -> tuple[int, PlanarIkExecutionResult]:
     initial_joint_feedback = controller.get_joint_state()
     initial_feedback_stamp = joint_feedback_timestamp(initial_joint_feedback)
+    joint_indices = planar_ik_joint_indices_for_step(step)
     print(
-        "Reusing planar IK J2/J3/J5: "
+        f"Reusing planar IK {planar_ik_joint_label(joint_indices)}: "
         f"step={step.label} from={cached.step_label} "
         f"target={format_pose(step.pose)} "
         f"speed={planar_ik_speed(args)}",
@@ -2974,6 +3023,7 @@ def execute_reused_planar_ik_step(
                 cached.target_joints_rad,
                 timeout_s=args.motion_timeout_s,
                 joint_tolerance_deg=float(args.planar_ik_joint_tolerance_deg),
+                joint_indices=joint_indices,
                 initial_feedback_stamp=initial_feedback_stamp,
             )
         )
@@ -2981,16 +3031,18 @@ def execute_reused_planar_ik_step(
         feedback_joints = joint_feedback_to_rad(controller.get_joint_state())
         if feedback_joints is not None:
             final_joints = feedback_joints
-            final_joint_errors = joint_errors_deg(feedback_joints, cached.target_joints_rad)
+            final_joint_errors = joint_errors_deg(
+                feedback_joints,
+                cached.target_joints_rad,
+                joint_indices,
+            )
             max_joint_error = max(abs(value) for value in final_joint_errors)
     final_pose = feedback_to_pose(controller.get_end_pose())
     if final_joints is not None and final_joint_errors is not None:
         print(
             "Planar IK reuse feedback: "
             f"step={step.label} "
-            f"j2_err={final_joint_errors[0]:.3f}deg "
-            f"j3_err={final_joint_errors[1]:.3f}deg "
-            f"j5_err={final_joint_errors[2]:.3f}deg "
+            f"joint_errors={tuple(round(value, 3) for value in final_joint_errors)}deg "
             f"max_err={max_joint_error:.3f}deg "
             f"final_pose={format_pose(final_pose)}",
             flush=True,
@@ -3007,15 +3059,14 @@ def execute_reused_planar_ik_step(
             None
             if final_joint_errors is None
             else (
-                float(final_joint_errors[0]),
-                float(final_joint_errors[1]),
-                float(final_joint_errors[2]),
+                *(float(value) for value in final_joint_errors),
             )
         ),
         max_joint_error_deg=max_joint_error,
         final_pose=final_pose,
         reused=True,
         reused_from_step_label=cached.step_label,
+        joint_indices=joint_indices,
     )
     return send_count, reused
 
@@ -3057,21 +3108,47 @@ def clamp_pitch_delta_to_joint_limits(
     return min(upper, max(lower, requested_pitch_delta_deg))
 
 
+def validate_planar_ik_joint_delta_limits(
+    current_joints: tuple[float, ...] | list[float],
+    target_joints: tuple[float, ...] | list[float],
+    joint_indices: tuple[int, ...],
+    *,
+    label: str,
+) -> None:
+    for joint_index in PLANAR_IK_YAW_DELTA_LIMIT_JOINT_INDICES:
+        if joint_index not in joint_indices:
+            continue
+        delta_deg = normalize_degrees(
+            math.degrees(float(target_joints[joint_index]) - float(current_joints[joint_index]))
+        )
+        if abs(delta_deg) > PLANAR_IK_YAW_DELTA_LIMIT_DEG:
+            raise SafetyError(
+                f"planar IK {label} requires J{joint_index + 1} delta "
+                f"{delta_deg:.3f}deg, exceeding +/-"
+                f"{PLANAR_IK_YAW_DELTA_LIMIT_DEG:.1f}deg limit"
+            )
+
+
 def _planar_ik_residual(
     joints_rad: tuple[float, ...] | list[float],
     args: argparse.Namespace,
     target_pose: EndPose,
     target_ry_deg: float,
+    *,
+    include_rx: bool = False,
+    include_rz: bool = False,
 ) -> np.ndarray:
     pose = forward_kinematics_planar_ik_pose(joints_rad, args)
-    return np.array(
-        [
-            (pose.x_mm - target_pose.x_mm) / 100.0,
-            (pose.z_mm - target_pose.z_mm) / 100.0,
-            normalize_degrees(pose.ry_deg - target_ry_deg) / 10.0,
-        ],
-        dtype=float,
-    )
+    residual = [
+        (pose.x_mm - target_pose.x_mm) / 100.0,
+        (pose.z_mm - target_pose.z_mm) / 100.0,
+    ]
+    if include_rx:
+        residual.append(normalize_degrees(pose.rx_deg - target_pose.rx_deg) / 10.0)
+    residual.append(normalize_degrees(pose.ry_deg - target_ry_deg) / 10.0)
+    if include_rz:
+        residual.append(normalize_degrees(pose.rz_deg - target_pose.rz_deg) / 10.0)
+    return np.array(residual, dtype=float)
 
 
 def solve_planar_ik_j2_j3_j5(
@@ -3080,9 +3157,12 @@ def solve_planar_ik_j2_j3_j5(
     current_joints: tuple[float, ...],
     target_pose: EndPose,
     pitch_source_x_mm: float,
+    joint_indices: tuple[int, ...] = PLANAR_IK_JOINT_INDICES,
 ) -> PlanarIkSolution:
     decision = joint_pitch_decision(args, pitch_source_x_mm)
     target_ry_deg = float(args.ry_deg) + float(decision.requested_pitch_delta_deg)
+    include_rx = 3 in joint_indices
+    include_rz = 5 in joint_indices
     joints = np.array(current_joints, dtype=float)
     max_step_rad = math.radians(float(args.planar_ik_max_step_deg))
     damping = float(args.planar_ik_damping)
@@ -3090,43 +3170,77 @@ def solve_planar_ik_j2_j3_j5(
 
     for iteration in range(int(args.planar_ik_max_iterations)):
         iterations = iteration + 1
-        residual = _planar_ik_residual(joints, args, target_pose, target_ry_deg)
+        residual = _planar_ik_residual(
+            joints,
+            args,
+            target_pose,
+            target_ry_deg,
+            include_rx=include_rx,
+            include_rz=include_rz,
+        )
         solved_pose = forward_kinematics_planar_ik_pose(joints, args)
         position_error_mm = math.sqrt(
             (solved_pose.x_mm - target_pose.x_mm) ** 2
             + (solved_pose.z_mm - target_pose.z_mm) ** 2
         )
+        rx_error_deg = abs(normalize_degrees(solved_pose.rx_deg - target_pose.rx_deg))
         ry_error_deg = abs(normalize_degrees(solved_pose.ry_deg - target_ry_deg))
+        rz_error_deg = abs(normalize_degrees(solved_pose.rz_deg - target_pose.rz_deg))
         if (
             position_error_mm <= float(args.planar_ik_position_tolerance_mm)
+            and (
+                not include_rx
+                or rx_error_deg <= float(args.planar_ik_rx_tolerance_deg)
+            )
             and ry_error_deg <= float(args.planar_ik_ry_tolerance_deg)
+            and (
+                not include_rz
+                or rz_error_deg <= float(args.planar_ik_rz_tolerance_deg)
+            )
         ):
             break
 
-        jacobian = np.zeros((3, 3), dtype=float)
+        jacobian = np.zeros((len(residual), len(joint_indices)), dtype=float)
         epsilon = 1e-4
-        for column, joint_index in enumerate(PLANAR_IK_JOINT_INDICES):
+        for column, joint_index in enumerate(joint_indices):
             plus = joints.copy()
             plus[joint_index] += epsilon
             minus = joints.copy()
             minus[joint_index] -= epsilon
             jacobian[:, column] = (
-                _planar_ik_residual(plus, args, target_pose, target_ry_deg)
-                - _planar_ik_residual(minus, args, target_pose, target_ry_deg)
+                _planar_ik_residual(
+                    plus,
+                    args,
+                    target_pose,
+                    target_ry_deg,
+                    include_rx=include_rx,
+                    include_rz=include_rz,
+                )
+                - _planar_ik_residual(
+                    minus,
+                    args,
+                    target_pose,
+                    target_ry_deg,
+                    include_rx=include_rx,
+                    include_rz=include_rz,
+                )
             ) / (2.0 * epsilon)
 
         try:
             delta = np.linalg.solve(
-                jacobian.T @ jacobian + damping * np.eye(3, dtype=float),
+                jacobian.T @ jacobian
+                + damping * np.eye(len(joint_indices), dtype=float),
                 -jacobian.T @ residual,
             )
         except np.linalg.LinAlgError as exc:
-            raise SafetyError("planar IK failed: singular J2/J3/J5 Jacobian") from exc
+            raise SafetyError(
+                f"planar IK failed: singular {planar_ik_joint_label(joint_indices)} Jacobian"
+            ) from exc
         max_abs_delta = float(np.max(np.abs(delta)))
         if max_abs_delta > max_step_rad:
             delta *= max_step_rad / max_abs_delta
 
-        for delta_value, joint_index in zip(delta, PLANAR_IK_JOINT_INDICES):
+        for delta_value, joint_index in zip(delta, joint_indices):
             limit = controller.config.joint_limits_rad[joint_index]
             joints[joint_index] = min(
                 limit.max_value - math.radians(0.1),
@@ -3135,6 +3249,12 @@ def solve_planar_ik_j2_j3_j5(
 
     target_joints = tuple(float(value) for value in joints)
     controller.validate_joints(target_joints)
+    validate_planar_ik_joint_delta_limits(
+        current_joints,
+        target_joints,
+        joint_indices,
+        label=format_pose(target_pose),
+    )
     solved_fk_pose = forward_kinematics_pose(target_joints)
     solved_pose = apply_tool_z_offset_to_fk_pose(
         solved_fk_pose,
@@ -3144,18 +3264,40 @@ def solve_planar_ik_j2_j3_j5(
     y_error_mm = solved_pose.y_mm - target_pose.y_mm
     z_error_mm = solved_pose.z_mm - target_pose.z_mm
     position_error_mm = math.sqrt(x_error_mm**2 + z_error_mm**2)
+    rx_error_deg = normalize_degrees(solved_pose.rx_deg - target_pose.rx_deg)
     ry_error_deg = normalize_degrees(solved_pose.ry_deg - target_ry_deg)
+    rz_error_deg = normalize_degrees(solved_pose.rz_deg - target_pose.rz_deg)
     if (
         position_error_mm > float(args.planar_ik_position_tolerance_mm)
+        or (
+            include_rx
+            and abs(rx_error_deg) > float(args.planar_ik_rx_tolerance_deg)
+        )
         or abs(ry_error_deg) > float(args.planar_ik_ry_tolerance_deg)
+        or (
+            include_rz
+            and abs(rz_error_deg) > float(args.planar_ik_rz_tolerance_deg)
+        )
     ):
+        rz_error_text = (
+            f" rz_err={rz_error_deg:.3f}deg"
+            if include_rz
+            else ""
+        )
+        rx_error_text = (
+            f"rx_err={rx_error_deg:.3f}deg "
+            if include_rx
+            else ""
+        )
         raise SafetyError(
             "planar IK did not converge within tolerance: "
             f"target={format_pose(target_pose)} "
             f"target_ry={target_ry_deg:.3f}deg "
             f"solved={format_pose(solved_pose)} "
             f"x_err={x_error_mm:.3f}mm z_err={z_error_mm:.3f}mm "
+            f"{rx_error_text}"
             f"ry_err={ry_error_deg:.3f}deg "
+            f"{rz_error_text}"
             f"iterations={iterations}"
         )
     return PlanarIkSolution(
@@ -3170,6 +3312,9 @@ def solve_planar_ik_j2_j3_j5(
         z_error_mm=z_error_mm,
         position_error_mm=position_error_mm,
         ry_error_deg=ry_error_deg,
+        rx_error_deg=rx_error_deg if include_rx else 0.0,
+        rz_error_deg=rz_error_deg if include_rz else 0.0,
+        joint_indices=joint_indices,
     )
 
 
@@ -3188,15 +3333,17 @@ def execute_planar_ik_step(
     current_joints = joint_feedback_to_rad(initial_joint_feedback)
     if current_joints is None:
         raise RuntimeError("planar IK requires valid joint feedback before JointCtrl")
+    joint_indices = planar_ik_joint_indices_for_step(step)
     solution = solve_planar_ik_j2_j3_j5(
         controller,
         args,
         current_joints,
         step.pose,
         pitch_source_x,
+        joint_indices=joint_indices,
     )
     print(
-        "Running planar IK J2/J3/J5: "
+        f"Running planar IK {planar_ik_joint_label(joint_indices)}: "
         f"step={step.label} "
         f"target={format_pose(step.pose)} "
         f"solved={format_pose(solution.solved_pose)} "
@@ -3205,7 +3352,9 @@ def execute_planar_ik_step(
         f"pitch_delta={solution.pitch_delta_deg:.3f}deg "
         f"x_err={solution.x_error_mm:.3f}mm "
         f"z_err={solution.z_error_mm:.3f}mm "
+        f"rx_err={solution.rx_error_deg:.3f}deg "
         f"ry_err={solution.ry_error_deg:.3f}deg "
+        f"rz_err={solution.rz_error_deg:.3f}deg "
         f"speed={planar_ik_speed(args)}",
         flush=True,
     )
@@ -3228,6 +3377,7 @@ def execute_planar_ik_step(
                 solution.target_joints_rad,
                 timeout_s=args.motion_timeout_s,
                 joint_tolerance_deg=float(args.planar_ik_joint_tolerance_deg),
+                joint_indices=joint_indices,
                 initial_feedback_stamp=initial_feedback_stamp,
             )
         )
@@ -3235,16 +3385,18 @@ def execute_planar_ik_step(
         feedback_joints = joint_feedback_to_rad(controller.get_joint_state())
         if feedback_joints is not None:
             final_joints = feedback_joints
-            final_joint_errors = joint_errors_deg(feedback_joints, solution.target_joints_rad)
+            final_joint_errors = joint_errors_deg(
+                feedback_joints,
+                solution.target_joints_rad,
+                joint_indices,
+            )
             max_joint_error = max(abs(value) for value in final_joint_errors)
     final_pose = feedback_to_pose(controller.get_end_pose())
     if final_joints is not None and final_joint_errors is not None:
         print(
             "Planar IK joint feedback: "
             f"step={step.label} "
-            f"j2_err={final_joint_errors[0]:.3f}deg "
-            f"j3_err={final_joint_errors[1]:.3f}deg "
-            f"j5_err={final_joint_errors[2]:.3f}deg "
+            f"joint_errors={tuple(round(value, 3) for value in final_joint_errors)}deg "
             f"max_err={max_joint_error:.3f}deg "
             f"final_pose={format_pose(final_pose)}",
             flush=True,
@@ -3269,7 +3421,9 @@ def execute_planar_ik_step(
         y_error_mm=solution.y_error_mm,
         z_error_mm=solution.z_error_mm,
         position_error_mm=solution.position_error_mm,
+        rx_error_deg=solution.rx_error_deg,
         ry_error_deg=solution.ry_error_deg,
+        rz_error_deg=solution.rz_error_deg,
         send_count=send_count,
         solved_fk_pose=solution.solved_fk_pose,
         final_joints_deg=(
@@ -3279,13 +3433,12 @@ def execute_planar_ik_step(
             None
             if final_joint_errors is None
             else (
-                float(final_joint_errors[0]),
-                float(final_joint_errors[1]),
-                float(final_joint_errors[2]),
+                *(float(value) for value in final_joint_errors),
             )
         ),
         max_joint_error_deg=max_joint_error,
         final_pose=final_pose,
+        joint_indices=joint_indices,
     )
 
 
@@ -3390,19 +3543,24 @@ def nearest_axis_equivalent_delta_deg(target_deg: float, current_deg: float) -> 
     return delta
 
 
-def apply_grasp_yaw_adjustment(
+def compute_grasp_yaw_adjustment_result(
     controller: PiperController,
     args: argparse.Namespace,
     target: YoloCatchTarget,
-) -> GraspYawAdjustmentResult:
+    *,
+    execute: bool,
+) -> tuple[GraspYawAdjustmentResult, tuple[float, ...] | None]:
     if not getattr(args, "grasp_yaw_by_object_short_edge", False):
-        return GraspYawAdjustmentResult(enabled=False, reason="disabled")
+        return GraspYawAdjustmentResult(enabled=False, reason="disabled"), None
 
     source_yaw = target.camera_command.object_short_axis_yaw_deg
     if source_yaw is None or not math.isfinite(float(source_yaw)):
-        return GraspYawAdjustmentResult(
-            enabled=True,
-            reason="missing_object_short_axis_yaw_deg",
+        return (
+            GraspYawAdjustmentResult(
+                enabled=True,
+                reason="missing_object_short_axis_yaw_deg",
+            ),
+            None,
         )
 
     current_joints = joint_feedback_to_rad(controller.get_joint_state())
@@ -3416,16 +3574,19 @@ def apply_grasp_yaw_adjustment(
     )
     raw_delta_deg = nearest_axis_equivalent_delta_deg(target_yaw_deg, current_j6_deg)
     if abs(raw_delta_deg) <= float(args.grasp_yaw_deadband_deg):
-        return GraspYawAdjustmentResult(
-            enabled=True,
-            applied=False,
-            reason="within_deadband",
-            source_yaw_deg=float(source_yaw),
-            target_yaw_deg=target_yaw_deg,
-            current_j6_deg=current_j6_deg,
-            delta_deg=0.0,
-            start_joints_deg=start_joints_deg,  # type: ignore[arg-type]
-            target_joints_deg=start_joints_deg,  # type: ignore[arg-type]
+        return (
+            GraspYawAdjustmentResult(
+                enabled=True,
+                applied=False,
+                reason="within_deadband",
+                source_yaw_deg=float(source_yaw),
+                target_yaw_deg=target_yaw_deg,
+                current_j6_deg=current_j6_deg,
+                delta_deg=0.0,
+                start_joints_deg=start_joints_deg,  # type: ignore[arg-type]
+                target_joints_deg=start_joints_deg,  # type: ignore[arg-type]
+            ),
+            current_joints,
         )
 
     max_delta_deg = float(args.grasp_yaw_max_delta_deg)
@@ -3450,27 +3611,39 @@ def apply_grasp_yaw_adjustment(
     )
     delta_deg = target_j6_deg - current_j6_deg
     if abs(delta_deg) <= float(args.grasp_yaw_deadband_deg):
-        return GraspYawAdjustmentResult(
-            enabled=True,
-            applied=False,
-            reason="within_joint6_limit_deadband" if limit_clamped else "within_deadband",
-            source_yaw_deg=float(source_yaw),
-            target_yaw_deg=target_yaw_deg,
-            current_j6_deg=current_j6_deg,
-            delta_deg=0.0,
-            clamped=delta_clamped,
-            limit_clamped=limit_clamped,
-            start_joints_deg=start_joints_deg,  # type: ignore[arg-type]
-            target_joints_deg=start_joints_deg,  # type: ignore[arg-type]
+        return (
+            GraspYawAdjustmentResult(
+                enabled=True,
+                applied=False,
+                reason=(
+                    "within_joint6_limit_deadband"
+                    if limit_clamped
+                    else "within_deadband"
+                ),
+                source_yaw_deg=float(source_yaw),
+                target_yaw_deg=target_yaw_deg,
+                current_j6_deg=current_j6_deg,
+                delta_deg=0.0,
+                clamped=delta_clamped,
+                limit_clamped=limit_clamped,
+                start_joints_deg=start_joints_deg,  # type: ignore[arg-type]
+                target_joints_deg=start_joints_deg,  # type: ignore[arg-type]
+            ),
+            current_joints,
         )
+
     clamped = delta_clamped or limit_clamped
     target_joints = list(current_joints)
     target_joints[5] += math.radians(delta_deg)
     controller.validate_joints(target_joints)
 
     print(
-        "Applying object short-edge grasp yaw: "
-        f"source_yaw={float(source_yaw):.3f}deg "
+        (
+            "Applying object short-edge grasp yaw: "
+            if execute
+            else "Planning integrated planar-IK object short-edge grasp yaw: "
+        )
+        + f"source_yaw={float(source_yaw):.3f}deg "
         f"offset={float(args.gripper_close_axis_offset_deg):.3f}deg "
         f"target_yaw={target_yaw_deg:.3f}deg "
         f"current_j6={current_j6_deg:.3f}deg "
@@ -3480,26 +3653,170 @@ def apply_grasp_yaw_adjustment(
         f"limit_clamped={limit_clamped}",
         flush=True,
     )
-    send_count = execute_joints_for_duration(
+    send_count = 0
+    if execute:
+        send_count = execute_joints_for_duration(
+            controller,
+            target_joints,
+            int(args.grasp_yaw_speed),
+            float(args.command_duration_s),
+            float(args.command_period_s),
+        )
+    return (
+        GraspYawAdjustmentResult(
+            enabled=True,
+            applied=True,
+            source_yaw_deg=float(source_yaw),
+            target_yaw_deg=target_yaw_deg,
+            current_j6_deg=current_j6_deg,
+            delta_deg=delta_deg,
+            clamped=clamped,
+            limit_clamped=limit_clamped,
+            start_joints_deg=start_joints_deg,  # type: ignore[arg-type]
+            target_joints_deg=joints_rad_to_deg(target_joints),
+            send_count=send_count,
+        ),
+        tuple(float(value) for value in target_joints),
+    )
+
+
+def apply_grasp_yaw_adjustment(
+    controller: PiperController,
+    args: argparse.Namespace,
+    target: YoloCatchTarget,
+) -> GraspYawAdjustmentResult:
+    result, _ = compute_grasp_yaw_adjustment_result(
         controller,
-        target_joints,
-        int(args.grasp_yaw_speed),
-        float(args.command_duration_s),
-        float(args.command_period_s),
+        args,
+        target,
+        execute=True,
     )
-    return GraspYawAdjustmentResult(
-        enabled=True,
-        applied=True,
-        source_yaw_deg=float(source_yaw),
-        target_yaw_deg=target_yaw_deg,
-        current_j6_deg=current_j6_deg,
-        delta_deg=delta_deg,
-        clamped=clamped,
-        limit_clamped=limit_clamped,
-        start_joints_deg=start_joints_deg,  # type: ignore[arg-type]
-        target_joints_deg=joints_rad_to_deg(target_joints),
-        send_count=send_count,
+    return result
+
+
+def should_inherit_post_yaw_orientation(result: GraspYawAdjustmentResult) -> bool:
+    return bool(
+        result.applied
+        or result.reason in ("within_deadband", "within_joint6_limit_deadband")
     )
+
+
+def with_current_orientation(pose: EndPose, current_pose: EndPose) -> EndPose:
+    return replace(
+        pose,
+        rx_deg=current_pose.rx_deg,
+        ry_deg=current_pose.ry_deg,
+        rz_deg=current_pose.rz_deg,
+    )
+
+
+def post_grasp_yaw_orientation(
+    before_pose: EndPose | None,
+    after_pose: EndPose | None,
+    result: GraspYawAdjustmentResult,
+) -> EndPose | None:
+    if not should_inherit_post_yaw_orientation(result):
+        return None
+    current_pose = after_pose
+    if (
+        result.applied
+        and result.delta_deg is not None
+        and before_pose is not None
+        and (
+            after_pose is None
+            or abs(normalize_degrees(after_pose.rz_deg - before_pose.rz_deg))
+            < min(1.0, max(0.1, abs(float(result.delta_deg)) * 0.25))
+        )
+    ):
+        current_pose = replace(
+            before_pose,
+            rz_deg=normalize_degrees(before_pose.rz_deg + float(result.delta_deg)),
+        )
+    return current_pose
+
+
+def apply_grasp_yaw_and_get_orientation(
+    controller: PiperController,
+    args: argparse.Namespace,
+    target: YoloCatchTarget,
+    grasp_yaw_adjustments: list[GraspYawAdjustmentResult],
+    *,
+    phase: str,
+) -> EndPose | None:
+    before_pose = feedback_to_pose(controller.get_end_pose())
+    result = apply_grasp_yaw_adjustment(controller, args, target)
+    grasp_yaw_adjustments.append(result)
+    if not should_inherit_post_yaw_orientation(result):
+        return None
+    current_pose = post_grasp_yaw_orientation(
+        before_pose,
+        feedback_to_pose(controller.get_end_pose()),
+        result,
+    )
+    if current_pose is None:
+        raise RuntimeError(
+            f"grasp yaw {phase} requires valid end-pose feedback "
+            "to preserve the rotated orientation"
+        )
+    return current_pose
+
+
+def plan_grasp_yaw_orientation_for_planar_ik(
+    controller: PiperController,
+    args: argparse.Namespace,
+    target: YoloCatchTarget,
+    grasp_yaw_adjustments: list[GraspYawAdjustmentResult],
+    *,
+    phase: str,
+) -> EndPose | None:
+    before_pose = feedback_to_pose(controller.get_end_pose())
+    result, _target_joints = compute_grasp_yaw_adjustment_result(
+        controller,
+        args,
+        target,
+        execute=False,
+    )
+    grasp_yaw_adjustments.append(result)
+    if not should_inherit_post_yaw_orientation(result):
+        return None
+    if before_pose is None:
+        raise RuntimeError(
+            f"grasp yaw {phase} requires valid end-pose feedback "
+            "to plan the integrated planar-IK yaw orientation"
+        )
+    if result.applied and result.delta_deg is not None:
+        return replace(
+            before_pose,
+            rz_deg=normalize_degrees(before_pose.rz_deg + float(result.delta_deg)),
+        )
+    return before_pose
+
+
+def apply_grasp_yaw_before_descent(
+    controller: PiperController,
+    args: argparse.Namespace,
+    target: YoloCatchTarget,
+    descent_step: SequenceStep,
+    grasp_yaw_adjustments: list[GraspYawAdjustmentResult],
+) -> SequenceStep:
+    current_pose = apply_grasp_yaw_and_get_orientation(
+        controller,
+        args,
+        target,
+        grasp_yaw_adjustments,
+        phase="before descent",
+    )
+    if current_pose is None:
+        return descent_step
+    updated_pose = with_current_orientation(descent_step.pose, current_pose)
+    print(
+        "Using post-yaw orientation for grasp descent: "
+        f"step={descent_step.label} orientation="
+        f"({updated_pose.rx_deg:.3f}, {updated_pose.ry_deg:.3f}, "
+        f"{updated_pose.rz_deg:.3f})",
+        flush=True,
+    )
+    return replace(descent_step, pose=updated_pose)
 
 
 def execute_and_record_step(
@@ -3511,7 +3828,6 @@ def execute_and_record_step(
     planar_ik_results: list[PlanarIkExecutionResult] | None = None,
     planar_ik_reuse_state: PlanarIkReuseState | None = None,
     grasp_yaw_adjustments: list[GraspYawAdjustmentResult] | None = None,
-    grasp_yaw_target: YoloCatchTarget | None = None,
 ) -> int:
     send_count, gripper_result = execute_step(
         controller,
@@ -3519,7 +3835,6 @@ def execute_and_record_step(
         step,
         joint_pitch_adjustments=joint_pitch_adjustments,
         grasp_yaw_adjustments=grasp_yaw_adjustments,
-        grasp_yaw_target=grasp_yaw_target,
         planar_ik_results=planar_ik_results,
         planar_ik_reuse_state=planar_ik_reuse_state,
     )
@@ -3544,15 +3859,59 @@ def execute_plan(
     grasp_yaw_adjustments: list[GraspYawAdjustmentResult] = []
     planar_ik_results: list[PlanarIkExecutionResult] = []
     planar_ik_reuse_state = PlanarIkReuseState()
+    post_yaw_orientation: EndPose | None = None
     for index, step in enumerate(plan.steps):
-        if should_guard_step(step, args):
-            guarded_start_pose = guarded_start_pose_for_grasp(args, step.pose)
+        active_step = step
+        if active_step.label in ("pick_grasp", "return_pick_grasp"):
+            integrated_planar_ik_yaw = bool(
+                use_planar_ik_yaw(args) and active_step.planar_ik
+            )
+            if integrated_planar_ik_yaw:
+                planned_orientation = plan_grasp_yaw_orientation_for_planar_ik(
+                    controller,
+                    args,
+                    plan.target,
+                    grasp_yaw_adjustments,
+                    phase="before descent",
+                )
+                if planned_orientation is not None:
+                    active_step = replace(
+                        active_step,
+                        pose=with_current_orientation(active_step.pose, planned_orientation),
+                        planar_ik_include_j6_yaw=True,
+                    )
+            else:
+                active_step = apply_grasp_yaw_before_descent(
+                    controller,
+                    args,
+                    plan.target,
+                    active_step,
+                    grasp_yaw_adjustments,
+                )
+            if (
+                grasp_yaw_adjustments
+                and should_inherit_post_yaw_orientation(grasp_yaw_adjustments[-1])
+            ):
+                post_yaw_orientation = active_step.pose
+        elif (
+            post_yaw_orientation is not None
+            and active_step.label in ("pick_lift", "return_pick_lift")
+        ):
+            active_step = replace(
+                active_step,
+                pose=with_current_orientation(active_step.pose, post_yaw_orientation),
+                planar_ik_include_j6_yaw=bool(
+                    use_planar_ik_yaw(args) and active_step.planar_ik
+                ),
+            )
+        if should_guard_step(active_step, args):
+            guarded_start_pose = guarded_start_pose_for_grasp(args, active_step.pose)
             guarded_start_step = SequenceStep(
-                f"{step.label}_guard_start",
+                f"{active_step.label}_guard_start",
                 guarded_start_pose,
                 args.vertical_mode,
                 None,
-                step.delay_before_s,
+                active_step.delay_before_s,
             )
             counts[guarded_start_step.label] = execute_and_record_step(
                 controller,
@@ -3567,9 +3926,9 @@ def execute_plan(
                 controller,
                 args,
                 start_pose=guarded_start_pose,
-                target_pose=step.pose,
+                target_pose=active_step.pose,
             )
-            counts[step.label] = guarded_result.send_count
+            counts[active_step.label] = guarded_result.send_count
             if guarded_result.aborted:
                 reason = guarded_result.reason or "guarded descent aborted"
                 print(f"Protected abort: {reason}", flush=True)
@@ -3586,28 +3945,24 @@ def execute_plan(
             pitch_adjustment = apply_joint_pitch_adjustment(
                 controller,
                 args,
-                step,
+                active_step,
                 phase="after_guarded_descent",
             )
             if pitch_adjustment is not None:
                 joint_pitch_adjustments.append(pitch_adjustment)
-            grasp_yaw_adjustments.append(
-                apply_grasp_yaw_adjustment(controller, args, plan.target)
-            )
-            gripper_result = send_gripper(controller, args, step.gripper_after)
+            gripper_result = send_gripper(controller, args, active_step.gripper_after)
             record_gripper_result(gripper_results, gripper_result)
             continue
         send_count, gripper_result = execute_step(
             controller,
             args,
-            step,
+            active_step,
             joint_pitch_adjustments=joint_pitch_adjustments,
             grasp_yaw_adjustments=grasp_yaw_adjustments,
-            grasp_yaw_target=plan.target,
             planar_ik_results=planar_ik_results,
             planar_ik_reuse_state=planar_ik_reuse_state,
         )
-        counts[step.label] = send_count
+        counts[active_step.label] = send_count
         record_gripper_result(gripper_results, gripper_result)
 
     if args.print_feedback:
@@ -3698,6 +4053,40 @@ def execute_dynamic_preposition_plan(
         planar_ik_results,
         planar_ik_reuse_state,
     )
+    integrated_planar_ik_yaw = bool(use_planar_ik_yaw(args) and use_preposition_ik)
+    if integrated_planar_ik_yaw:
+        post_yaw_orientation = plan_grasp_yaw_orientation_for_planar_ik(
+            controller,
+            args,
+            plan.target,
+            grasp_yaw_adjustments,
+            phase="after pick_above",
+        )
+    else:
+        post_yaw_orientation = apply_grasp_yaw_and_get_orientation(
+            controller,
+            args,
+            plan.target,
+            grasp_yaw_adjustments,
+            phase="after pick_above",
+        )
+    if post_yaw_orientation is not None:
+        include_j6_yaw = integrated_planar_ik_yaw
+        preposition_step = replace(
+            preposition_step,
+            pose=with_current_orientation(preposition_step.pose, post_yaw_orientation),
+            planar_ik_include_j6_yaw=include_j6_yaw,
+        )
+        grasp_step = replace(
+            grasp_step,
+            pose=with_current_orientation(grasp_step.pose, post_yaw_orientation),
+            planar_ik_include_j6_yaw=include_j6_yaw,
+        )
+        lift_step = replace(
+            lift_step,
+            pose=with_current_orientation(lift_step.pose, post_yaw_orientation),
+            planar_ik_include_j6_yaw=include_j6_yaw,
+        )
     counts[preposition_step.label] = execute_and_record_step(
         controller,
         args,
@@ -3707,7 +4096,7 @@ def execute_dynamic_preposition_plan(
         planar_ik_results,
         planar_ik_reuse_state,
     )
-
+    preposition_pose_for_descent = preposition_step.pose
     preposition_elapsed_s = time.monotonic() - started_s
     final_wait_s = wait_for_dynamic_final_action(
         timing,
@@ -3722,7 +4111,7 @@ def execute_dynamic_preposition_plan(
         guarded_result = execute_guarded_descent(
             controller,
             args,
-            start_pose=preposition_pose,
+            start_pose=preposition_pose_for_descent,
             target_pose=grasp_step.pose,
         )
         counts[grasp_step.label] = guarded_result.send_count
@@ -3753,9 +4142,6 @@ def execute_dynamic_preposition_plan(
         )
         if pitch_adjustment is not None:
             joint_pitch_adjustments.append(pitch_adjustment)
-        grasp_yaw_adjustments.append(
-            apply_grasp_yaw_adjustment(controller, args, plan.target)
-        )
         gripper_result = send_gripper(controller, args, grasp_step.gripper_after)
         record_gripper_result(gripper_results, gripper_result)
     else:
@@ -3765,7 +4151,6 @@ def execute_dynamic_preposition_plan(
             grasp_step,
             joint_pitch_adjustments=joint_pitch_adjustments,
             grasp_yaw_adjustments=grasp_yaw_adjustments,
-            grasp_yaw_target=plan.target,
             planar_ik_results=planar_ik_results,
             planar_ik_reuse_state=planar_ik_reuse_state,
         )
@@ -3986,6 +4371,7 @@ def handle_message(
                     "joint_pitch_after_pose": step.joint_pitch_after_pose,
                     "pitch_source_x_mm": step.pitch_source_x_mm,
                     "planar_ik": step.planar_ik,
+                    "planar_ik_include_j6_yaw": step.planar_ik_include_j6_yaw,
                     "require_reached": step.require_reached,
                 }
                 for step in plan.steps

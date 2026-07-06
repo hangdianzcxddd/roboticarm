@@ -11,6 +11,7 @@ import numpy as np
 
 from robot_control.linux.arm.piper_arm import RAD_TO_MILLI_DEG
 from robot_control.linux.arm.piper_arm import PiperController
+from robot_control.linux.arm.safety import SafetyError
 from robot_control.linux.arm.piper_arm_test import FakeJointFeedback, FakePiperSdk
 from robot_control.linux.catch.catch_server_1 import (
     build_parser,
@@ -24,6 +25,7 @@ from robot_control.linux.catch.catch_server_1 import (
     PlanarIkSolution,
     target_from_command,
     validate_args,
+    validate_planar_ik_joint_delta_limits,
     wait_for_dynamic_timing,
     yolo_metadata_from_message,
 )
@@ -107,9 +109,12 @@ def make_args(**overrides: object) -> argparse.Namespace:
         "dynamic_pitch_speed": 20,
         "planar_ik_max_iterations": 40,
         "planar_ik_position_tolerance_mm": 3.0,
+        "planar_ik_rx_tolerance_deg": 5.0,
         "planar_ik_ry_tolerance_deg": 1.0,
+        "planar_ik_rz_tolerance_deg": 3.0,
         "planar_ik_max_step_deg": 8.0,
         "planar_ik_damping": 1e-3,
+        "planar_ik_include_j6_yaw": True,
         "planar_ik_speed": None,
         "planar_ik_grasp_z_comp_mm_per_deg": 0.0,
         "reuse_planar_ik_above_target": True,
@@ -211,6 +216,14 @@ class FeedbackPiperSdk(FakePiperSdk):
         super().JointCtrl(joint_1, joint_2, joint_3, joint_4, joint_5, joint_6)
         self.joint_feedback = FakeJointFeedback(
             (joint_1, joint_2, joint_3, joint_4, joint_5, joint_6)
+        )
+        self.pose = EndPose(
+            self.pose.x_mm,
+            self.pose.y_mm,
+            self.pose.z_mm,
+            self.pose.rx_deg,
+            self.pose.ry_deg,
+            joint_6 / 1000.0,
         )
 
     def GetArmEndPoseMsgs(self):
@@ -324,7 +337,10 @@ class TestCatchServer1(unittest.TestCase):
         self.assertAlmostEqual(args.max_dynamic_pitch_deg, 12.0)
         self.assertEqual(args.planar_ik_max_iterations, 40)
         self.assertAlmostEqual(args.planar_ik_position_tolerance_mm, 3.0)
+        self.assertAlmostEqual(args.planar_ik_rx_tolerance_deg, 5.0)
         self.assertAlmostEqual(args.planar_ik_ry_tolerance_deg, 1.0)
+        self.assertAlmostEqual(args.planar_ik_rz_tolerance_deg, 3.0)
+        self.assertTrue(args.planar_ik_include_j6_yaw)
         self.assertIsNone(args.planar_ik_speed)
         self.assertTrue(args.reuse_planar_ik_above_target)
         self.assertAlmostEqual(args.planar_ik_joint_tolerance_deg, 2.0)
@@ -1177,7 +1193,7 @@ class TestCatchServer1(unittest.TestCase):
         self.assertEqual(len(joint_calls), 1)
         self.assertAlmostEqual(joint_calls[0][1][5], -119900, delta=1)
 
-    def test_execute_plan_applies_grasp_yaw_after_grasp_pose_before_close(self):
+    def test_execute_plan_applies_grasp_yaw_before_grasp_descent_and_preserves_orientation(self):
         args = make_args(
             execute=True,
             grasp_only=True,
@@ -1217,6 +1233,11 @@ class TestCatchServer1(unittest.TestCase):
         self.assertEqual(len(yaw_results), 1)
         self.assertTrue(yaw_results[0]["applied"])
         calls = controller.sdk.calls
+        pick_above_index = next(
+            index
+            for index, call in enumerate(calls)
+            if call[0] == "EndPoseCtrl" and call[1][2] == round(args.transfer_z_mm * 1000)
+        )
         pick_grasp_index = next(
             index
             for index, call in enumerate(calls)
@@ -1232,8 +1253,10 @@ class TestCatchServer1(unittest.TestCase):
             for index, call in enumerate(calls)
             if call[0] == "GripperCtrl" and call[1][0] == -100000
         )
-        self.assertLess(pick_grasp_index, yaw_joint_index)
+        self.assertLess(pick_above_index, yaw_joint_index)
+        self.assertLess(yaw_joint_index, pick_grasp_index)
         self.assertLess(yaw_joint_index, close_index)
+        self.assertEqual(calls[pick_grasp_index][1][5], 20000)
 
     def test_planar_ik_grasp_z_compensation_lowers_far_grasp_only(self):
         args = make_args(
@@ -1719,6 +1742,87 @@ class TestCatchServer1(unittest.TestCase):
         )
         self.assertLess(call_order.index("wait"), call_order.index("dynamic_preposition"))
         self.assertLess(call_order.index("dynamic_preposition"), call_order.index("pick_grasp"))
+
+    def test_dynamic_preposition_applies_grasp_yaw_after_pick_above_before_preposition(self):
+        args = make_args(
+            execute=True,
+            grasp_only=True,
+            no_return_ready=True,
+            dynamic_preposition=True,
+            final_action_time_s=0.0,
+            guarded_descent=False,
+            grasp_yaw_by_object_short_edge=True,
+            grasp_yaw_max_delta_deg=30.0,
+            grasp_yaw_deadband_deg=0.0,
+            command_duration_s=0.0,
+        )
+        camera_to_base = np.eye(4, dtype=float)
+        message = make_camera_point_message(
+            CameraPointCommand(
+                x_m=0.35,
+                y_m=0.02,
+                z_m=0.30,
+                command_id="cmd-dynamic-yaw-before-descent",
+                grasp_mode="dynamic",
+                t_arrive_s=0.0,
+                conveyor_speed_mm_s=100.0,
+                pick_x_mm=350.0,
+                pick_y_mm=-30.0,
+                detected_z_mm=120.0,
+                object_short_axis_yaw_deg=20.0,
+            )
+        )
+        controller = make_feedback_controller(
+            EndPose(350.0, 0.0, 253.252, -176.794223, 0.889438, -105.490597)
+        )
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            response = handle_message(
+                message,
+                args=args,
+                camera_to_base=camera_to_base,
+                validator=controller,
+                controller=controller,
+            )
+
+        self.assertTrue(response["payload"]["executed"])
+        yaw_results = response["payload"]["grasp_yaw_adjustments"]
+        self.assertEqual(len(yaw_results), 1)
+        self.assertTrue(yaw_results[0]["applied"])
+        calls = controller.sdk.calls
+        pick_above_index = next(
+            index
+            for index, call in enumerate(calls)
+            if call[0] == "EndPoseCtrl"
+            and call[1][1] == -30000
+            and call[1][2] == round(args.transfer_z_mm * 1000)
+        )
+        dynamic_preposition_index = next(
+            index
+            for index, call in enumerate(calls)
+            if call[0] == "EndPoseCtrl" and call[1][2] == 140000
+        )
+        yaw_joint_index = next(
+            index
+            for index, call in enumerate(calls)
+            if call[0] == "JointCtrl" and call[1][5] != 0
+        )
+        pick_grasp_index = next(
+            index
+            for index, call in enumerate(calls)
+            if call[0] == "EndPoseCtrl" and call[1][2] == round(args.grasp_z_mm * 1000)
+        )
+        close_index = next(
+            index
+            for index, call in enumerate(calls)
+            if call[0] == "GripperCtrl" and call[1][0] == -100000
+        )
+        self.assertLess(pick_above_index, yaw_joint_index)
+        self.assertLess(yaw_joint_index, dynamic_preposition_index)
+        self.assertLess(yaw_joint_index, pick_grasp_index)
+        self.assertLess(pick_grasp_index, close_index)
+        self.assertEqual(calls[dynamic_preposition_index][1][5], 20000)
+        self.assertEqual(calls[pick_grasp_index][1][5], 20000)
 
     def test_execute_dynamic_preposition_guarded_descent_abort_stops_without_return(self):
         args = make_args(
@@ -2486,7 +2590,17 @@ class TestCatchServer1(unittest.TestCase):
             call for call in controller.sdk.calls if call[0] == "EndPoseCtrl"
         ]
         self.assertIn(
-            ("EndPoseCtrl", (80000, 260000, 253252, -176794, 889, -105491)),
+            (
+                "EndPoseCtrl",
+                (
+                    round(args.place_x_mm * 1000),
+                    round(args.place_y_mm * 1000),
+                    round(args.transfer_z_mm * 1000),
+                    round(args.rx_deg * 1000),
+                    round(args.ry_deg * 1000),
+                    round(args.rz_deg * 1000),
+                ),
+            ),
             end_pose_calls,
         )
         gripper_calls = [call for call in controller.sdk.calls if call[0] == "GripperCtrl"]
@@ -2497,6 +2611,173 @@ class TestCatchServer1(unittest.TestCase):
                 ("GripperCtrl", (-100000, 1000, 0x01, 0)),
                 ("GripperCtrl", (0, 1000, 0x01, 0)),
             ],
+        )
+
+    def test_dynamic_preposition_planar_ik_yaw_after_pick_above_is_preserved_through_lift(self):
+        args = make_args(
+            execute=True,
+            grasp_only=True,
+            no_return_ready=True,
+            guarded_descent=False,
+            dynamic_preposition=True,
+            final_action_time_s=0.0,
+            dynamic_pitch_by_x=True,
+            dynamic_pitch_mode="planar-ik",
+            keep_pitch_min_x_mm=300.0,
+            keep_pitch_max_x_mm=380.0,
+            pitch_deg_per_mm_far=0.04,
+            grasp_yaw_by_object_short_edge=True,
+            grasp_yaw_max_delta_deg=90.0,
+            grasp_yaw_deadband_deg=0.0,
+            command_duration_s=0.0,
+            no_wait_waypoints=True,
+        )
+        camera_to_base = np.eye(4, dtype=float)
+        message = make_camera_point_message(
+            CameraPointCommand(
+                x_m=0.0,
+                y_m=0.0,
+                z_m=0.30,
+                command_id="cmd-dynamic-planar-yaw",
+                grasp_mode="dynamic",
+                t_arrive_s=0.0,
+                conveyor_speed_mm_s=100.0,
+                pick_x_mm=457.775,
+                pick_y_mm=0.0,
+                detected_z_mm=184.737,
+                object_short_axis_yaw_deg=20.0,
+            )
+        )
+        controller = make_feedback_controller(
+            EndPose(350.0, 0.0, 253.252, -176.794223, 0.889438, -105.490597)
+        )
+        controller.sdk.joint_feedbacks = [
+            joint_feedback_from_degrees(0.0, 10.0, -20.0, 0.0, 30.0, -70.0),
+            joint_feedback_from_degrees(0.0, 11.0, -21.0, 0.0, 31.0, -70.0),
+            joint_feedback_from_degrees(0.0, 11.0, -21.0, 0.0, 31.0, -70.0),
+            joint_feedback_from_degrees(0.0, 12.0, -22.0, 0.0, 32.0, 20.0),
+            joint_feedback_from_degrees(0.0, 13.0, -23.0, 0.0, 33.0, 20.0),
+        ]
+        solutions = [
+            PlanarIkSolution(
+                target_joints_rad=tuple(math.radians(value) for value in (0.0, 11.0, -21.0, 0.0, 31.0, -70.0)),
+                solved_pose=EndPose(457.775, 0.0, 253.252, args.rx_deg, args.ry_deg + 3.111, args.rz_deg),
+                solved_fk_pose=EndPose(445.0, 0.0, 323.0, args.rx_deg, args.ry_deg + 3.111, args.rz_deg),
+                pitch_delta_deg=3.111,
+                requested_pitch_delta_deg=3.111,
+                iterations=4,
+                x_error_mm=0.0,
+                y_error_mm=0.0,
+                z_error_mm=0.0,
+                position_error_mm=0.0,
+                ry_error_deg=0.0,
+            ),
+            PlanarIkSolution(
+                target_joints_rad=tuple(math.radians(value) for value in (0.0, 12.0, -22.0, 0.0, 32.0, 20.0)),
+                solved_pose=EndPose(457.775, 0.0, 204.737, args.rx_deg, args.ry_deg + 3.111, 20.0),
+                solved_fk_pose=EndPose(445.0, 0.0, 274.0, args.rx_deg, args.ry_deg + 3.111, 20.0),
+                pitch_delta_deg=3.111,
+                requested_pitch_delta_deg=3.111,
+                iterations=4,
+                x_error_mm=0.0,
+                y_error_mm=0.0,
+                z_error_mm=0.0,
+                position_error_mm=0.0,
+                ry_error_deg=0.0,
+            ),
+            PlanarIkSolution(
+                target_joints_rad=tuple(math.radians(value) for value in (0.0, 13.0, -23.0, 0.0, 33.0, 20.0)),
+                solved_pose=EndPose(457.775, 0.0, 184.737, args.rx_deg, args.ry_deg + 3.111, 20.0),
+                solved_fk_pose=EndPose(445.0, 0.0, 254.0, args.rx_deg, args.ry_deg + 3.111, 20.0),
+                pitch_delta_deg=3.111,
+                requested_pitch_delta_deg=3.111,
+                iterations=4,
+                x_error_mm=0.0,
+                y_error_mm=0.0,
+                z_error_mm=0.0,
+                position_error_mm=0.0,
+                ry_error_deg=0.0,
+            ),
+            PlanarIkSolution(
+                target_joints_rad=tuple(math.radians(value) for value in (0.0, 14.0, -24.0, 0.0, 34.0, 20.0)),
+                solved_pose=EndPose(457.775, 0.0, 253.252, args.rx_deg, args.ry_deg + 3.111, 20.0),
+                solved_fk_pose=EndPose(445.0, 0.0, 323.0, args.rx_deg, args.ry_deg + 3.111, 20.0),
+                pitch_delta_deg=3.111,
+                requested_pitch_delta_deg=3.111,
+                iterations=4,
+                x_error_mm=0.0,
+                y_error_mm=0.0,
+                z_error_mm=0.0,
+                position_error_mm=0.0,
+                ry_error_deg=0.0,
+            ),
+        ]
+
+        with mock.patch(
+            "robot_control.linux.catch.catch_server_1.solve_planar_ik_j2_j3_j5",
+            side_effect=solutions,
+        ) as solve_ik, contextlib.redirect_stdout(io.StringIO()):
+            response = handle_message(
+                message,
+                args=args,
+                camera_to_base=camera_to_base,
+                validator=controller,
+                controller=controller,
+            )
+
+        self.assertTrue(response["payload"]["executed"])
+        self.assertEqual(solve_ik.call_count, 4)
+        results = response["payload"]["planar_ik_results"]
+        self.assertEqual(
+            [result["step_label"] for result in results],
+            ["pick_above", "dynamic_preposition", "pick_grasp", "pick_lift"],
+        )
+        self.assertFalse(results[3]["reused"])
+        self.assertAlmostEqual(results[1]["target_pose"]["rz_deg"], 20.0)
+        self.assertAlmostEqual(results[2]["target_pose"]["rz_deg"], 20.0)
+        self.assertAlmostEqual(results[3]["target_pose"]["rz_deg"], 20.0)
+        self.assertEqual(results[0]["joint_indices"], [2, 3, 5])
+        self.assertEqual(results[1]["joint_indices"], [2, 3, 4, 5, 6])
+        self.assertEqual(results[2]["joint_indices"], [2, 3, 4, 5, 6])
+        self.assertEqual(results[3]["joint_indices"], [2, 3, 4, 5, 6])
+        self.assertEqual(
+            [call.kwargs["joint_indices"] for call in solve_ik.call_args_list],
+            [(1, 2, 4), (1, 2, 3, 4, 5), (1, 2, 3, 4, 5), (1, 2, 3, 4, 5)],
+        )
+        joint_calls = [call for call in controller.sdk.calls if call[0] == "JointCtrl"]
+        self.assertEqual([call[1][5] for call in joint_calls], [-70000, 20000, 20000, 20000])
+
+    def test_planar_ik_yaw_rejects_large_j4_or_j6_delta(self):
+        current = tuple(math.radians(value) for value in (0.0, 10.0, -20.0, 0.0, 30.0, -70.0))
+        safe_target = tuple(math.radians(value) for value in (0.0, 12.0, -22.0, 45.0, 32.0, 20.0))
+        validate_planar_ik_joint_delta_limits(
+            current,
+            safe_target,
+            (1, 2, 3, 4, 5),
+            label="test",
+        )
+
+        with self.assertRaisesRegex(SafetyError, r"J4 delta .*90"):
+            validate_planar_ik_joint_delta_limits(
+                current,
+                tuple(math.radians(value) for value in (0.0, 12.0, -22.0, 91.0, 32.0, 20.0)),
+                (1, 2, 3, 4, 5),
+                label="test",
+            )
+
+        with self.assertRaisesRegex(SafetyError, r"J6 delta .*90"):
+            validate_planar_ik_joint_delta_limits(
+                current,
+                tuple(math.radians(value) for value in (0.0, 12.0, -22.0, 45.0, 32.0, 21.0)),
+                (1, 2, 3, 4, 5),
+                label="test",
+            )
+
+        validate_planar_ik_joint_delta_limits(
+            current,
+            tuple(math.radians(value) for value in (0.0, 12.0, -22.0, 91.0, 32.0, 21.0)),
+            (1, 2, 4),
+            label="ordinary-planar-ik",
         )
 
     def test_dynamic_pitch_clamps_to_joint_limits_before_joint_command(self):
