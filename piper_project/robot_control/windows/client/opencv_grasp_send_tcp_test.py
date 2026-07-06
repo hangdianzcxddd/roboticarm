@@ -155,6 +155,75 @@ class TestOpenCVGraspSendTcp(unittest.TestCase):
         self.assertAlmostEqual(segments[0].centroid_u, 79.5, places=1)
         self.assertAlmostEqual(segments[0].centroid_v, 59.5, places=1)
 
+    def test_detector_closes_green_label_gap_before_opening(self):
+        frame = green_frame()
+        frame[40:80, 50:120] = (0, 0, 255)
+        frame[40:80, 82:88] = (0, 180, 0)
+        detector = GreenConveyorOpenCVDetector(
+            GreenConveyorDetectorConfig(
+                min_area_px=100,
+                morphology_kernel_size=1,
+                morphology_close_kernel_size=9,
+                morphology_open_kernel_size=1,
+            )
+        )
+
+        segments = detector.detect(frame)
+
+        self.assertEqual(len(segments), 1)
+        detection = segments[0].detection
+        self.assertEqual((detection.x, detection.y, detection.width, detection.height), (50, 40, 70, 40))
+        self.assertGreater(segments[0].mask_area_px, 2500)
+
+    def test_detector_can_use_convex_hull_for_object_mask(self):
+        frame = green_frame()
+        points = np.array(
+            [
+                [50, 35],
+                [120, 35],
+                [120, 90],
+                [92, 90],
+                [92, 62],
+                [78, 62],
+                [78, 90],
+                [50, 90],
+            ],
+            dtype=np.int32,
+        )
+        cv2.fillPoly(frame, [points], (0, 0, 255))
+        raw_detector = GreenConveyorOpenCVDetector(
+            GreenConveyorDetectorConfig(
+                min_area_px=100,
+                morphology_kernel_size=1,
+            )
+        )
+        hull_detector = GreenConveyorOpenCVDetector(
+            GreenConveyorDetectorConfig(
+                min_area_px=100,
+                morphology_kernel_size=1,
+                contour_mask_mode="convex-hull",
+            )
+        )
+
+        raw_segment = raw_detector.detect(frame)[0]
+        hull_segment = hull_detector.detect(frame)[0]
+
+        self.assertEqual(
+            (
+                hull_segment.detection.x,
+                hull_segment.detection.y,
+                hull_segment.detection.width,
+                hull_segment.detection.height,
+            ),
+            (
+                raw_segment.detection.x,
+                raw_segment.detection.y,
+                raw_segment.detection.width,
+                raw_segment.detection.height,
+            ),
+        )
+        self.assertGreater(hull_segment.mask_area_px, raw_segment.mask_area_px)
+
     def test_project_base_point_to_pixel_uses_inverse_hand_eye(self):
         camera_to_base = np.eye(4, dtype=float)
         camera_to_base[:3, 3] = np.array([0.10, -0.20, 0.0])
@@ -615,6 +684,29 @@ class TestOpenCVGraspSendTcp(unittest.TestCase):
         self.assertEqual(config.entry_edge, "right")
         self.assertEqual(config.entry_clear_margin_px, 12)
         self.assertEqual(config.entry_clear_frames, 3)
+
+    def test_morphology_and_contour_mask_arguments_are_stored(self):
+        args = build_parser().parse_args(
+            [
+                "--dry-run",
+                "--morphology-kernel-size",
+                "5",
+                "--morphology-close-kernel-size",
+                "11",
+                "--morphology-open-kernel-size",
+                "3",
+                "--contour-mask-mode",
+                "convex-hull",
+            ]
+        )
+
+        validate_args(args)
+        config = detector_config_from_args(args)
+
+        self.assertEqual(config.morphology_kernel_size, 5)
+        self.assertEqual(config.morphology_close_kernel_size, 11)
+        self.assertEqual(config.morphology_open_kernel_size, 3)
+        self.assertEqual(config.contour_mask_mode, "convex-hull")
 
     def test_dynamic_roi_visualization_arguments_are_parsed(self):
         args = build_parser().parse_args(

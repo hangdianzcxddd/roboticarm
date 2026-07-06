@@ -91,7 +91,10 @@ class GreenConveyorDetectorConfig:
     min_fill_ratio: float = 0.0
     max_results: int = 10
     morphology_kernel_size: int = 5
+    morphology_close_kernel_size: int | None = None
+    morphology_open_kernel_size: int | None = None
     morphology_iterations: int = 1
+    contour_mask_mode: Literal["raw", "convex-hull"] = "raw"
     roi_xywh: tuple[int, int, int, int] | None = None
     reject_roi_border_touching: bool = False
     entry_edge: Literal["left", "right", "top", "bottom"] | None = None
@@ -289,6 +292,8 @@ class GreenConveyorOpenCVDetector:
         object_mask = clean_binary_mask(
             object_mask,
             kernel_size=self.config.morphology_kernel_size,
+            close_kernel_size=self.config.morphology_close_kernel_size,
+            open_kernel_size=self.config.morphology_open_kernel_size,
             iterations=self.config.morphology_iterations,
         )
 
@@ -311,11 +316,12 @@ class GreenConveyorOpenCVDetector:
 
         segments: list[SegmentationDetection] = []
         for contour in contours:
-            area = float(cv2.contourArea(contour))
+            shape_contour = contour_for_mask_mode(contour, self.config.contour_mask_mode)
+            area = float(cv2.contourArea(shape_contour))
             if not contour_area_allowed(area, self.config):
                 continue
 
-            x, y, bbox_width, bbox_height = cv2.boundingRect(contour)
+            x, y, bbox_width, bbox_height = cv2.boundingRect(shape_contour)
             if not bbox_allowed(x, y, bbox_width, bbox_height, self.config):
                 continue
             if self.config.reject_roi_border_touching and bbox_touches_roi_border(
@@ -360,7 +366,7 @@ class GreenConveyorOpenCVDetector:
                 continue
 
             mask = np.zeros((height, width), dtype=np.uint8)
-            cv2.drawContours(mask, [contour], -1, 1, thickness=cv2.FILLED)
+            cv2.drawContours(mask, [shape_contour], -1, 1, thickness=cv2.FILLED)
             mask_bool = mask.astype(bool)
             try:
                 centroid_u, centroid_v, mask_area_px = mask_centroid(mask_bool)
@@ -482,17 +488,56 @@ def make_shadow_mask(
     return cv2.bitwise_and(mask, roi_mask)
 
 
-def clean_binary_mask(mask: np.ndarray, *, kernel_size: int, iterations: int) -> np.ndarray:
+def clean_binary_mask(
+    mask: np.ndarray,
+    *,
+    kernel_size: int,
+    iterations: int,
+    close_kernel_size: int | None = None,
+    open_kernel_size: int | None = None,
+) -> np.ndarray:
     if mask.ndim != 2:
         raise ValueError("mask must be a single-channel image")
     _, binary = cv2.threshold(mask, 0, 255, cv2.THRESH_BINARY)
-    kernel_size = int(kernel_size)
     iterations = max(1, int(iterations))
-    if kernel_size <= 1:
-        return binary
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
-    opened = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=iterations)
-    return cv2.morphologyEx(opened, cv2.MORPH_CLOSE, kernel, iterations=iterations)
+    close_size = int(kernel_size if close_kernel_size is None else close_kernel_size)
+    open_size = int(kernel_size if open_kernel_size is None else open_kernel_size)
+
+    cleaned = binary
+    if close_size > 1:
+        close_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (close_size, close_size),
+        )
+        cleaned = cv2.morphologyEx(
+            cleaned,
+            cv2.MORPH_CLOSE,
+            close_kernel,
+            iterations=iterations,
+        )
+    if open_size > 1:
+        open_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (open_size, open_size),
+        )
+        cleaned = cv2.morphologyEx(
+            cleaned,
+            cv2.MORPH_OPEN,
+            open_kernel,
+            iterations=iterations,
+        )
+    return cleaned
+
+
+def contour_for_mask_mode(
+    contour: np.ndarray,
+    mode: Literal["raw", "convex-hull"],
+) -> np.ndarray:
+    if mode == "raw":
+        return contour
+    if mode == "convex-hull":
+        return cv2.convexHull(contour)
+    raise ValueError(f"unsupported contour mask mode: {mode!r}")
 
 
 def contour_area_allowed(area: float, config: GreenConveyorDetectorConfig) -> bool:
@@ -1088,7 +1133,34 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-results", type=int, default=10)
     parser.add_argument("--morphology-kernel-size", type=int, default=5)
+    parser.add_argument(
+        "--morphology-close-kernel-size",
+        type=int,
+        help=(
+            "kernel size for closing the object mask before opening; larger "
+            "values fill label/texture gaps and join split object regions. "
+            "Defaults to --morphology-kernel-size"
+        ),
+    )
+    parser.add_argument(
+        "--morphology-open-kernel-size",
+        type=int,
+        help=(
+            "kernel size for opening the object mask after closing; smaller "
+            "values remove isolated noise without breaking the object. Defaults "
+            "to --morphology-kernel-size"
+        ),
+    )
     parser.add_argument("--morphology-iterations", type=int, default=1)
+    parser.add_argument(
+        "--contour-mask-mode",
+        choices=("raw", "convex-hull"),
+        default="raw",
+        help=(
+            "raw uses the cleaned external contour; convex-hull fills contour "
+            "concavities for more stable size and minAreaRect yaw"
+        ),
+    )
     parser.add_argument(
         "--reject-roi-border-touching",
         action="store_true",
@@ -1344,6 +1416,16 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--max-results must be >= 1")
     if args.morphology_kernel_size < 1:
         raise ValueError("--morphology-kernel-size must be >= 1")
+    if (
+        args.morphology_close_kernel_size is not None
+        and args.morphology_close_kernel_size < 1
+    ):
+        raise ValueError("--morphology-close-kernel-size must be >= 1")
+    if (
+        args.morphology_open_kernel_size is not None
+        and args.morphology_open_kernel_size < 1
+    ):
+        raise ValueError("--morphology-open-kernel-size must be >= 1")
     if args.morphology_iterations < 1:
         raise ValueError("--morphology-iterations must be >= 1")
     if args.entry_clear_margin_px < 0:
@@ -1415,7 +1497,18 @@ def detector_config_from_args(args: argparse.Namespace) -> GreenConveyorDetector
         min_fill_ratio=float(args.min_fill_ratio),
         max_results=int(args.max_results),
         morphology_kernel_size=int(args.morphology_kernel_size),
+        morphology_close_kernel_size=(
+            int(args.morphology_close_kernel_size)
+            if args.morphology_close_kernel_size is not None
+            else None
+        ),
+        morphology_open_kernel_size=(
+            int(args.morphology_open_kernel_size)
+            if args.morphology_open_kernel_size is not None
+            else None
+        ),
         morphology_iterations=int(args.morphology_iterations),
+        contour_mask_mode=args.contour_mask_mode,
         roi_xywh=tuple(int(item) for item in args.roi) if args.roi is not None else None,
         reject_roi_border_touching=bool(args.reject_roi_border_touching),
         entry_edge=args.entry_edge,
@@ -2218,6 +2311,10 @@ def main() -> None:
         "OpenCV belt threshold HSV "
         f"lower={tuple(args.belt_lower_hsv)} upper={tuple(args.belt_upper_hsv)} "
         f"roi={tuple(args.roi) if args.roi is not None else 'full-frame'} "
+        f"morphology=(close={args.morphology_close_kernel_size or args.morphology_kernel_size}, "
+        f"open={args.morphology_open_kernel_size or args.morphology_kernel_size}, "
+        f"iterations={args.morphology_iterations}) "
+        f"contour_mask_mode={args.contour_mask_mode} "
         f"reject_highlight={args.reject_highlight} "
         f"highlight=(S<={args.highlight_max_s}, V>={args.highlight_min_v}) "
         f"reject_shadow={args.reject_shadow} shadow=(V<={args.shadow_max_v})",
