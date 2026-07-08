@@ -10,6 +10,7 @@ const state = {
 
 const el = {
   profileName: document.getElementById("profileName"),
+  linuxSudoPassword: document.getElementById("linuxSudoPassword"),
   windowsCommand: document.getElementById("windowsCommand"),
   linuxCommand: document.getElementById("linuxCommand"),
   windowsLog: document.getElementById("windowsLog"),
@@ -21,6 +22,13 @@ const el = {
   linuxPortStatus: document.getElementById("linuxPortStatus"),
   lastLinuxEvent: document.getElementById("lastLinuxEvent"),
   validationStatus: document.getElementById("validationStatus"),
+  startWindows: document.getElementById("startWindows"),
+  startLinux: document.getElementById("startLinux"),
+  armActivityBar: document.getElementById("armActivityBar"),
+  armActivityStep: document.getElementById("armActivityStep"),
+  armActivityPhase: document.getElementById("armActivityPhase"),
+  armActivityTime: document.getElementById("armActivityTime"),
+  armActivityHistory: document.getElementById("armActivityHistory"),
   previewImage: document.getElementById("previewImage"),
   previewEmpty: document.getElementById("previewEmpty"),
   pauseLogs: document.getElementById("pauseLogs"),
@@ -130,14 +138,25 @@ async function startProcess(name) {
     method: "POST",
     body: JSON.stringify({ profile: state.profile }),
   });
+  await refreshStatus();
 }
 
 async function stopProcess(name) {
   await api(`/api/process/${name}/stop`, { method: "POST", body: "{}" });
+  await refreshStatus();
 }
 
 async function stopAll() {
   await Promise.all([stopProcess("windows"), stopProcess("linux")]);
+}
+
+async function toggleProcess(name) {
+  const button = name === "windows" ? el.startWindows : el.startLinux;
+  if (button.dataset.running === "true") {
+    await stopProcess(name);
+  } else {
+    await startProcess(name);
+  }
 }
 
 async function checkLinuxPort() {
@@ -169,6 +188,23 @@ async function stopRemoteLinuxPortOwner() {
   });
   renderLinuxPortStatus(result.status || result);
   alert(result.message);
+  return result;
+}
+
+async function setupCan() {
+  updateProfileFromForm();
+  const password = el.linuxSudoPassword.value;
+  if (!password) {
+    throw new Error("请输入 Linux sudo 密码");
+  }
+  const result = await api("/api/linux/setup-can", {
+    method: "POST",
+    body: JSON.stringify({ profile: state.profile, password }),
+  });
+  el.linuxSudoPassword.value = "";
+  alert(result.message);
+  await refreshLogs();
+  await refreshStatus();
   return result;
 }
 
@@ -220,8 +256,15 @@ function renderLinuxPortStatus(status) {
 
 function renderStatus(name, status) {
   const target = name === "windows" ? el.windowsStatus : el.linuxStatus;
+  const button = name === "windows" ? el.startWindows : el.startLinux;
   target.classList.toggle("running", Boolean(status.running));
   target.classList.toggle("error", !status.running && status.exit_code && status.exit_code !== 0);
+  button.dataset.running = status.running ? "true" : "false";
+  button.classList.toggle("primary", !status.running);
+  button.classList.toggle("danger", Boolean(status.running));
+  button.textContent = status.running
+    ? `停止 ${name === "windows" ? "Windows" : "Linux"}`
+    : `启动 ${name === "windows" ? "Windows" : "Linux"}`;
   const prefix = name === "windows" ? "Windows" : "Linux";
   if (status.running) {
     const uptime = status.uptime_s == null ? "" : ` ${Math.round(status.uptime_s)}s`;
@@ -242,11 +285,138 @@ function renderLastLinuxEvent(status) {
   el.lastLinuxEvent.textContent = `${item.time} ${item.level}`;
 }
 
+function renderArmActivity(activity) {
+  if (!activity || !el.armActivityBar) return;
+  el.armActivityBar.classList.remove("running", "done", "idle", "error");
+  const phase = activity.phase || "空闲";
+  const label = activity.label || "等待机械臂流程日志";
+  const time = activity.time ? `[${activity.time}]` : "";
+  if (activity.running) {
+    el.armActivityBar.classList.add("running");
+  } else if (activity.exit_code && activity.exit_code !== 0) {
+    el.armActivityBar.classList.add("error");
+  } else if (phase === "完成") {
+    el.armActivityBar.classList.add("done");
+  } else {
+    el.armActivityBar.classList.add("idle");
+  }
+  el.armActivityStep.textContent = label;
+  el.armActivityPhase.textContent = phase;
+  el.armActivityTime.textContent = time;
+}
+
+function renderArmActivityHistory(history) {
+  if (!el.armActivityHistory) return;
+  const items = Array.isArray(history) ? history.slice(-18).reverse() : [];
+  if (!items.length) {
+    el.armActivityHistory.innerHTML = '<div class="activity-history-empty">暂无状态记录</div>';
+    return;
+  }
+  el.armActivityHistory.innerHTML = items
+    .map((item) => {
+      const time = item.time ? `[${escapeHtml(item.time)}]` : "";
+      const label = escapeHtml(item.label || item.step || "未知状态");
+      const phase = escapeHtml(item.phase || "");
+      return (
+        '<div class="activity-history-item">' +
+        `<span class="activity-history-time">${time}</span>` +
+        '<div class="activity-history-main">' +
+        `<div class="activity-history-label">${label}</div>` +
+        `<div class="activity-history-phase">${phase}</div>` +
+        "</div>" +
+        "</div>"
+      );
+    })
+    .join("");
+}
+
+function labelArmStep(step) {
+  const labels = {
+    initial_ready: "初始准备等待",
+    startup_ready: "启动准备位",
+    ready_open: "准备并打开夹爪",
+    pick_above: "移动到抓取上方",
+    preposition: "预定位等待",
+    dynamic_preposition: "动态预定位",
+    pick_grasp: "下探抓取",
+    pick_lift: "抓取后抬升",
+    return_ready_above: "返回准备上方",
+    place_above: "移动到放置上方",
+    place_release: "放置并释放",
+    return_ready: "返回准备位",
+  };
+  return labels[step] || String(step || "").replaceAll("_", " ");
+}
+
+function parseArmActivityLog(line) {
+  const text = line.text || "";
+  const stepMatch = text.match(/\bstep=([a-zA-Z0-9_-]+)/);
+  if ((text.includes("Running planar IK") || text.includes("Reusing planar IK")) && stepMatch) {
+    const step = stepMatch[1];
+    return { phase: "运动中", step, label: labelArmStep(step), time: line.time };
+  }
+  if (text.includes("Planar IK") && text.includes("feedback:") && stepMatch) {
+    const step = stepMatch[1];
+    return { phase: "到达反馈", step, label: labelArmStep(step), time: line.time };
+  }
+  const runningMatch = text.match(/\bRunning ([a-zA-Z0-9_-]+):/);
+  if (runningMatch) {
+    const step = runningMatch[1];
+    return { phase: "运动中", step, label: labelArmStep(step), time: line.time };
+  }
+  const waitMatch = text.match(/Dynamic final timing: waiting [0-9.]+s at ([^(]+)/);
+  if (waitMatch) {
+    const step = waitMatch[1].trim().replaceAll(" ", "_");
+    return { phase: "动态时序等待", step, label: labelArmStep(step), time: line.time };
+  }
+  if (text.includes("Client connected:")) {
+    return { phase: "连接", step: "client_connected", label: "客户端已连接", time: line.time };
+  }
+  if (text.includes("Before catch J6")) {
+    return { phase: "抓取开始", step: "before_catch", label: "读取抓取前姿态", time: line.time };
+  }
+  if (text.includes("Moving to startup ready pose")) {
+    return { phase: "启动", step: "startup_ready", label: labelArmStep("startup_ready"), time: line.time };
+  }
+  if (text.includes("Piper arm enabled")) {
+    return { phase: "就绪", step: "enabled", label: "机械臂已使能", time: line.time };
+  }
+  if (text.toLowerCase().includes("listening on")) {
+    return { phase: "等待", step: "listening", label: "等待视觉客户端连接", time: line.time };
+  }
+  if (text.includes("After catch J6")) {
+    return { phase: "完成", step: "after_catch", label: "本轮抓取完成", time: line.time };
+  }
+  if (text.includes("Catch send counts")) {
+    return { phase: "完成", step: "catch_counts", label: "动作指令统计完成", time: line.time };
+  }
+  if (text.startsWith("task=")) {
+    return { phase: "完成", step: "task_result", label: "任务结果已输出", time: line.time };
+  }
+  return null;
+}
+
+function renderArmActivityHistoryFromLogs(lines) {
+  const history = [];
+  let lastKey = "";
+  lines.forEach((line) => {
+    const item = parseArmActivityLog(line);
+    if (!item) return;
+    const key = `${item.phase}|${item.step}|${item.label}`;
+    if (key === lastKey) return;
+    history.push(item);
+    lastKey = key;
+  });
+  renderArmActivityHistory(history);
+}
+
 async function refreshStatus() {
   const status = await api("/api/status");
   renderStatus("windows", status.windows);
   renderStatus("linux", status.linux);
   renderLastLinuxEvent(status);
+  renderArmActivity(status.arm_activity);
+  renderArmActivityHistory(status.arm_activity_history);
 }
 
 async function refreshLogs() {
@@ -260,6 +430,7 @@ async function refreshLogs() {
   renderPlainLog(el.linuxLog, linux);
   renderAllLog(windows, linux);
   renderImportantLog(linuxImportant);
+  renderArmActivityHistoryFromLogs(linux);
 }
 
 function renderAllLog(windows, linux) {
@@ -422,15 +593,14 @@ document.getElementById("validateProfile").addEventListener("click", () =>
 document.getElementById("checkLinuxPort").addEventListener("click", () =>
   checkLinuxPort().catch(alertError),
 );
+document.getElementById("setupCan").addEventListener("click", () =>
+  setupCan().catch(alertError),
+);
 document.getElementById("stopRemoteLinux").addEventListener("click", () =>
   stopRemoteLinuxPortOwner().catch(alertError),
 );
-document.getElementById("startWindows").addEventListener("click", () =>
-  startProcess("windows").catch(alertError),
-);
-document.getElementById("startLinux").addEventListener("click", () =>
-  startProcess("linux").catch(alertError),
-);
+el.startWindows.addEventListener("click", () => toggleProcess("windows").catch(alertError));
+el.startLinux.addEventListener("click", () => toggleProcess("linux").catch(alertError));
 document.getElementById("stopAll").addEventListener("click", () => stopAll().catch(alertError));
 
 async function tick() {

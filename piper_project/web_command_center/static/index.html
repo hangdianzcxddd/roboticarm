@@ -17,6 +17,15 @@
           <input id="profileName" class="profile-name" aria-label="配置名称" />
           <button id="saveProfile">保存配置</button>
           <button id="validateProfile">校验</button>
+          <input
+            id="linuxSudoPassword"
+            class="sudo-password"
+            type="password"
+            autocomplete="current-password"
+            placeholder="Linux 密码"
+            aria-label="Linux sudo 密码"
+          />
+          <button id="setupCan" class="primary">连接机械臂</button>
           <button id="checkLinuxPort">检查旧服务</button>
           <button id="stopRemoteLinux" class="danger">释放旧服务</button>
           <button id="startLinux" class="primary">启动 Linux</button>
@@ -53,8 +62,8 @@
                 <label>
                   <span>传送带方向</span>
                   <select data-path="windows.conveyor_direction">
-                    <option value="positive-y">positive-y</option>
-                    <option value="negative-y">negative-y</option>
+                    <option value="positive-y">从右向左</option>
+                    <option value="negative-y">从左向右</option>
                   </select>
                 </label>
                 <label>
@@ -70,7 +79,7 @@
 
             <section class="panel">
               <div class="panel-title">
-                <h2>动态窗口</h2>
+                <h2>检测区域</h2>
               </div>
               <div class="form-grid two">
                 <label>
@@ -102,7 +111,7 @@
 
             <section class="panel">
               <div class="panel-title">
-                <h2>ROI 与阈值</h2>
+                <h2>画面裁剪与颜色筛选</h2>
               </div>
               <div class="form-grid four">
                 <label>
@@ -151,7 +160,7 @@
             </section>
 
             <details class="panel" open>
-              <summary>Windows 高级</summary>
+              <summary>其他配置</summary>
               <div class="form-grid two details-body">
                 <label class="check-row wide">
                   <input data-path="windows.reject_highlight" type="checkbox" />
@@ -178,15 +187,15 @@
                   <input data-path="windows.min_height_px" type="number" step="1" />
                 </label>
                 <label>
-                  <span>Close kernel</span>
+                  <span>物体完整性补偿强度</span>
                   <input data-path="windows.morphology_close_kernel_size" type="number" step="1" />
                 </label>
                 <label>
-                  <span>Open kernel</span>
+                  <span>噪声过滤强度</span>
                   <input data-path="windows.morphology_open_kernel_size" type="number" step="1" />
                 </label>
                 <label>
-                  <span>入口边</span>
+                  <span>物体进入位置</span>
                   <select data-path="windows.entry_edge">
                     <option value="right">right</option>
                     <option value="left">left</option>
@@ -195,7 +204,7 @@
                   </select>
                 </label>
                 <label>
-                  <span>清空帧数</span>
+                  <span>进入后连续帧数</span>
                   <input data-path="windows.entry_clear_frames" type="number" step="1" />
                 </label>
                 <label class="wide">
@@ -216,23 +225,27 @@
                   <button class="preview-tab" data-preview="depth">Depth</button>
                 </div>
               </div>
+              <div class="arm-activity" id="armActivityBar">
+                <span class="activity-label">机械臂状态</span>
+                <strong id="armActivityStep">等待启动 Linux 服务</strong>
+                <span id="armActivityPhase">空闲</span>
+                <span id="armActivityTime"></span>
+              </div>
               <div class="preview-stage">
                 <img id="previewImage" alt="OpenCV preview" />
                 <div id="previewEmpty" class="empty">等待 Windows 视觉画面</div>
               </div>
             </article>
 
-            <details class="panel command-preview">
-              <summary>
-                <span>生成命令</span>
-                <div class="segmented">
-                  <button class="command-tab active" data-command="windowsCommand">Windows</button>
-                  <button class="command-tab" data-command="linuxCommand">Linux</button>
-                </div>
-              </summary>
-              <pre id="windowsCommand" class="generated-command"></pre>
-              <pre id="linuxCommand" class="generated-command hidden"></pre>
-            </details>
+            <section class="panel activity-history-panel" aria-label="机械臂状态历史">
+              <div class="panel-title">
+                <h2>机械臂状态历史</h2>
+              </div>
+              <div id="armActivityHistory" class="activity-history-list">
+                <div class="activity-history-empty">暂无状态记录</div>
+              </div>
+            </section>
+
           </section>
 
           <aside class="side-scroll">
@@ -330,7 +343,7 @@
                   <input data-path="linux.final_action_time_s" type="number" step="0.01" />
                 </label>
                 <label>
-                  <span>机器人时延 s</span>
+                  <span>机器运动时延 s</span>
                   <input data-path="linux.t_robot_s" type="number" step="0.01" />
                 </label>
                 <label>
@@ -353,7 +366,7 @@
             </section>
 
             <details class="panel" open>
-              <summary>Linux 高级</summary>
+              <summary>其他配置</summary>
               <div class="form-grid two details-body">
                 <label class="check-row wide">
                   <input data-path="linux.dynamic_preposition" type="checkbox" />
@@ -375,63 +388,79 @@
                   <span>按 X 修正时延</span>
                 </label>
                 <label>
-                  <span>参考 X</span>
+                  <span>X 基准线</span>
                   <input data-path="linux.dynamic_t_robot_reference_x_mm" type="number" step="1" />
                 </label>
                 <label>
-                  <span>Near 斜率</span>
+                  <span>向近处斜率</span>
                   <input data-path="linux.dynamic_t_robot_planar_near_s_per_mm" type="number" step="0.001" />
                 </label>
                 <label>
-                  <span>Far 斜率</span>
+                  <span>向远处斜率</span>
                   <input data-path="linux.dynamic_t_robot_planar_far_s_per_mm" type="number" step="0.001" />
                 </label>
                 <label class="check-row wide">
                   <input data-path="linux.adaptive_joint_pitch_by_x" type="checkbox" />
-                  <span>自适应 pitch</span>
+                  <span>自适应夹爪姿态变化</span>
                 </label>
                 <label>
-                  <span>Pitch 模式</span>
+                  <span>变化模式</span>
                   <select data-path="linux.dynamic_pitch_mode">
                     <option value="planar-ik">planar-ik</option>
                     <option value="joint">joint</option>
                   </select>
                 </label>
                 <label>
-                  <span>Keep X 最小</span>
+                  <span>保持区下界</span>
                   <input data-path="linux.keep_pitch_min_x_mm" type="number" step="1" />
                 </label>
                 <label>
-                  <span>Keep X 最大</span>
+                  <span>保持区上界</span>
                   <input data-path="linux.keep_pitch_max_x_mm" type="number" step="1" />
                 </label>
                 <label>
-                  <span>Pitch far</span>
+                  <span>向远处斜率</span>
                   <input data-path="linux.pitch_deg_per_mm_far" type="number" step="0.001" />
                 </label>
                 <label>
-                  <span>Pitch near</span>
+                  <span>向近处斜率</span>
                   <input data-path="linux.pitch_deg_per_mm_near" type="number" step="0.001" />
                 </label>
                 <label class="check-row wide">
                   <input data-path="linux.grasp_yaw_by_object_short_edge" type="checkbox" />
-                  <span>按短边调整 yaw</span>
+                  <span>根据物体姿态旋转夹爪</span>
                 </label>
                 <label>
-                  <span>Yaw 最大变化</span>
+                  <span>夹爪角度最大变化</span>
                   <input data-path="linux.grasp_yaw_max_delta_deg" type="number" step="1" />
                 </label>
                 <label>
-                  <span>Yaw 死区</span>
+                  <span>变化最小角度阈值</span>
                   <input data-path="linux.grasp_yaw_deadband_deg" type="number" step="1" />
                 </label>
                 <label>
-                  <span>Yaw 速度</span>
+                  <span>旋转速度</span>
                   <input data-path="linux.grasp_yaw_speed" type="number" step="1" />
                 </label>
               </div>
             </details>
           </aside>
+
+          <details class="panel command-preview">
+            <summary>
+              <span>生成命令</span>
+              <div class="segmented">
+                <button class="command-tab active" data-command="windowsCommand">Windows</button>
+                <button class="command-tab" data-command="linuxCommand">Linux</button>
+              </div>
+            </summary>
+            <div class="command-preview-body">
+              <div class="command-output">
+                <pre id="windowsCommand" class="generated-command"></pre>
+                <pre id="linuxCommand" class="generated-command hidden"></pre>
+              </div>
+            </div>
+          </details>
         </div>
       </section>
 

@@ -160,6 +160,68 @@ IMPORTANT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 
 
+STEP_LABELS: dict[str, str] = {
+    "initial_ready": "初始准备等待",
+    "startup_ready": "启动准备位",
+    "ready_open": "准备并打开夹爪",
+    "pick_above": "移动到抓取上方",
+    "preposition": "预定位等待",
+    "dynamic_preposition": "动态预定位",
+    "pick_grasp": "下探抓取",
+    "pick_lift": "抓取后抬升",
+    "return_ready_above": "返回准备上方",
+    "place_above": "移动到放置上方",
+    "place_release": "放置并释放",
+    "return_ready": "返回准备位",
+}
+
+
+def humanize_step(step: str) -> str:
+    return STEP_LABELS.get(step, step.replace("_", " "))
+
+
+def parse_arm_activity(line: str) -> dict[str, str] | None:
+    message = re.sub(r"^\[\d{2}:\d{2}:\d{2}\]\s*", "", line).strip()
+    step_match = re.search(r"\bstep=([a-zA-Z0-9_-]+)", message)
+    if "Running planar IK" in message and step_match:
+        step = step_match.group(1)
+        return {"phase": "运动中", "step": step, "label": humanize_step(step)}
+    if "Reusing planar IK" in message and step_match:
+        step = step_match.group(1)
+        return {"phase": "运动中", "step": step, "label": humanize_step(step)}
+    if "Planar IK" in message and "feedback:" in message and step_match:
+        step = step_match.group(1)
+        return {"phase": "到达反馈", "step": step, "label": humanize_step(step)}
+
+    running_match = re.search(r"\bRunning ([a-zA-Z0-9_-]+):", message)
+    if running_match:
+        step = running_match.group(1)
+        return {"phase": "运动中", "step": step, "label": humanize_step(step)}
+
+    waiting_match = re.search(r"Dynamic final timing: waiting [0-9.]+s at ([^(]+)", message)
+    if waiting_match:
+        step = waiting_match.group(1).strip().replace(" ", "_")
+        return {"phase": "动态时序等待", "step": step, "label": humanize_step(step)}
+
+    if "Client connected:" in message:
+        return {"phase": "连接", "step": "client_connected", "label": "客户端已连接"}
+    if "Before catch J6" in message:
+        return {"phase": "抓取开始", "step": "before_catch", "label": "读取抓取前姿态"}
+    if "Moving to startup ready pose" in message:
+        return {"phase": "启动", "step": "startup_ready", "label": humanize_step("startup_ready")}
+    if "Piper arm enabled" in message:
+        return {"phase": "就绪", "step": "enabled", "label": "机械臂已使能"}
+    if "listening on" in message.lower():
+        return {"phase": "等待", "step": "listening", "label": "等待视觉客户端连接"}
+    if "After catch J6" in message:
+        return {"phase": "完成", "step": "after_catch", "label": "本轮抓取完成"}
+    if "Catch send counts" in message:
+        return {"phase": "完成", "step": "catch_counts", "label": "动作指令统计完成"}
+    if message.startswith("task="):
+        return {"phase": "完成", "step": "task_result", "label": "任务结果已输出"}
+    return None
+
+
 @dataclass(frozen=True)
 class LogEntry:
     time: str
@@ -288,6 +350,72 @@ class ManagedProcess:
                 "exit_code": None if running else self._exit_code,
                 "last_important": asdict(self._important[-1]) if self._important else None,
             }
+
+    def activity_status(self) -> dict[str, Any]:
+        with self._lock:
+            running = self.is_running_locked()
+            exit_code = None if running else self._exit_code
+            if exit_code not in (None, 0):
+                return {
+                    "phase": "异常停止",
+                    "step": "process_exit",
+                    "label": f"Linux 进程退出，code={exit_code}",
+                    "time": timestamp(),
+                    "running": False,
+                    "exit_code": exit_code,
+                }
+            for entry in reversed(self._logs):
+                activity = parse_arm_activity(entry.text)
+                if activity:
+                    return {
+                        **activity,
+                        "time": entry.time,
+                        "running": running,
+                        "exit_code": exit_code,
+                    }
+            if running:
+                return {
+                    "phase": "运行中",
+                    "step": "waiting_log",
+                    "label": "等待机械臂流程日志",
+                    "time": timestamp(),
+                    "running": True,
+                    "exit_code": None,
+                }
+            if exit_code is not None:
+                return {
+                    "phase": "已停止",
+                    "step": "process_exit",
+                    "label": f"Linux 进程退出，code={exit_code}",
+                    "time": timestamp(),
+                    "running": False,
+                    "exit_code": exit_code,
+                }
+            return {
+                "phase": "空闲",
+                "step": "idle",
+                "label": "等待启动 Linux 服务",
+                "time": None,
+                "running": False,
+                "exit_code": None,
+            }
+
+    def activity_history(self, *, limit: int = 40) -> list[dict[str, Any]]:
+        with self._lock:
+            items: list[dict[str, Any]] = []
+            last_key: tuple[str | None, str | None, str | None] | None = None
+            for entry in reversed(self._logs):
+                activity = parse_arm_activity(entry.text)
+                if not activity:
+                    continue
+                key = (activity.get("phase"), activity.get("step"), activity.get("label"))
+                if key == last_key:
+                    continue
+                items.append({**activity, "time": entry.time})
+                last_key = key
+                if len(items) >= limit:
+                    break
+            return list(reversed(items))
 
     def logs(self, *, limit: int = 500, important: bool = False) -> list[dict[str, str]]:
         with self._lock:
@@ -558,6 +686,88 @@ def build_ssh_argv(shell: dict[str, Any], remote_command: str) -> list[str]:
     return [str(part) for part in ssh_parts]
 
 
+def remote_setup_can(profile: dict[str, Any], sudo_password: str) -> dict[str, Any]:
+    profile = deep_merge(DEFAULT_PROFILE, profile)
+    password = str(sudo_password or "")
+    if not password:
+        return {
+            "ok": False,
+            "running": False,
+            "message": "请输入 Linux sudo 密码。",
+        }
+
+    shell = profile["linux_shell"]
+    linux = profile["linux"]
+    remote_project = str(shell.get("remote_project", "")).strip()
+    if not remote_project:
+        return {
+            "ok": False,
+            "running": False,
+            "message": "远端项目路径为空，无法执行 setup_can.sh。",
+        }
+
+    can_iface = str(linux.get("can") or "can0").strip() or "can0"
+    bitrate = str(linux.get("can_bitrate") or "1000000").strip() or "1000000"
+    remote_steps = [
+        f"cd {shlex.quote(remote_project)}",
+        "test -f ./setup_can.sh || { echo 'setup_can.sh not found in remote project'; exit 66; }",
+        "IFS= read -r SUDO_PASS",
+        (
+            "printf '%s\\n' \"$SUDO_PASS\" | "
+            f"sudo -S -p '' bash ./setup_can.sh {shlex.quote(can_iface)} {shlex.quote(bitrate)}"
+        ),
+    ]
+    remote_command = " && ".join(remote_steps)
+
+    try:
+        result = subprocess.run(
+            build_ssh_argv(shell, remote_command),
+            input=password + "\n",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=20,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "ok": False,
+            "running": False,
+            "can": can_iface,
+            "bitrate": bitrate,
+            "message": "连接机械臂超时：远端 setup_can.sh 未在 20 秒内完成。",
+        }
+    except OSError as exc:
+        return {
+            "ok": False,
+            "running": False,
+            "can": can_iface,
+            "bitrate": bitrate,
+            "message": f"连接机械臂失败：{exc}",
+        }
+
+    raw = result.stdout.strip().replace(password, "******")
+    ok = result.returncode == 0
+    if ok:
+        message = f"机械臂 CAN 已连接：{can_iface}，bitrate={bitrate}。"
+    elif result.returncode == 66:
+        message = "远端项目目录中没有找到 setup_can.sh，请先同步该文件到 Linux 项目目录。"
+    else:
+        message = raw or f"连接机械臂失败，setup_can.sh 返回 {result.returncode}。"
+
+    return {
+        "ok": ok,
+        "running": False,
+        "can": can_iface,
+        "bitrate": bitrate,
+        "exit_code": result.returncode,
+        "raw": raw,
+        "message": message,
+    }
+
+
 def linux_service_port(profile: dict[str, Any]) -> int:
     try:
         port = int(profile["linux"].get("port", 5005))
@@ -787,6 +997,8 @@ class PiperCommandCenter:
             "windows": self.windows.status(),
             "linux": self.linux.status(),
             "preview": preview_status(),
+            "arm_activity": self.linux.activity_status(),
+            "arm_activity_history": self.linux.activity_history(),
         }
 
 
@@ -916,6 +1128,13 @@ class RequestHandler(BaseHTTPRequestHandler):
             profile = payload.get("profile") or load_profile()
             result = stop_remote_linux_port_owner(profile, force=bool(payload.get("force")))
             self.app.linux.append_event("warn" if result.get("ok") else "error", result.get("message", ""))
+            self.send_json(result, status=200 if result.get("ok") else 400)
+            return
+        if path == "/api/linux/setup-can":
+            payload = self.read_json()
+            profile = payload.get("profile") or load_profile()
+            result = remote_setup_can(profile, str(payload.get("password") or ""))
+            self.app.linux.append_event("success" if result.get("ok") else "error", result.get("message", ""))
             self.send_json(result, status=200 if result.get("ok") else 400)
             return
 
