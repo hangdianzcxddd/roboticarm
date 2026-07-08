@@ -16,6 +16,7 @@ import argparse
 from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
 import math
+import os
 import sys
 import time
 from dataclasses import dataclass, replace
@@ -71,6 +72,58 @@ from robot_control.windows.vision.detector import Detection
 RGB_WINDOW_NAME = "OpenCV belt-color grasp -> catch_server_1"
 MASK_WINDOW_NAME = "OpenCV belt/object masks"
 DEPTH_WINDOW_NAME = "Aligned depth valid map"
+
+
+@dataclass
+class WebPreviewWriter:
+    output_dir: Path
+    interval_s: float = 0.2
+    jpeg_quality: int = 80
+    last_write_s: float = 0.0
+
+    @classmethod
+    def from_environment(cls) -> "WebPreviewWriter | None":
+        output_dir = os.environ.get("PIPER_WEB_PREVIEW_DIR")
+        if not output_dir:
+            return None
+        try:
+            interval_s = float(os.environ.get("PIPER_WEB_PREVIEW_INTERVAL_S", "0.2"))
+        except ValueError:
+            interval_s = 0.2
+        try:
+            jpeg_quality = int(os.environ.get("PIPER_WEB_PREVIEW_JPEG_QUALITY", "80"))
+        except ValueError:
+            jpeg_quality = 80
+        return cls(
+            output_dir=Path(output_dir),
+            interval_s=max(0.05, interval_s),
+            jpeg_quality=min(100, max(1, jpeg_quality)),
+        )
+
+    def maybe_write(
+        self,
+        *,
+        rgb: np.ndarray | None = None,
+        mask: np.ndarray | None = None,
+        depth: np.ndarray | None = None,
+    ) -> None:
+        now = time.monotonic()
+        if now - self.last_write_s < self.interval_s:
+            return
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self._write("opencv_rgb.jpg", rgb)
+        self._write("opencv_mask.jpg", mask)
+        self._write("opencv_depth.jpg", depth)
+        self.last_write_s = now
+
+    def _write(self, filename: str, image: np.ndarray | None) -> None:
+        if image is None:
+            return
+        output_path = self.output_dir / filename
+        temp_path = output_path.with_suffix(".tmp.jpg")
+        params = [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality]
+        if cv2.imwrite(str(temp_path), image, params):
+            temp_path.replace(output_path)
 
 
 @dataclass(frozen=True)
@@ -2349,6 +2402,9 @@ def main() -> None:
             cv2.namedWindow(MASK_WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
         if not args.hide_depth:
             cv2.namedWindow(DEPTH_WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
+    web_preview = WebPreviewWriter.from_environment()
+    if web_preview is not None:
+        print(f"Web preview enabled: {web_preview.output_dir}", flush=True)
 
     try:
         running = True
@@ -2638,7 +2694,11 @@ def main() -> None:
                                         now_s=now,
                                     )
 
-            if not args.no_display:
+            needs_preview_images = not args.no_display or web_preview is not None
+            display_image: np.ndarray | None = None
+            mask_debug: np.ndarray | None = None
+            depth_debug: np.ndarray | None = None
+            if needs_preview_images:
                 if args.mode == "static":
                     status = "No OpenCV target found. Type q in terminal or press Esc to exit."
                 else:
@@ -2680,18 +2740,16 @@ def main() -> None:
                 )
                 if dynamic_roi_pixels is not None:
                     draw_dynamic_base_roi_pixels(display_image, dynamic_roi_pixels)
-                cv2.imshow(RGB_WINDOW_NAME, display_image)
 
-                if not args.hide_mask:
+                if not args.hide_mask or web_preview is not None:
                     mask_debug = make_mask_debug_image(
                         detector,
                         segments,
                         latest_targets,
                         color_image.shape,
                     )
-                    cv2.imshow(MASK_WINDOW_NAME, mask_debug)
 
-                if not args.hide_depth:
+                if not args.hide_depth or web_preview is not None:
                     depth_debug = make_depth_colormap(depth_frame, args.max_depth_m)
                     draw_opencv_targets(
                         depth_debug,
@@ -2703,6 +2761,20 @@ def main() -> None:
                     )
                     if dynamic_roi_pixels is not None:
                         draw_dynamic_base_roi_pixels(depth_debug, dynamic_roi_pixels)
+
+            if web_preview is not None:
+                web_preview.maybe_write(
+                    rgb=display_image,
+                    mask=mask_debug,
+                    depth=depth_debug,
+                )
+
+            if not args.no_display:
+                if display_image is not None:
+                    cv2.imshow(RGB_WINDOW_NAME, display_image)
+                if not args.hide_mask and mask_debug is not None:
+                    cv2.imshow(MASK_WINDOW_NAME, mask_debug)
+                if not args.hide_depth and depth_debug is not None:
                     cv2.imshow(DEPTH_WINDOW_NAME, depth_debug)
 
                 key = cv2.waitKey(1) & 0xFF

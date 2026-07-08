@@ -72,6 +72,7 @@ DEFAULT_HAND_EYE_RESULT = (
 Action = Literal["open", "close", None]
 JointPitchMode = Literal["disabled", "keep_fixed", "adjust"]
 DynamicPitchControlMode = Literal["joint", "planar_ik"]
+GraspYawMode = Literal["integrated-planar-ik", "separate-j6"]
 DEFAULT_KEEP_PITCH_MIN_X_MM = 300.0
 DEFAULT_KEEP_PITCH_MAX_X_MM = 380.0
 DEFAULT_PITCH_DEG_PER_MM_FAR = 0.04
@@ -132,6 +133,7 @@ class DynamicTiming:
     t_robot_source_x_mm: float | None = None
     t_robot_reference_x_mm: float | None = None
     t_robot_segment: str | None = None
+    t_robot_slope_s_per_mm: float | None = None
     t_robot_base_s: float | None = None
     t_robot_unclamped_s: float | None = None
     t_robot_margin_s: float = 0.0
@@ -226,6 +228,16 @@ class GraspYawAdjustmentResult:
     start_joints_deg: tuple[float, float, float, float, float, float] | None = None
     target_joints_deg: tuple[float, float, float, float, float, float] | None = None
     send_count: int = 0
+
+
+@dataclass(frozen=True)
+class GraspYawPlan:
+    raw_delta_deg: float
+    delta_deg: float
+    target_j6_deg: float
+    axis_error_deg: float
+    delta_clamped: bool
+    limit_clamped: bool
 
 
 @dataclass(frozen=True)
@@ -379,9 +391,9 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.0,
         help=(
-            "linear timing slope in seconds per raw-X millimeter when "
-            "--dynamic-t-robot-by-x is enabled; positive means smaller X takes "
-            "longer and larger X is faster"
+            "default linear timing slope in seconds per raw-X millimeter when "
+            "--dynamic-t-robot-by-x is enabled. Used for both sides unless "
+            "the near/far side-specific slope is provided"
         ),
     )
     parser.add_argument(
@@ -389,8 +401,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.0,
         help=(
-            "legacy option accepted for compatibility; linear dynamic timing "
-            "uses --dynamic-t-robot-s-per-mm"
+            "X-based timing slope for raw X greater than "
+            "--dynamic-t-robot-reference-x-mm; 0 uses --dynamic-t-robot-s-per-mm"
         ),
     )
     parser.add_argument(
@@ -398,8 +410,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.0,
         help=(
-            "legacy option accepted for compatibility; linear dynamic timing "
-            "uses --dynamic-t-robot-s-per-mm"
+            "X-based timing slope for raw X smaller than "
+            "--dynamic-t-robot-reference-x-mm; 0 uses --dynamic-t-robot-s-per-mm"
         ),
     )
     parser.add_argument(
@@ -591,8 +603,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--grasp-yaw-by-object-short-edge",
         action="store_true",
         help=(
-            "before final grasp descent, rotate only J6 toward the object short-edge "
-            "yaw reported by the vision payload; disabled by default"
+            "align grasp yaw to the object short-edge yaw reported by the vision "
+            "payload before final grasp descent; disabled by default"
+        ),
+    )
+    parser.add_argument(
+        "--grasp-yaw-mode",
+        choices=("integrated-planar-ik", "separate-j6"),
+        default="integrated-planar-ik",
+        help=(
+            "object-short-edge yaw strategy when --grasp-yaw-by-object-short-edge "
+            "is enabled. integrated-planar-ik keeps the existing J2/J3/J4/J5/J6 "
+            "planar-IK yaw solve; separate-j6 rotates J6 first, then keeps planar "
+            "IK on J2/J3/J5 only"
         ),
     )
     parser.add_argument(
@@ -1317,6 +1340,8 @@ def use_planar_ik_yaw(args: argparse.Namespace) -> bool:
     return bool(
         getattr(args, "planar_ik_include_j6_yaw", False)
         and getattr(args, "grasp_yaw_by_object_short_edge", False)
+        and getattr(args, "grasp_yaw_mode", "integrated-planar-ik")
+        == "integrated-planar-ik"
     )
 
 
@@ -1424,6 +1449,7 @@ def dynamic_t_robot_s_for_x(
             "source_x_mm": source_x_mm,
             "reference_x_mm": None,
             "segment": None,
+            "slope_s_per_mm": None,
             "base_s": base_s,
             "unclamped_s": base_s,
             "margin_s": 0.0,
@@ -1433,7 +1459,24 @@ def dynamic_t_robot_s_for_x(
 
     source_x = float(source_x_mm)
     reference_x = dynamic_t_robot_reference_x_mm(args)
-    slope_s_per_mm = float(args.dynamic_t_robot_s_per_mm)
+    default_slope_s_per_mm = float(args.dynamic_t_robot_s_per_mm)
+    if source_x < reference_x:
+        segment = "near"
+        side_slope = float(getattr(args, "dynamic_t_robot_planar_near_s_per_mm", 0.0))
+    elif source_x > reference_x:
+        segment = "far"
+        side_slope = float(getattr(args, "dynamic_t_robot_planar_far_s_per_mm", 0.0))
+    else:
+        segment = "reference"
+        side_slope = 0.0
+    slope_s_per_mm = (
+        side_slope
+        if segment != "reference"
+        and not math.isclose(side_slope, 0.0, rel_tol=0.0, abs_tol=1e-12)
+        else default_slope_s_per_mm
+    )
+    if segment == "reference":
+        slope_s_per_mm = 0.0
     margin_s = float(args.dynamic_t_robot_margin_s)
     t_robot_s = base_s + (reference_x - source_x) * slope_s_per_mm
     t_robot_s += margin_s
@@ -1448,7 +1491,8 @@ def dynamic_t_robot_s_for_x(
         "source": "x_linear",
         "source_x_mm": source_x,
         "reference_x_mm": reference_x,
-        "segment": None,
+        "segment": segment,
+        "slope_s_per_mm": slope_s_per_mm,
         "base_s": base_s,
         "unclamped_s": unclamped_s,
         "margin_s": margin_s,
@@ -1757,6 +1801,7 @@ def dynamic_timing_from_command(
             t_robot_source_x_mm=t_robot_meta["source_x_mm"],
             t_robot_reference_x_mm=t_robot_meta["reference_x_mm"],
             t_robot_segment=t_robot_meta["segment"],
+            t_robot_slope_s_per_mm=t_robot_meta["slope_s_per_mm"],
             t_robot_base_s=t_robot_meta["base_s"],
             t_robot_unclamped_s=t_robot_meta["unclamped_s"],
             t_robot_margin_s=t_robot_meta["margin_s"],
@@ -1784,6 +1829,7 @@ def dynamic_timing_from_command(
         t_robot_source_x_mm=t_robot_meta["source_x_mm"],
         t_robot_reference_x_mm=t_robot_meta["reference_x_mm"],
         t_robot_segment=t_robot_meta["segment"],
+        t_robot_slope_s_per_mm=t_robot_meta["slope_s_per_mm"],
         t_robot_base_s=t_robot_meta["base_s"],
         t_robot_unclamped_s=t_robot_meta["unclamped_s"],
         t_robot_margin_s=t_robot_meta["margin_s"],
@@ -3543,6 +3589,59 @@ def nearest_axis_equivalent_delta_deg(target_deg: float, current_deg: float) -> 
     return delta
 
 
+def plan_grasp_yaw_delta(
+    target_deg: float,
+    current_deg: float,
+    *,
+    max_delta_deg: float,
+    min_j6_deg: float,
+    max_j6_deg: float,
+) -> GraspYawPlan:
+    candidates: list[GraspYawPlan] = []
+    target_axis_deg = normalize_degrees(target_deg)
+    for equivalent_target_deg in (
+        target_axis_deg,
+        normalize_degrees(target_axis_deg + 180.0),
+    ):
+        raw_delta_deg = normalize_degrees(equivalent_target_deg - float(current_deg))
+        delta_limited_deg = min(
+            float(max_delta_deg),
+            max(-float(max_delta_deg), raw_delta_deg),
+        )
+        requested_j6_deg = float(current_deg) + delta_limited_deg
+        target_j6_deg = min(float(max_j6_deg), max(float(min_j6_deg), requested_j6_deg))
+        delta_deg = target_j6_deg - float(current_deg)
+        reached_axis_delta = nearest_axis_equivalent_delta_deg(target_axis_deg, target_j6_deg)
+        candidates.append(
+            GraspYawPlan(
+                raw_delta_deg=raw_delta_deg,
+                delta_deg=delta_deg,
+                target_j6_deg=target_j6_deg,
+                axis_error_deg=abs(reached_axis_delta),
+                delta_clamped=not math.isclose(
+                    delta_limited_deg,
+                    raw_delta_deg,
+                    rel_tol=0.0,
+                    abs_tol=1e-9,
+                ),
+                limit_clamped=not math.isclose(
+                    target_j6_deg,
+                    requested_j6_deg,
+                    rel_tol=0.0,
+                    abs_tol=1e-9,
+                ),
+            )
+        )
+    return min(
+        candidates,
+        key=lambda candidate: (
+            candidate.axis_error_deg,
+            candidate.limit_clamped,
+            abs(candidate.delta_deg),
+        ),
+    )
+
+
 def compute_grasp_yaw_adjustment_result(
     controller: PiperController,
     args: argparse.Namespace,
@@ -3572,67 +3671,42 @@ def compute_grasp_yaw_adjustment_result(
     target_yaw_deg = normalize_degrees(
         float(source_yaw) + float(args.gripper_close_axis_offset_deg)
     )
-    raw_delta_deg = nearest_axis_equivalent_delta_deg(target_yaw_deg, current_j6_deg)
-    if abs(raw_delta_deg) <= float(args.grasp_yaw_deadband_deg):
-        return (
-            GraspYawAdjustmentResult(
-                enabled=True,
-                applied=False,
-                reason="within_deadband",
-                source_yaw_deg=float(source_yaw),
-                target_yaw_deg=target_yaw_deg,
-                current_j6_deg=current_j6_deg,
-                delta_deg=0.0,
-                start_joints_deg=start_joints_deg,  # type: ignore[arg-type]
-                target_joints_deg=start_joints_deg,  # type: ignore[arg-type]
-            ),
-            current_joints,
-        )
-
-    max_delta_deg = float(args.grasp_yaw_max_delta_deg)
-    delta_deg = min(max_delta_deg, max(-max_delta_deg, raw_delta_deg))
-    delta_clamped = not math.isclose(
-        delta_deg,
-        raw_delta_deg,
-        rel_tol=0.0,
-        abs_tol=1e-9,
-    )
     joint6_limit = controller.config.joint_limits_rad[5]
     margin_rad = math.radians(0.1)
     min_j6_deg = math.degrees(joint6_limit.min_value + margin_rad)
     max_j6_deg = math.degrees(joint6_limit.max_value - margin_rad)
-    requested_j6_deg = current_j6_deg + delta_deg
-    target_j6_deg = min(max_j6_deg, max(min_j6_deg, requested_j6_deg))
-    limit_clamped = not math.isclose(
-        target_j6_deg,
-        requested_j6_deg,
-        rel_tol=0.0,
-        abs_tol=1e-9,
+    yaw_plan = plan_grasp_yaw_delta(
+        target_yaw_deg,
+        current_j6_deg,
+        max_delta_deg=float(args.grasp_yaw_max_delta_deg),
+        min_j6_deg=min_j6_deg,
+        max_j6_deg=max_j6_deg,
     )
-    delta_deg = target_j6_deg - current_j6_deg
-    if abs(delta_deg) <= float(args.grasp_yaw_deadband_deg):
+    raw_delta_deg = yaw_plan.raw_delta_deg
+    if abs(yaw_plan.delta_deg) <= float(args.grasp_yaw_deadband_deg):
         return (
             GraspYawAdjustmentResult(
                 enabled=True,
                 applied=False,
                 reason=(
                     "within_joint6_limit_deadband"
-                    if limit_clamped
+                    if yaw_plan.limit_clamped
                     else "within_deadband"
                 ),
                 source_yaw_deg=float(source_yaw),
                 target_yaw_deg=target_yaw_deg,
                 current_j6_deg=current_j6_deg,
                 delta_deg=0.0,
-                clamped=delta_clamped,
-                limit_clamped=limit_clamped,
+                clamped=yaw_plan.delta_clamped or yaw_plan.limit_clamped,
+                limit_clamped=yaw_plan.limit_clamped,
                 start_joints_deg=start_joints_deg,  # type: ignore[arg-type]
                 target_joints_deg=start_joints_deg,  # type: ignore[arg-type]
             ),
             current_joints,
         )
 
-    clamped = delta_clamped or limit_clamped
+    delta_deg = yaw_plan.delta_deg
+    clamped = yaw_plan.delta_clamped or yaw_plan.limit_clamped
     target_joints = list(current_joints)
     target_joints[5] += math.radians(delta_deg)
     controller.validate_joints(target_joints)
@@ -3649,8 +3723,9 @@ def compute_grasp_yaw_adjustment_result(
         f"current_j6={current_j6_deg:.3f}deg "
         f"delta={delta_deg:.3f}deg "
         f"raw_delta={raw_delta_deg:.3f}deg "
+        f"axis_err={yaw_plan.axis_error_deg:.3f}deg "
         f"clamped={clamped} "
-        f"limit_clamped={limit_clamped}",
+        f"limit_clamped={yaw_plan.limit_clamped}",
         flush=True,
     )
     send_count = 0
@@ -3662,6 +3737,15 @@ def compute_grasp_yaw_adjustment_result(
             float(args.command_duration_s),
             float(args.command_period_s),
         )
+        if not args.no_wait_waypoints:
+            wait_until_planar_ik_joints_reached(
+                controller,
+                "grasp_yaw",
+                target_joints,
+                timeout_s=args.motion_timeout_s,
+                joint_tolerance_deg=float(args.planar_ik_joint_tolerance_deg),
+                joint_indices=(5,),
+            )
     return (
         GraspYawAdjustmentResult(
             enabled=True,
@@ -3671,7 +3755,7 @@ def compute_grasp_yaw_adjustment_result(
             current_j6_deg=current_j6_deg,
             delta_deg=delta_deg,
             clamped=clamped,
-            limit_clamped=limit_clamped,
+            limit_clamped=yaw_plan.limit_clamped,
             start_joints_deg=start_joints_deg,  # type: ignore[arg-type]
             target_joints_deg=joints_rad_to_deg(target_joints),
             send_count=send_count,
@@ -4469,6 +4553,7 @@ def handle_message(
             "t_robot_source_x_mm": timing.t_robot_source_x_mm,
             "t_robot_reference_x_mm": timing.t_robot_reference_x_mm,
             "t_robot_segment": timing.t_robot_segment,
+            "t_robot_slope_s_per_mm": timing.t_robot_slope_s_per_mm,
             "t_robot_base_s": timing.t_robot_base_s,
             "t_robot_unclamped_s": timing.t_robot_unclamped_s,
             "t_robot_margin_s": timing.t_robot_margin_s,

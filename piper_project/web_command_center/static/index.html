@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Piper Command Center</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <h1>Piper Command Center</h1>
+          <p>OpenCV 动态检测与 Linux 抓取日志</p>
+        </div>
+        <div class="status-strip">
+          <span id="windowsStatus" class="pill">Windows idle</span>
+          <span id="linuxStatus" class="pill">Linux idle</span>
+        </div>
+      </header>
+
+      <section class="command-grid">
+        <article class="panel">
+          <div class="panel-title">
+            <h2>Windows 命令</h2>
+            <div class="actions">
+              <button id="saveWindows">保存</button>
+              <button id="startWindows" class="primary">启动</button>
+              <button id="stopWindows" class="danger">停止</button>
+            </div>
+          </div>
+          <textarea id="windowsCommand" spellcheck="false"></textarea>
+        </article>
+
+        <article class="panel">
+          <div class="panel-title">
+            <h2>Linux 命令</h2>
+            <div class="actions">
+              <button id="saveLinux">保存</button>
+              <button id="startLinux" class="primary">启动</button>
+              <button id="stopLinux" class="danger">停止</button>
+            </div>
+          </div>
+          <textarea id="linuxCommand" spellcheck="false"></textarea>
+        </article>
+      </section>
+
+      <section class="work-grid">
+        <article class="panel preview-panel">
+          <div class="panel-title">
+            <h2>Windows 检测界面</h2>
+            <div class="preview-tabs">
+              <button class="tab active" data-preview="rgb">RGB</button>
+              <button class="tab" data-preview="mask">Mask</button>
+              <button class="tab" data-preview="depth">Depth</button>
+            </div>
+          </div>
+          <div class="preview-stage">
+            <img id="previewImage" alt="OpenCV preview" />
+            <div id="previewEmpty" class="empty">等待 Windows 检测画面</div>
+          </div>
+        </article>
+
+        <article class="panel log-panel important-panel">
+          <div class="panel-title">
+            <h2>Linux 重要日志</h2>
+            <span id="lastLinuxEvent" class="mini-status">无事件</span>
+          </div>
+          <div id="linuxImportantLog" class="important-log"></div>
+        </article>
+      </section>
+
+      <section class="log-grid">
+        <article class="panel log-panel">
+          <div class="panel-title">
+            <h2>Windows 输出</h2>
+          </div>
+          <pre id="windowsLog"></pre>
+        </article>
+        <article class="panel log-panel">
+          <div class="panel-title">
+            <h2>Linux 输出</h2>
+          </div>
+          <pre id="linuxLog"></pre>
+        </article>
+      </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
