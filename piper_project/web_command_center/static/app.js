@@ -1,6 +1,7 @@
 const state = {
   activePreview: "rgb",
   previewReady: false,
+  streamConnected: false,
 };
 
 const el = {
@@ -137,13 +138,14 @@ async function refreshPreview() {
   const current = status[state.activePreview];
   if (!current || !current.exists) {
     state.previewReady = false;
+    state.streamConnected = false;
     el.previewImage.classList.remove("ready");
     el.previewEmpty.style.display = "block";
     return;
   }
-  const nextSrc = `/preview/${state.activePreview}.jpg?t=${Date.now()}`;
-  if (el.previewImage.src !== nextSrc) {
-    el.previewImage.src = nextSrc;
+  if (!state.streamConnected) {
+    el.previewImage.src = `/stream/${state.activePreview}.mjpg?t=${Date.now()}`;
+    state.streamConnected = true;
   }
 }
 
@@ -158,6 +160,11 @@ document.querySelectorAll(".tab").forEach((button) => {
     document.querySelectorAll(".tab").forEach((item) => item.classList.remove("active"));
     button.classList.add("active");
     state.activePreview = button.dataset.preview;
+    state.previewReady = false;
+    state.streamConnected = false;
+    el.previewImage.classList.remove("ready");
+    el.previewEmpty.style.display = "block";
+    el.previewImage.removeAttribute("src");
     refreshPreview().catch(console.error);
   });
 });
@@ -197,4 +204,3 @@ loadCommands()
   });
 
 setInterval(tick, 1000);
-setInterval(() => refreshPreview().catch(console.error), 250);

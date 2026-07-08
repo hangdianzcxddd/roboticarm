@@ -120,10 +120,16 @@ class WebPreviewWriter:
         if image is None:
             return
         output_path = self.output_dir / filename
-        temp_path = output_path.with_suffix(".tmp.jpg")
+        temp_path = output_path.with_name(f"{output_path.stem}.{os.getpid()}.tmp.jpg")
         params = [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality]
         if cv2.imwrite(str(temp_path), image, params):
-            temp_path.replace(output_path)
+            try:
+                temp_path.replace(output_path)
+            except PermissionError:
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
 
 
 @dataclass(frozen=True)

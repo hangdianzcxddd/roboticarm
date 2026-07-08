@@ -26,6 +26,11 @@ STATE_DIR = APP_DIR / "state"
 RUNTIME_DIR = APP_DIR / "runtime"
 PREVIEW_DIR = RUNTIME_DIR / "preview"
 COMMANDS_PATH = STATE_DIR / "commands.json"
+PREVIEW_FILES = {
+    "rgb": "opencv_rgb.jpg",
+    "mask": "opencv_mask.jpg",
+    "depth": "opencv_depth.jpg",
+}
 
 
 DEFAULT_WINDOWS_COMMAND = (
@@ -134,7 +139,7 @@ class ManagedProcess:
             if self.preview_enabled:
                 PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
                 env["PIPER_WEB_PREVIEW_DIR"] = str(PREVIEW_DIR)
-                env.setdefault("PIPER_WEB_PREVIEW_INTERVAL_S", "0.20")
+                env.setdefault("PIPER_WEB_PREVIEW_INTERVAL_S", "0.05")
             kwargs: dict[str, Any] = {
                 "cwd": str(PROJECT_ROOT),
                 "shell": True,
@@ -299,11 +304,7 @@ class PiperCommandCenter:
 def preview_status() -> dict[str, Any]:
     return {
         name: image_status(PREVIEW_DIR / filename)
-        for name, filename in {
-            "rgb": "opencv_rgb.jpg",
-            "mask": "opencv_mask.jpg",
-            "depth": "opencv_depth.jpg",
-        }.items()
+        for name, filename in PREVIEW_FILES.items()
     }
 
 
@@ -358,13 +359,17 @@ class RequestHandler(BaseHTTPRequestHandler):
         if path == "/api/preview/status":
             self.send_json(preview_status())
             return
+        if path.startswith("/stream/"):
+            filename = path.rsplit("/", 1)[-1]
+            stream_name = filename.removesuffix(".mjpg")
+            if stream_name not in PREVIEW_FILES or filename == stream_name:
+                self.send_error(404, "unknown stream")
+                return
+            self.send_mjpeg_stream(PREVIEW_DIR / PREVIEW_FILES[stream_name])
+            return
         if path.startswith("/preview/"):
             filename = path.rsplit("/", 1)[-1]
-            allowed = {
-                "rgb.jpg": "opencv_rgb.jpg",
-                "mask.jpg": "opencv_mask.jpg",
-                "depth.jpg": "opencv_depth.jpg",
-            }
+            allowed = {f"{name}.jpg": preview_file for name, preview_file in PREVIEW_FILES.items()}
             if filename not in allowed:
                 self.send_error(404, "unknown preview")
                 return
@@ -435,6 +440,42 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
+
+    def send_mjpeg_stream(self, path: Path) -> None:
+        boundary = "piper-preview-frame"
+        self.send_response(200)
+        self.send_header("Content-Type", f"multipart/x-mixed-replace; boundary={boundary}")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        last_mtime_ns: int | None = None
+        last_body: bytes | None = None
+        while True:
+            try:
+                stat = path.stat()
+                if stat.st_mtime_ns != last_mtime_ns:
+                    last_body = path.read_bytes()
+                    last_mtime_ns = stat.st_mtime_ns
+                body = last_body
+                if body:
+                    self.wfile.write(
+                        (
+                            f"--{boundary}\r\n"
+                            "Content-Type: image/jpeg\r\n"
+                            f"Content-Length: {len(body)}\r\n\r\n"
+                        ).encode("ascii")
+                    )
+                    self.wfile.write(body)
+                    self.wfile.write(b"\r\n")
+                    self.wfile.flush()
+                time.sleep(0.05)
+            except FileNotFoundError:
+                time.sleep(0.1)
+            except PermissionError:
+                time.sleep(0.05)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                return
 
 
 def parse_int(value: str, *, default: int) -> int:
