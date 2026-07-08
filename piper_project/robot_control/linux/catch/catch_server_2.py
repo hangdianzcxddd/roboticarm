@@ -53,62 +53,12 @@ DEFAULT_EYE_IN_HAND_RESULT = (
     / "eye_in_hand_result_auto.json"
 )
 _CATCH_SERVER_1_READY_POSE = catch_server_1.ready_pose
-_GUARDED_DESCENT_OPTION_STRINGS = (
-    "--guarded-descent",
-    "--no-guarded-descent",
-    "--descent-protection",
-    "--no-descent-protection",
-    "--guarded-descent-zone-mm",
-    "--guarded-descent-step-mm",
-    "--guarded-descent-speed",
-    "--guarded-follow-error-mm",
-    "--guarded-stall-s",
-    "--guarded-start-tolerance-mm",
-    "--guarded-start-timeout-s",
-    "--guarded-progress-min-mm",
-    "--guarded-step-timeout-s",
-    "--guarded-abort-return",
-)
-_SERVER_1_NO_GUARDED_DESCENT_DEFAULTS = {
-    "guarded_descent": False,
-    "guarded_descent_zone_mm": 30.0,
-    "guarded_descent_step_mm": 3.0,
-    "guarded_descent_speed": 20,
-    "guarded_follow_error_mm": 4.0,
-    "guarded_stall_s": 0.2,
-    "guarded_start_tolerance_mm": 2.0,
-    "guarded_start_timeout_s": 1.0,
-    "guarded_progress_min_mm": 1.0,
-    "guarded_step_timeout_s": 0.25,
-    "guarded_abort_return": "none",
+_SERVER_1_MOTION_ARG_DEFAULTS = {
     "disable_ready_planar_ik_return": True,
 }
 
 
-def remove_parser_option_strings(
-    parser: argparse.ArgumentParser,
-    option_strings: tuple[str, ...],
-) -> None:
-    actions = {
-        parser._option_string_actions[option_string]
-        for option_string in option_strings
-        if option_string in parser._option_string_actions
-    }
-    for action in actions:
-        for option_string in action.option_strings:
-            parser._option_string_actions.pop(option_string, None)
-        if action in parser._actions:
-            parser._actions.remove(action)
-        for group in parser._action_groups:
-            if action in group._group_actions:
-                group._group_actions.remove(action)
-        for group in parser._mutually_exclusive_groups:
-            if action in group._group_actions:
-                group._group_actions.remove(action)
-
-
 def configure_eye_in_hand_parser(parser: argparse.ArgumentParser) -> None:
-    remove_parser_option_strings(parser, _GUARDED_DESCENT_OPTION_STRINGS)
     parser.set_defaults(
         dynamic_pitch_mode="planar-ik",
     )
@@ -213,7 +163,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def server_1_motion_args(args: argparse.Namespace) -> argparse.Namespace:
     values = vars(args).copy()
-    values.update(_SERVER_1_NO_GUARDED_DESCENT_DEFAULTS)
+    values.update(_SERVER_1_MOTION_ARG_DEFAULTS)
     return argparse.Namespace(**values)
 
 
@@ -567,7 +517,6 @@ def handle_message(
     )
     payload = response.get("payload")
     if isinstance(payload, dict):
-        payload.pop("guarded_execution", None)
         payload["mapping_source"] = "eye_in_hand"
         payload["eye_in_hand"] = {
             "result_path": str(args.eye_in_hand_result),

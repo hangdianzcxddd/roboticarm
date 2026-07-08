@@ -62,7 +62,7 @@ DEFAULT_LINUX_COMMAND = (
     "--gripper-settle-s 0.1 --dynamic-preposition "
     "--dynamic-preposition-clearance-mm 40 --final-action-time-s 0.5 "
     "--command-period-s 0.05 --print-feedback --open-command-mm 0 "
-    "--grasp-command-mm -90 --effort-nm 0.9 --no-descent-protection "
+    "--grasp-command-mm -90 --effort-nm 0.9 "
     "--min-target-x-mm 220 --max-target-x-mm 480 --force-pick-y-mm 0 "
     "--adaptive-joint-pitch-by-x --dynamic-pitch-mode planar-ik "
     "--planar-ik-fk-tool-z-offset-mm 82 --planar-ik-joint-tolerance-deg 12 "
@@ -85,7 +85,7 @@ DEFAULT_LINUX_COMMAND = (
 IMPORTANT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("error", re.compile(r"\b(error|failed|traceback|exception|timed out|abort|refused)\b", re.I)),
     ("error", re.compile(r"TARGET_POS_EXCEEDS_LIMIT|EXCEEDS_LIMIT", re.I)),
-    ("warn", re.compile(r"\b(skipped|warning|protected abort|not reached|no valid)\b", re.I)),
+    ("warn", re.compile(r"\b(skipped|warning|not reached|no valid)\b", re.I)),
     ("success", re.compile(r"\b(ack|send completed|catch send counts|after catch|executed=True|Piper arm enabled)\b", re.I)),
     ("info", re.compile(r"\b(dynamic timing|client connected|listening on|using hand-eye)\b", re.I)),
 )

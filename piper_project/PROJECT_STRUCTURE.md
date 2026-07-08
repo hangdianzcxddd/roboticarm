@@ -196,7 +196,7 @@ Linux 抓取执行层，包含点击抓取、YOLO 传送带抓取、eye-in-hand 
 | `__init__.py` | Python 包标识文件；包文档说明这里是 Linux 侧 click-to-catch server。 |
 | `catch_server.py` | Linux 点击抓取 TCP server；接收 camera XYZ，使用手眼或临时映射生成抓取/放置计划并可执行机械臂和夹爪动作。 |
 | `catch_server_test.py` | `catch_server.py` 的单元测试，覆盖 TCP 偏移、抓取计划和 fake SDK 行为。 |
-| `catch_server_1.py` | 当前 YOLO 传送带抓取核心 server；接收 Windows YOLO/OpenCV camera point，加载 eye-to-hand 结果，生成 out/in 动作序列，支持动态时序、固定/动态 pitch、guarded descent、safe gripper、planar IK 等实机场景逻辑。 |
+| `catch_server_1.py` | 当前 YOLO 传送带抓取核心 server；接收 Windows YOLO/OpenCV camera point，加载 eye-to-hand 结果，生成 out/in 动作序列，支持动态时序、固定/动态 pitch、safe gripper、planar IK 等实机场景逻辑。 |
 | `catch_server_1_test.py` | `catch_server_1.py` 的单元测试，覆盖目标校验、动态时序、夹爪保护、平面 IK、位姿序列等逻辑。 |
 | `catch_server_2.py` | eye-in-hand 静态抓取 server；复用 `catch_server_1` 动作序列，但每条消息根据当前末端位姿计算 camera-to-base。 |
 | `catch_server_coordinate_and_args_guide.md` | 抓取 server 坐标系、参数和现场调参说明。 |

@@ -52,7 +52,7 @@ robot_control/linux/catch/catch_server_1.py
 - 根据任务类型 `out` 或 `in` 生成固定姿态的 J6 位姿序列。
 - 支持静态抓取、动态定时抓取、probe 坐标验证模式。
 - 在 `--execute` 模式下通过 Piper SDK 控制机械臂和夹爪。
-- 支持边界检查、启动 ready 位姿、下降保护、夹爪力矩保护和 ACK/ERROR 响应。
+- 支持边界检查、启动 ready 位姿、夹爪力矩保护和 ACK/ERROR 响应。
 
 ## 3. 总体技术架构
 
@@ -177,7 +177,6 @@ Linux 端成功解析和规划后返回 `ack`，失败时返回 `error`。ACK �
 - `steps`：完整动作序列。
 - `send_counts`：每个阶段下发位姿次数。
 - `dynamic_timing`：动态模式的到达时间、等待时间和跳过原因。
-- `guarded_execution`：下降保护执行结果。
 - `safe_gripper`：夹爪力矩保护结果。
 
 ## 6. 坐标系与数据转换
@@ -318,8 +317,6 @@ Linux 端可启用：
 
 - `--dynamic-preposition-clearance-mm`：预定位姿高于检测 Z 的距离。
 - `--final-action-time-s`：最后下降和闭合预留时间。
-- `--guarded-descent`：默认启用的分段下降保护。
-
 这种模式更适合传送带抓取，因为机械臂不必等到最后一刻才从 ready 点出发。
 
 ### 7.4 Probe 模式
@@ -436,7 +433,6 @@ ready_open
 - 支持控制速度：
   - `--startup-speed`
   - `--speed`
-  - `--guarded-descent-speed`
 - 支持每个 waypoint 重复下发一段时间：
   - `--command-duration-s`
   - `--command-period-s`
@@ -471,10 +467,6 @@ ready_open
 - 支持 Piper SDK 位姿合法性校验。
 - 支持碰撞保护等级配置：
   - `--collision-protection-level`
-- 默认支持 guarded descent 分段下降保护：
-  - 每次下降固定步长。
-  - 检查 J6 Z 反馈是否跟随命令下降。
-  - 若反馈没有按预期变化，则中止下降并返回安全高度。
 - 支持夹爪力矩保护：
   - `--safe-gripper-stop-on-effort`
   - `--max-gripper-effort-nm`
@@ -606,7 +598,6 @@ python3 -m robot_control.linux.catch.catch_server_1 \
 - `--place-x-mm/--place-y-mm` 定义 out 任务的固定放置点。
 - `--rx-deg/--ry-deg/--rz-deg` 定义固定腕部姿态。
 - `--min-target-x-mm` 等边界参数用于提前拒绝危险或不可达目标。
-- `--guarded-descent-zone-mm` 和 `--guarded-descent-step-mm` 决定保护下降的起点和步长。
 
 ## 12. 调试观察重点
 
@@ -663,7 +654,6 @@ task=... mode=...
 - `payload.dynamic_timing.skipped`
 - `payload.dynamic_timing.skip_reason`
 - `payload.dynamic_timing.too_close_skip_enabled`
-- `payload.guarded_execution.protected_abort`
 - `payload.safe_gripper.triggered`
 
 ## 13. 当前边界与注意事项

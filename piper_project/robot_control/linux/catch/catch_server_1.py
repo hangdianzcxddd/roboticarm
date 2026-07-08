@@ -148,18 +148,6 @@ class DynamicTiming:
 
 
 @dataclass(frozen=True)
-class GuardedDescentResult:
-    send_count: int
-    start_z_mm: float
-    target_z_mm: float
-    aborted: bool = False
-    reason: str | None = None
-    last_feedback_z_mm: float | None = None
-    last_follow_error_mm: float | None = None
-    last_progress_mm: float | None = None
-
-
-@dataclass(frozen=True)
 class SafeGripperResult:
     action: Action
     command_mm: float | None = None
@@ -305,17 +293,12 @@ class PlanarIkReuseState:
 @dataclass(frozen=True)
 class DynamicExecutionResult:
     send_counts: dict[str, int]
-    protected_abort: bool = False
-    protected_abort_reason: str | None = None
-    protected_abort_return: str | None = None
-    protected_abort_return_label: str | None = None
     preposition_z_mm: float | None = None
     preposition_source: str | None = None
     preposition_elapsed_s: float | None = None
     final_action_due_s: float | None = None
     final_wait_s: float | None = None
     final_action_late_s: float | None = None
-    guarded_descent: GuardedDescentResult | None = None
     safe_gripper_results: tuple[SafeGripperResult, ...] = ()
     joint_pitch_adjustments: tuple[JointPitchAdjustmentResult, ...] = ()
     grasp_yaw_adjustments: tuple[GraspYawAdjustmentResult, ...] = ()
@@ -464,7 +447,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=20.0,
         help=(
             "dynamic preposition clearance above detected_z_mm; when detected Z "
-            "is unavailable, falls back to grasp_z plus the guarded descent zone"
+            "is unavailable, falls back to grasp_z plus this clearance"
         ),
     )
     parser.add_argument(
@@ -477,79 +460,11 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--guarded-descent",
-        "--descent-protection",
-        action=argparse.BooleanOptionalAction,
-        dest="guarded_descent",
-        default=True,
-        help=(
-            "check J6 Z feedback during the final dynamic descent and abort if "
-            "the arm stops following the commanded Z; enabled by default, use "
-            "--no-guarded-descent or --no-descent-protection to disable"
-        ),
-    )
-    parser.add_argument("--guarded-descent-zone-mm", type=float, default=30.0)
-    parser.add_argument("--guarded-descent-step-mm", type=float, default=3.0)
-    parser.add_argument("--guarded-descent-speed", type=int, default=20)
-    parser.add_argument(
-        "--guarded-follow-error-mm",
-        type=float,
-        default=4.0,
-        help=(
-            "maximum allowed Z feedback lag from each guarded descent command "
-            "after the step wait; gripper close effort is not used for descent "
-            "collision protection"
-        ),
-    )
-    parser.add_argument("--guarded-stall-s", type=float, default=0.2)
-    parser.add_argument(
-        "--guarded-start-tolerance-mm",
-        type=float,
-        default=2.0,
-        help=(
-            "required Z feedback tolerance at the guarded descent start pose; "
-            "prevents starting descent while the arm is still above guard start"
-        ),
-    )
-    parser.add_argument(
-        "--guarded-start-timeout-s",
-        type=float,
-        default=1.0,
-        help="maximum time to wait for feedback to reach guarded descent start Z",
-    )
-    parser.add_argument(
-        "--guarded-progress-min-mm",
-        type=float,
-        default=1.0,
-        help=(
-            "minimum observed downward J6 feedback movement required after each "
-            "guarded descent command; 0 requires any measurable downward movement"
-        ),
-    )
-    parser.add_argument(
-        "--guarded-step-timeout-s",
-        type=float,
-        default=0.25,
-        help=(
-            "maximum time to wait for guarded descent feedback progress after "
-            "each step; defaults to --guarded-stall-s when 0"
-        ),
-    )
-    parser.add_argument(
         "--collision-protection-level",
         type=int,
         help=(
             "optional Piper SDK collision protection level applied to all six "
             "joints at startup; valid range is 0-8"
-        ),
-    )
-    parser.add_argument(
-        "--guarded-abort-return",
-        choices=("pick_above", "preposition", "none"),
-        default="pick_above",
-        help=(
-            "legacy abort-return selection. Guarded descent aborts now stop "
-            "the sequence without issuing an automatic return pose."
         ),
     )
     parser.add_argument(
@@ -1025,11 +940,6 @@ def validate_args(args: argparse.Namespace) -> None:
     if not math.isfinite(args.safe_gripper_poll_s) or args.safe_gripper_poll_s <= 0:
         raise ValueError("--safe-gripper-poll-s must be finite and > 0")
     if (
-        not isinstance(args.guarded_descent_speed, int)
-        or not 0 <= args.guarded_descent_speed <= 100
-    ):
-        raise ValueError("--guarded-descent-speed must be an integer in [0, 100]")
-    if (
         not isinstance(args.dynamic_pitch_speed, int)
         or not 0 <= args.dynamic_pitch_speed <= 100
     ):
@@ -1041,35 +951,17 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--grasp-yaw-speed must be an integer in [0, 100]")
     for name in (
         "dynamic_preposition_clearance_mm",
-        "guarded_descent_zone_mm",
-        "guarded_descent_step_mm",
-        "guarded_follow_error_mm",
-        "guarded_stall_s",
-        "guarded_start_tolerance_mm",
-        "guarded_start_timeout_s",
-        "guarded_progress_min_mm",
-        "guarded_step_timeout_s",
     ):
         value = float(getattr(args, name))
         if not math.isfinite(value) or value < 0:
             raise ValueError(f"--{name.replace('_', '-')} must be finite and >= 0")
     if args.dynamic_preposition_clearance_mm <= 0.0:
         raise ValueError("--dynamic-preposition-clearance-mm must be > 0")
-    if args.guarded_descent_zone_mm <= 0.0:
-        raise ValueError("--guarded-descent-zone-mm must be > 0")
-    if args.guarded_descent_step_mm <= 0.0:
-        raise ValueError("--guarded-descent-step-mm must be > 0")
-    if args.guarded_follow_error_mm <= 0.0:
-        raise ValueError("--guarded-follow-error-mm must be > 0")
-    if args.guarded_start_tolerance_mm <= 0.0:
-        raise ValueError("--guarded-start-tolerance-mm must be > 0")
     if args.collision_protection_level is not None and (
         not isinstance(args.collision_protection_level, int)
         or not 0 <= args.collision_protection_level <= 8
     ):
         raise ValueError("--collision-protection-level must be an integer in [0, 8]")
-    if getattr(args, "dynamic_pitch_mode", "joint") == "planar-ik" and args.guarded_descent:
-        raise ValueError("--dynamic-pitch-mode planar-ik requires --no-guarded-descent")
     if args.grasp_z_mm > args.transfer_z_mm:
         raise ValueError("--grasp-z-mm should not be above --transfer-z-mm")
     if args.place_pick_z_mm is not None and args.place_pick_z_mm > args.transfer_z_mm:
@@ -1883,165 +1775,19 @@ def dynamic_preposition_pose(
         requested_z_mm = float(detected_z_mm) + float(args.dynamic_preposition_clearance_mm)
         source = detected_source
     else:
-        requested_z_mm = target.grasp_z_mm + float(args.guarded_descent_zone_mm)
-        source = "grasp_z_plus_guarded_zone"
+        requested_z_mm = target.grasp_z_mm + float(
+            args.dynamic_preposition_clearance_mm
+        )
+        source = "grasp_z_plus_clearance"
 
     min_descent_z_mm = min(
         float(args.transfer_z_mm),
-        target.grasp_z_mm + float(args.guarded_descent_step_mm),
+        target.grasp_z_mm + 1.0,
     )
     z_mm = min(float(args.transfer_z_mm), max(requested_z_mm, min_descent_z_mm))
     if z_mm != requested_z_mm:
         source = f"{source}_clamped"
     return target_pose(args, target, z_mm), source
-
-
-def guarded_start_pose_for_grasp(
-    args: argparse.Namespace,
-    grasp_pose: EndPose,
-) -> EndPose:
-    z_mm = min(
-        float(args.transfer_z_mm),
-        grasp_pose.z_mm + float(args.guarded_descent_zone_mm),
-    )
-    return replace(grasp_pose, z_mm=z_mm)
-
-
-def should_guard_step(step: SequenceStep, args: argparse.Namespace) -> bool:
-    return bool(
-        args.guarded_descent
-        and step.gripper_after == "close"
-        and step.pose.z_mm < args.transfer_z_mm
-    )
-
-
-def guarded_abort_return_step(
-    args: argparse.Namespace,
-    steps: tuple[SequenceStep, ...],
-    step_index: int,
-    fallback_pose: EndPose,
-) -> SequenceStep | None:
-    if args.guarded_abort_return == "none":
-        return None
-    if args.guarded_abort_return == "preposition":
-        return SequenceStep(
-            "protected_abort_return_preposition",
-            fallback_pose,
-            args.vertical_mode,
-        )
-    for prior_step in reversed(steps[:step_index]):
-        same_xy = (
-            abs(prior_step.pose.x_mm - steps[step_index].pose.x_mm) <= 1e-6
-            and abs(prior_step.pose.y_mm - steps[step_index].pose.y_mm) <= 1e-6
-        )
-        above_target = prior_step.pose.z_mm > steps[step_index].pose.z_mm
-        if same_xy and above_target:
-            return SequenceStep(
-                f"protected_abort_return_{prior_step.label}",
-                prior_step.pose,
-                args.vertical_mode,
-            )
-    return SequenceStep(
-        "protected_abort_return_pick_above",
-        replace(steps[step_index].pose, z_mm=args.transfer_z_mm),
-        args.vertical_mode,
-    )
-
-
-def dynamic_protected_abort_return_step(
-    args: argparse.Namespace,
-    *,
-    pick_above_pose: EndPose,
-    preposition_pose: EndPose,
-) -> tuple[SequenceStep | None, str | None]:
-    if args.guarded_abort_return == "none":
-        return None, None
-    if args.guarded_abort_return == "preposition":
-        return (
-            SequenceStep(
-                "protected_abort_return_preposition",
-                preposition_pose,
-                args.vertical_mode,
-            ),
-            "preposition",
-        )
-    return (
-        SequenceStep(
-            "protected_abort_return_pick_above",
-            pick_above_pose,
-            args.vertical_mode,
-        ),
-        "pick_above",
-    )
-
-
-def execute_protected_abort_return(
-    controller: PiperController,
-    args: argparse.Namespace,
-    counts: dict[str, int],
-    gripper_results: list[SafeGripperResult],
-    joint_pitch_adjustments: list[JointPitchAdjustmentResult],
-    planar_ik_results: list[PlanarIkExecutionResult],
-    abort_step: SequenceStep | None,
-    planar_ik_reuse_state: PlanarIkReuseState | None = None,
-) -> tuple[str | None, str | None]:
-    if abort_step is None:
-        return None, None
-    counts[abort_step.label] = execute_and_record_step(
-        controller,
-        args,
-        abort_step,
-        gripper_results,
-        joint_pitch_adjustments,
-        planar_ik_results,
-        planar_ik_reuse_state,
-    )
-    abort_return = None
-    if abort_step.label.startswith("protected_abort_return_"):
-        abort_return = abort_step.label.removeprefix("protected_abort_return_")
-    return abort_return, abort_step.label
-
-
-def safe_gripper_abort_reason(result: SafeGripperResult) -> str:
-    effort = (
-        "unknown" if result.last_effort_nm is None else f"{result.last_effort_nm:.3f}Nm"
-    )
-    threshold = (
-        "unknown" if result.max_effort_nm is None else f"{result.max_effort_nm:.3f}Nm"
-    )
-    return (
-        "safe gripper effort threshold exceeded: "
-        f"effort={effort} threshold={threshold}"
-    )
-
-
-def wait_until_guarded_start_reached(
-    controller: PiperController,
-    args: argparse.Namespace,
-    start_pose: EndPose,
-) -> tuple[bool, str | None, float | None]:
-    timeout_s = float(args.guarded_start_timeout_s)
-    deadline = time.monotonic() + timeout_s
-    last_z_mm: float | None = None
-    tolerance_mm = float(args.guarded_start_tolerance_mm)
-    while timeout_s == 0.0 or time.monotonic() < deadline:
-        feedback_pose = feedback_to_pose(controller.get_end_pose())
-        if feedback_pose is not None:
-            last_z_mm = float(feedback_pose.z_mm)
-            if abs(last_z_mm - float(start_pose.z_mm)) <= tolerance_mm:
-                return True, None, last_z_mm
-        if timeout_s == 0.0:
-            break
-        time.sleep(min(max(float(args.command_period_s), 0.005), 0.05))
-    return (
-        False,
-        "guarded descent start not reached: "
-        f"target_z={start_pose.z_mm:.3f}mm "
-        f"feedback_z={last_z_mm}mm "
-        f"tolerance={tolerance_mm:.3f}mm "
-        f"timeout={timeout_s:.3f}s",
-        last_z_mm,
-    )
 
 
 def wait_for_dynamic_final_action(
@@ -2089,211 +1835,6 @@ def use_dynamic_nowait(args: argparse.Namespace) -> bool:
         getattr(args, "dynamic_preposition", False)
         and getattr(args, "dynamic_wait_placement", "wait") == "nowait"
     )
-
-
-def execute_guarded_descent(
-    controller: PiperController,
-    args: argparse.Namespace,
-    *,
-    start_pose: EndPose,
-    target_pose: EndPose,
-) -> GuardedDescentResult:
-    start_z_mm = float(start_pose.z_mm)
-    target_z_mm = float(target_pose.z_mm)
-    if start_z_mm <= target_z_mm:
-        return GuardedDescentResult(
-            send_count=0,
-            start_z_mm=start_z_mm,
-            target_z_mm=target_z_mm,
-            aborted=True,
-            reason=(
-                "guarded descent start is not above target: "
-                f"start_z={start_z_mm:.3f} target_z={target_z_mm:.3f}"
-            ),
-        )
-    start_reached, start_reason, start_feedback_z_mm = wait_until_guarded_start_reached(
-        controller,
-        args,
-        start_pose,
-    )
-    if not start_reached:
-        return GuardedDescentResult(
-            send_count=0,
-            start_z_mm=start_z_mm,
-            target_z_mm=target_z_mm,
-            aborted=True,
-            reason=start_reason,
-            last_feedback_z_mm=start_feedback_z_mm,
-        )
-
-    print(
-        "Running guarded_descent: "
-        f"z {start_z_mm:.3f}->{target_z_mm:.3f} mm "
-        f"step={args.guarded_descent_step_mm:.3f}mm "
-        f"speed={args.guarded_descent_speed}",
-        flush=True,
-    )
-    send_count = 0
-    commanded_z_mm = start_z_mm
-    last_feedback_z_mm: float | None = start_feedback_z_mm
-    last_follow_error_mm: float | None = None
-    last_progress_mm: float | None = None
-    while commanded_z_mm > target_z_mm:
-        previous_feedback_z_mm = last_feedback_z_mm
-        if previous_feedback_z_mm is None:
-            previous_pose = feedback_to_pose(controller.get_end_pose())
-            if previous_pose is not None:
-                previous_feedback_z_mm = float(previous_pose.z_mm)
-        next_commanded_z_mm = max(
-            target_z_mm,
-            commanded_z_mm - float(args.guarded_descent_step_mm),
-        )
-        commanded_drop_mm = commanded_z_mm - next_commanded_z_mm
-        commanded_z_mm = next_commanded_z_mm
-        command_pose = replace(target_pose, z_mm=commanded_z_mm)
-        controller.move_to_pose(
-            command_pose,
-            speed_percent=args.guarded_descent_speed,
-            move_mode=args.vertical_mode,
-        )
-        send_count += 1
-        (
-            aborted,
-            reason,
-            last_feedback_z_mm,
-            last_follow_error_mm,
-            last_progress_mm,
-        ) = (
-            guarded_step_abort_status(
-                controller,
-                args,
-                command_pose,
-                previous_feedback_z_mm=previous_feedback_z_mm,
-                commanded_drop_mm=commanded_drop_mm,
-            )
-        )
-        if args.print_feedback:
-            print(
-                "Guarded step feedback: "
-                f"command_z={command_pose.z_mm:.3f}mm "
-                f"feedback_z={last_feedback_z_mm}mm "
-                f"progress={last_progress_mm}mm "
-                f"follow_error={last_follow_error_mm}mm",
-                flush=True,
-            )
-        if aborted:
-            controller.emergency_stop()
-            return GuardedDescentResult(
-                send_count=send_count,
-                start_z_mm=start_z_mm,
-                target_z_mm=target_z_mm,
-                aborted=True,
-                reason=reason,
-                last_feedback_z_mm=last_feedback_z_mm,
-                last_follow_error_mm=last_follow_error_mm,
-                last_progress_mm=last_progress_mm,
-            )
-    return GuardedDescentResult(
-        send_count=send_count,
-        start_z_mm=start_z_mm,
-        target_z_mm=target_z_mm,
-        last_feedback_z_mm=last_feedback_z_mm,
-        last_follow_error_mm=last_follow_error_mm,
-        last_progress_mm=last_progress_mm,
-    )
-
-
-def guarded_step_abort_status(
-    controller: PiperController,
-    args: argparse.Namespace,
-    command_pose: EndPose,
-    *,
-    previous_feedback_z_mm: float | None = None,
-    commanded_drop_mm: float | None = None,
-) -> tuple[bool, str | None, float | None, float | None, float | None]:
-    timeout_s = (
-        float(args.guarded_step_timeout_s)
-        if float(args.guarded_step_timeout_s) > 0.0
-        else float(args.guarded_stall_s)
-    )
-    deadline = time.monotonic() + timeout_s
-    last_feedback_z_mm: float | None = None
-    last_follow_error_mm: float | None = None
-    last_progress_mm: float | None = None
-    progress_min_mm = float(args.guarded_progress_min_mm)
-    required_progress_mm = progress_min_mm
-    if commanded_drop_mm is not None and commanded_drop_mm > 0.0 and progress_min_mm > 0.0:
-        required_progress_mm = min(progress_min_mm, commanded_drop_mm)
-    while True:
-        feedback_pose = feedback_to_pose(controller.get_end_pose())
-        if feedback_pose is not None:
-            last_feedback_z_mm = float(feedback_pose.z_mm)
-            last_follow_error_mm = last_feedback_z_mm - float(command_pose.z_mm)
-            if previous_feedback_z_mm is not None:
-                last_progress_mm = previous_feedback_z_mm - last_feedback_z_mm
-            progress_ok = (
-                last_progress_mm is not None
-                and (
-                    last_progress_mm > 0.0
-                    if required_progress_mm <= 0.0
-                    else last_progress_mm >= required_progress_mm
-                )
-            )
-            follow_error_ok = last_follow_error_mm <= float(args.guarded_follow_error_mm)
-            if progress_ok and follow_error_ok:
-                return (
-                    False,
-                    None,
-                    last_feedback_z_mm,
-                    last_follow_error_mm,
-                    last_progress_mm,
-                )
-        if time.monotonic() >= deadline:
-            if last_feedback_z_mm is None:
-                return (
-                    True,
-                    "no valid J6 feedback during guarded descent",
-                    None,
-                    None,
-                    None,
-                )
-            progress_ok = (
-                last_progress_mm is not None
-                and (
-                    last_progress_mm > 0.0
-                    if required_progress_mm <= 0.0
-                    else last_progress_mm >= required_progress_mm
-                )
-            )
-            if progress_ok:
-                return (
-                    True,
-                    "guarded descent feedback did not reach commanded height "
-                    f"within {timeout_s:.3f}s: "
-                    f"command_z={command_pose.z_mm:.3f}mm "
-                    f"previous_feedback_z={previous_feedback_z_mm}mm "
-                    f"feedback_z={last_feedback_z_mm:.3f}mm "
-                    f"progress={last_progress_mm}mm "
-                    f"follow_error={last_follow_error_mm}mm "
-                    f"limit={args.guarded_follow_error_mm:.3f}mm",
-                    last_feedback_z_mm,
-                    last_follow_error_mm,
-                    last_progress_mm,
-                )
-            return (
-                True,
-                "guarded descent height did not decrease "
-                f"{required_progress_mm:.3f} mm within {timeout_s:.3f}s: "
-                f"command_z={command_pose.z_mm:.3f}mm "
-                f"previous_feedback_z={previous_feedback_z_mm}mm "
-                f"feedback_z={last_feedback_z_mm:.3f}mm "
-                f"progress={last_progress_mm}mm "
-                f"follow_error={last_follow_error_mm}mm",
-                last_feedback_z_mm,
-                last_follow_error_mm,
-                last_progress_mm,
-            )
-        time.sleep(min(max(float(args.command_period_s), 0.005), 0.05))
 
 
 def yolo_metadata_from_message(message: dict[str, Any]) -> dict[str, Any]:
@@ -3937,7 +3478,6 @@ def execute_plan(
         print(f"Before catch J6: {format_pose(before_pose)}", flush=True)
 
     counts: dict[str, int] = {}
-    guarded_result: GuardedDescentResult | None = None
     gripper_results: list[SafeGripperResult] = []
     joint_pitch_adjustments: list[JointPitchAdjustmentResult] = []
     grasp_yaw_adjustments: list[GraspYawAdjustmentResult] = []
@@ -3988,55 +3528,6 @@ def execute_plan(
                     use_planar_ik_yaw(args) and active_step.planar_ik
                 ),
             )
-        if should_guard_step(active_step, args):
-            guarded_start_pose = guarded_start_pose_for_grasp(args, active_step.pose)
-            guarded_start_step = SequenceStep(
-                f"{active_step.label}_guard_start",
-                guarded_start_pose,
-                args.vertical_mode,
-                None,
-                active_step.delay_before_s,
-            )
-            counts[guarded_start_step.label] = execute_and_record_step(
-                controller,
-                args,
-                guarded_start_step,
-                gripper_results,
-                joint_pitch_adjustments,
-                planar_ik_results,
-                planar_ik_reuse_state,
-            )
-            guarded_result = execute_guarded_descent(
-                controller,
-                args,
-                start_pose=guarded_start_pose,
-                target_pose=active_step.pose,
-            )
-            counts[active_step.label] = guarded_result.send_count
-            if guarded_result.aborted:
-                reason = guarded_result.reason or "guarded descent aborted"
-                print(f"Protected abort: {reason}", flush=True)
-                return DynamicExecutionResult(
-                    send_counts=counts,
-                    protected_abort=True,
-                    protected_abort_reason=reason,
-                    guarded_descent=guarded_result,
-                    safe_gripper_results=tuple(gripper_results),
-                    joint_pitch_adjustments=tuple(joint_pitch_adjustments),
-                    grasp_yaw_adjustments=tuple(grasp_yaw_adjustments),
-                    planar_ik_results=tuple(planar_ik_results),
-                )
-            pitch_adjustment = apply_joint_pitch_adjustment(
-                controller,
-                args,
-                active_step,
-                phase="after_guarded_descent",
-            )
-            if pitch_adjustment is not None:
-                joint_pitch_adjustments.append(pitch_adjustment)
-            gripper_result = send_gripper(controller, args, active_step.gripper_after)
-            record_gripper_result(gripper_results, gripper_result)
-            continue
         send_count, gripper_result = execute_step(
             controller,
             args,
@@ -4057,7 +3548,6 @@ def execute_plan(
         print(f"Catch send counts: {counts}", flush=True)
     return DynamicExecutionResult(
         send_counts=counts,
-        guarded_descent=guarded_result,
         safe_gripper_results=tuple(gripper_results),
         joint_pitch_adjustments=tuple(joint_pitch_adjustments),
         grasp_yaw_adjustments=tuple(grasp_yaw_adjustments),
@@ -4180,7 +3670,6 @@ def execute_dynamic_preposition_plan(
         planar_ik_results,
         planar_ik_reuse_state,
     )
-    preposition_pose_for_descent = preposition_step.pose
     preposition_elapsed_s = time.monotonic() - started_s
     final_wait_s = wait_for_dynamic_final_action(
         timing,
@@ -4190,56 +3679,17 @@ def execute_dynamic_preposition_plan(
     )
     final_action_late_s = max(0.0, preposition_elapsed_s - final_action_due_s)
 
-    guarded_result: GuardedDescentResult | None = None
-    if args.guarded_descent:
-        guarded_result = execute_guarded_descent(
-            controller,
-            args,
-            start_pose=preposition_pose_for_descent,
-            target_pose=grasp_step.pose,
-        )
-        counts[grasp_step.label] = guarded_result.send_count
-        if guarded_result.aborted:
-            reason = guarded_result.reason or "guarded descent aborted"
-            print(f"Protected abort: {reason}", flush=True)
-            return DynamicExecutionResult(
-                send_counts=counts,
-                protected_abort=True,
-                protected_abort_reason=reason,
-                preposition_z_mm=preposition_pose.z_mm,
-                preposition_source=preposition_source,
-                preposition_elapsed_s=preposition_elapsed_s,
-                final_action_due_s=final_action_due_s,
-                final_wait_s=final_wait_s,
-                final_action_late_s=final_action_late_s,
-                guarded_descent=guarded_result,
-                safe_gripper_results=tuple(gripper_results),
-                joint_pitch_adjustments=tuple(joint_pitch_adjustments),
-                grasp_yaw_adjustments=tuple(grasp_yaw_adjustments),
-                planar_ik_results=tuple(planar_ik_results),
-            )
-        pitch_adjustment = apply_joint_pitch_adjustment(
-            controller,
-            args,
-            grasp_step,
-            phase="after_guarded_descent",
-        )
-        if pitch_adjustment is not None:
-            joint_pitch_adjustments.append(pitch_adjustment)
-        gripper_result = send_gripper(controller, args, grasp_step.gripper_after)
-        record_gripper_result(gripper_results, gripper_result)
-    else:
-        send_count, gripper_result = execute_step(
-            controller,
-            args,
-            grasp_step,
-            joint_pitch_adjustments=joint_pitch_adjustments,
-            grasp_yaw_adjustments=grasp_yaw_adjustments,
-            planar_ik_results=planar_ik_results,
-            planar_ik_reuse_state=planar_ik_reuse_state,
-        )
-        counts[grasp_step.label] = send_count
-        record_gripper_result(gripper_results, gripper_result)
+    send_count, gripper_result = execute_step(
+        controller,
+        args,
+        grasp_step,
+        joint_pitch_adjustments=joint_pitch_adjustments,
+        grasp_yaw_adjustments=grasp_yaw_adjustments,
+        planar_ik_results=planar_ik_results,
+        planar_ik_reuse_state=planar_ik_reuse_state,
+    )
+    counts[grasp_step.label] = send_count
+    record_gripper_result(gripper_results, gripper_result)
 
     counts[lift_step.label] = execute_and_record_step(
         controller,
@@ -4276,7 +3726,6 @@ def execute_dynamic_preposition_plan(
         final_action_due_s=final_action_due_s,
         final_wait_s=final_wait_s,
         final_action_late_s=final_action_late_s,
-        guarded_descent=guarded_result,
         safe_gripper_results=tuple(gripper_results),
         joint_pitch_adjustments=tuple(joint_pitch_adjustments),
         grasp_yaw_adjustments=tuple(grasp_yaw_adjustments),
@@ -4509,42 +3958,8 @@ def handle_message(
                 ),
             },
             "skipped": skipped,
-            "protected_abort": execution.protected_abort,
-            "protected_abort_reason": execution.protected_abort_reason,
         }
     )
-    guarded_execution: dict[str, Any] = {
-        "guarded_descent_enabled": bool(args.guarded_descent),
-        "protected_abort": execution.protected_abort,
-        "protected_abort_reason": execution.protected_abort_reason,
-        "protected_abort_return": execution.protected_abort_return,
-        "protected_abort_return_label": execution.protected_abort_return_label,
-    }
-    if execution.guarded_descent is not None:
-        guarded_execution["guarded_descent"] = {
-            "send_count": execution.guarded_descent.send_count,
-            "start_z_mm": execution.guarded_descent.start_z_mm,
-            "target_z_mm": execution.guarded_descent.target_z_mm,
-            "aborted": execution.guarded_descent.aborted,
-            "reason": execution.guarded_descent.reason,
-            "last_feedback_z_mm": execution.guarded_descent.last_feedback_z_mm,
-            "last_follow_error_mm": execution.guarded_descent.last_follow_error_mm,
-            "last_progress_mm": execution.guarded_descent.last_progress_mm,
-            "zone_mm": args.guarded_descent_zone_mm,
-            "step_mm": args.guarded_descent_step_mm,
-            "speed": args.guarded_descent_speed,
-            "follow_error_mm": args.guarded_follow_error_mm,
-            "stall_s": args.guarded_stall_s,
-            "start_tolerance_mm": args.guarded_start_tolerance_mm,
-            "start_timeout_s": args.guarded_start_timeout_s,
-            "progress_min_mm": args.guarded_progress_min_mm,
-            "step_timeout_s": (
-                args.guarded_step_timeout_s
-                if args.guarded_step_timeout_s > 0.0
-                else args.guarded_stall_s
-            ),
-        }
-    response["payload"]["guarded_execution"] = guarded_execution
     if timing is not None:
         response["payload"]["dynamic_timing"] = {
             "t_arrive_s": timing.t_arrive_s,
@@ -4580,7 +3995,6 @@ def handle_message(
         dynamic_execution: dict[str, Any] = {
             "preposition_enabled": bool(args.dynamic_preposition),
             "wait_placement": args.dynamic_wait_placement,
-            "guarded_descent_enabled": bool(args.guarded_descent),
             "preposition_z_mm": execution.preposition_z_mm,
             "preposition_source": execution.preposition_source,
             "preposition_clearance_mm": args.dynamic_preposition_clearance_mm,
@@ -4588,13 +4002,7 @@ def handle_message(
             "final_action_due_s": execution.final_action_due_s,
             "final_wait_s": execution.final_wait_s,
             "final_action_late_s": execution.final_action_late_s,
-            "protected_abort": execution.protected_abort,
-            "protected_abort_reason": execution.protected_abort_reason,
-            "protected_abort_return": execution.protected_abort_return,
-            "protected_abort_return_label": execution.protected_abort_return_label,
         }
-        if "guarded_descent" in guarded_execution:
-            dynamic_execution["guarded_descent"] = guarded_execution["guarded_descent"]
         response["payload"]["dynamic_execution"] = dynamic_execution
     if metadata:
         response["payload"]["yolo"] = metadata

@@ -19,7 +19,6 @@ from robot_control.linux.catch.catch_server_1 import (
     dynamic_preposition_pose,
     dynamic_timing_from_command,
     apply_grasp_yaw_adjustment,
-    guarded_step_abort_status,
     handle_message,
     move_to_start_ready,
     PlanarIkSolution,
@@ -63,17 +62,6 @@ def make_args(**overrides: object) -> argparse.Namespace:
         "dynamic_wait_placement": "wait",
         "dynamic_preposition_clearance_mm": 20.0,
         "final_action_time_s": 0.55,
-        "guarded_descent": True,
-        "guarded_descent_zone_mm": 30.0,
-        "guarded_descent_step_mm": 3.0,
-        "guarded_descent_speed": 20,
-        "guarded_follow_error_mm": 4.0,
-        "guarded_stall_s": 0.2,
-        "guarded_start_tolerance_mm": 2.0,
-        "guarded_start_timeout_s": 1.0,
-        "guarded_progress_min_mm": 1.0,
-        "guarded_step_timeout_s": 0.25,
-        "guarded_abort_return": "pick_above",
         "collision_protection_level": None,
         "no_start_ready": False,
         "ready_x_mm": 350.0,
@@ -306,20 +294,16 @@ def joint_feedback_from_degrees(*joints_deg: float) -> FakeJointFeedback:
 
 
 class TestCatchServer1(unittest.TestCase):
-    def test_parser_defaults_enable_guarded_descent_with_overridable_values(self):
+    def test_parser_rejects_removed_descent_protection_options(self):
         args = build_parser().parse_args([])
 
-        self.assertTrue(args.guarded_descent)
-        self.assertAlmostEqual(args.guarded_descent_zone_mm, 30.0)
-        self.assertAlmostEqual(args.guarded_descent_step_mm, 3.0)
-        self.assertEqual(args.guarded_descent_speed, 20)
-        self.assertAlmostEqual(args.guarded_follow_error_mm, 4.0)
-        self.assertAlmostEqual(args.guarded_stall_s, 0.2)
-        self.assertAlmostEqual(args.guarded_start_tolerance_mm, 2.0)
-        self.assertAlmostEqual(args.guarded_start_timeout_s, 1.0)
-        self.assertAlmostEqual(args.guarded_progress_min_mm, 1.0)
-        self.assertAlmostEqual(args.guarded_step_timeout_s, 0.25)
-        self.assertEqual(args.guarded_abort_return, "pick_above")
+        self.assertFalse(hasattr(args, "guarded_descent"))
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                build_parser().parse_args(["--no-descent-protection"])
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                build_parser().parse_args(["--guarded-descent"])
         self.assertEqual(args.startup_speed, 10)
         self.assertAlmostEqual(args.place_x_mm, 60.0)
         self.assertAlmostEqual(args.place_y_mm, 270.0)
@@ -375,11 +359,6 @@ class TestCatchServer1(unittest.TestCase):
 
         args = build_parser().parse_args(
             [
-                "--no-guarded-descent",
-                "--guarded-descent-speed",
-                "12",
-                "--guarded-follow-error-mm",
-                "6",
                 "--startup-speed",
                 "9",
                 "--planar-ik-speed",
@@ -405,9 +384,6 @@ class TestCatchServer1(unittest.TestCase):
             ]
         )
 
-        self.assertFalse(args.guarded_descent)
-        self.assertEqual(args.guarded_descent_speed, 12)
-        self.assertAlmostEqual(args.guarded_follow_error_mm, 6.0)
         self.assertEqual(args.startup_speed, 9)
         self.assertEqual(args.planar_ik_speed, 25)
         self.assertEqual(args.dynamic_wait_placement, "nowait")
@@ -440,15 +416,6 @@ class TestCatchServer1(unittest.TestCase):
         self.assertTrue(args.dynamic_pitch_by_x)
         self.assertAlmostEqual(args.pitch_deg_per_mm_far, 0.07)
         self.assertAlmostEqual(args.pitch_deg_per_mm_near, 0.07)
-
-    def test_parser_accepts_descent_protection_alias(self):
-        args = build_parser().parse_args(["--no-descent-protection"])
-        self.assertFalse(args.guarded_descent)
-
-        args = build_parser().parse_args(
-            ["--no-guarded-descent", "--descent-protection"]
-        )
-        self.assertTrue(args.guarded_descent)
 
     def test_parser_accepts_grasp_z_alias(self):
         args = build_parser().parse_args(["--grasp-z", "133"])
@@ -959,7 +926,6 @@ class TestCatchServer1(unittest.TestCase):
         args = make_args(
             dynamic_preposition=True,
             dynamic_preposition_clearance_mm=20.0,
-            guarded_descent_zone_mm=30.0,
         )
         camera_to_base = np.eye(4, dtype=float)
         command = CameraPointCommand(
@@ -986,7 +952,6 @@ class TestCatchServer1(unittest.TestCase):
         args = make_args(
             dynamic_preposition=True,
             dynamic_preposition_clearance_mm=20.0,
-            guarded_descent_zone_mm=30.0,
             use_detected_z="top",
         )
         camera_to_base = np.eye(4, dtype=float)
@@ -1237,7 +1202,6 @@ class TestCatchServer1(unittest.TestCase):
             grasp_only=True,
             no_return_ready=True,
             no_gripper=False,
-            guarded_descent=False,
             grasp_yaw_by_object_short_edge=True,
             grasp_yaw_max_delta_deg=30.0,
             grasp_yaw_deadband_deg=0.0,
@@ -1633,18 +1597,13 @@ class TestCatchServer1(unittest.TestCase):
         self.assertEqual(timing.t_robot_segment, "reference")
         self.assertAlmostEqual(timing.t_robot_slope_s_per_mm, 0.0)
 
-    def test_execute_dynamic_preposition_guarded_descent_success(self):
+    def test_execute_dynamic_preposition_direct_descent_success(self):
         args = make_args(
             execute=True,
             grasp_only=True,
             no_return_ready=True,
             dynamic_preposition=True,
             final_action_time_s=0.0,
-            guarded_descent=True,
-            guarded_descent_step_mm=5.0,
-            guarded_descent_speed=15,
-            guarded_follow_error_mm=8.0,
-            guarded_stall_s=0.0,
         )
         camera_to_base = np.eye(4, dtype=float)
         message = make_camera_point_message(
@@ -1652,7 +1611,7 @@ class TestCatchServer1(unittest.TestCase):
                 x_m=0.35,
                 y_m=0.02,
                 z_m=0.30,
-                command_id="cmd-dynamic-guard-ok",
+                command_id="cmd-dynamic-direct-descent",
                 grasp_mode="dynamic",
                 t_arrive_s=0.0,
                 conveyor_speed_mm_s=100.0,
@@ -1675,15 +1634,11 @@ class TestCatchServer1(unittest.TestCase):
             )
 
         self.assertTrue(response["payload"]["executed"])
-        self.assertFalse(response["payload"]["protected_abort"])
         self.assertAlmostEqual(
             response["payload"]["dynamic_execution"]["preposition_z_mm"],
             140.0,
         )
-        self.assertEqual(
-            response["payload"]["dynamic_execution"]["guarded_descent"]["send_count"],
-            2,
-        )
+        self.assertNotIn("guarded_descent", response["payload"]["dynamic_execution"])
         gripper_calls = [call for call in controller.sdk.calls if call[0] == "GripperCtrl"]
         self.assertEqual(
             gripper_calls,
@@ -1693,7 +1648,7 @@ class TestCatchServer1(unittest.TestCase):
             ],
         )
         end_pose_calls = [call for call in controller.sdk.calls if call[0] == "EndPoseCtrl"]
-        self.assertGreaterEqual(len(end_pose_calls), 6)
+        self.assertGreaterEqual(len(end_pose_calls), 5)
 
     def test_execute_dynamic_preposition_reports_final_timing_window(self):
         args = make_args(
@@ -1746,7 +1701,6 @@ class TestCatchServer1(unittest.TestCase):
             dynamic_wait_placement="nowait",
             final_action_time_s=0.25,
             t_robot_s=2.80,
-            guarded_descent=False,
         )
         camera_to_base = np.eye(4, dtype=float)
         message = make_camera_point_message(
@@ -1835,7 +1789,6 @@ class TestCatchServer1(unittest.TestCase):
             no_return_ready=True,
             dynamic_preposition=True,
             final_action_time_s=0.0,
-            guarded_descent=False,
             grasp_yaw_by_object_short_edge=True,
             grasp_yaw_max_delta_deg=30.0,
             grasp_yaw_deadband_deg=0.0,
@@ -1908,208 +1861,6 @@ class TestCatchServer1(unittest.TestCase):
         self.assertLess(pick_grasp_index, close_index)
         self.assertEqual(calls[dynamic_preposition_index][1][5], 20000)
         self.assertEqual(calls[pick_grasp_index][1][5], 20000)
-
-    def test_execute_dynamic_preposition_guarded_descent_abort_stops_without_return(self):
-        args = make_args(
-            execute=True,
-            grasp_only=True,
-            no_return_ready=True,
-            dynamic_preposition=True,
-            final_action_time_s=0.0,
-            guarded_descent=True,
-            guarded_descent_step_mm=3.0,
-            guarded_descent_speed=15,
-            guarded_follow_error_mm=2.0,
-            guarded_stall_s=0.0,
-            guarded_progress_min_mm=0.0,
-            guarded_abort_return="pick_above",
-        )
-        camera_to_base = np.eye(4, dtype=float)
-        message = make_camera_point_message(
-            CameraPointCommand(
-                x_m=0.35,
-                y_m=0.02,
-                z_m=0.30,
-                command_id="cmd-dynamic-guard-abort",
-                grasp_mode="dynamic",
-                t_arrive_s=0.0,
-                conveyor_speed_mm_s=100.0,
-                pick_x_mm=350.0,
-                pick_y_mm=-30.0,
-                detected_z_mm=120.0,
-            )
-        )
-        controller = make_feedback_controller(
-            EndPose(350.0, 0.0, 253.252, -176.794223, 0.889438, -105.490597),
-            stall_z_mm=140.0,
-        )
-
-        with contextlib.redirect_stdout(io.StringIO()):
-            response = handle_message(
-                message,
-                args=args,
-                camera_to_base=camera_to_base,
-                validator=controller,
-                controller=controller,
-        )
-
-        self.assertTrue(response["payload"]["executed"])
-        self.assertTrue(response["payload"]["protected_abort"])
-        self.assertIn(
-            "height did not decrease",
-            response["payload"]["protected_abort_reason"],
-        )
-        self.assertIsNone(response["payload"]["dynamic_execution"]["protected_abort_return"])
-        self.assertIsNone(
-            response["payload"]["dynamic_execution"]["protected_abort_return_label"]
-        )
-        self.assertEqual(
-            response["payload"]["dynamic_execution"]["guarded_descent"]["send_count"],
-            1,
-        )
-        self.assertEqual(
-            set(response["payload"]["send_counts"].keys()),
-            {
-                "ready_open",
-                "pick_above",
-                "dynamic_preposition",
-                "pick_grasp",
-            },
-        )
-        gripper_calls = [call for call in controller.sdk.calls if call[0] == "GripperCtrl"]
-        self.assertEqual(
-            gripper_calls,
-            [
-                ("GripperCtrl", (0, 1000, 0x01, 0)),
-            ],
-        )
-        self.assertEqual(
-            controller.sdk.calls.count(
-                ("EndPoseCtrl", (350000, -30000, 253252, -176794, 889, -105491))
-            ),
-            1,
-        )
-        self.assertEqual(controller.sdk.calls[-1], ("EmergencyStop", (0x01,)))
-
-    def test_guarded_descent_progress_check_aborts_when_feedback_z_stalls(self):
-        args = make_args(
-            execute=True,
-            grasp_only=True,
-            no_return_ready=True,
-            dynamic_preposition=True,
-            final_action_time_s=0.0,
-            guarded_descent=True,
-            guarded_descent_step_mm=3.0,
-            guarded_descent_speed=25,
-            guarded_follow_error_mm=8.0,
-            guarded_stall_s=0.0,
-            guarded_progress_min_mm=1.0,
-            guarded_abort_return="pick_above",
-        )
-        camera_to_base = np.eye(4, dtype=float)
-        message = make_camera_point_message(
-            CameraPointCommand(
-                x_m=0.35,
-                y_m=0.02,
-                z_m=0.30,
-                command_id="cmd-dynamic-progress-abort",
-                grasp_mode="dynamic",
-                t_arrive_s=0.0,
-                conveyor_speed_mm_s=100.0,
-                pick_x_mm=350.0,
-                pick_y_mm=-30.0,
-                detected_z_mm=120.0,
-            )
-        )
-        controller = make_feedback_controller(
-            EndPose(350.0, 0.0, 253.252, -176.794223, 0.889438, -105.490597),
-            stall_z_mm=140.0,
-        )
-
-        with contextlib.redirect_stdout(io.StringIO()):
-            response = handle_message(
-                message,
-                args=args,
-                camera_to_base=camera_to_base,
-                validator=controller,
-                controller=controller,
-            )
-
-        self.assertTrue(response["payload"]["executed"])
-        self.assertTrue(response["payload"]["protected_abort"])
-        self.assertIn(
-            "height did not decrease",
-            response["payload"]["protected_abort_reason"],
-        )
-        guarded = response["payload"]["dynamic_execution"]["guarded_descent"]
-        self.assertEqual(guarded["send_count"], 1)
-        self.assertEqual(guarded["progress_min_mm"], 1.0)
-        self.assertLess(guarded["last_progress_mm"], 1.0)
-        self.assertEqual(
-            set(response["payload"]["send_counts"].keys()),
-            {
-                "ready_open",
-                "pick_above",
-                "dynamic_preposition",
-                "pick_grasp",
-            },
-        )
-
-    def test_guarded_step_waits_for_follow_error_to_recover_within_timeout(self):
-        args = make_args(
-            guarded_follow_error_mm=10.0,
-            guarded_progress_min_mm=0.0,
-            guarded_step_timeout_s=0.2,
-            command_period_s=0.005,
-        )
-        command_pose = EndPose(350.0, -30.0, 154.0, 180.0, 14.795, 168.0)
-        controller = make_sequenced_feedback_controller(
-            [
-                EndPose(350.0, -30.0, 165.478, 180.0, 14.795, 168.0),
-                EndPose(350.0, -30.0, 154.0, 180.0, 14.795, 168.0),
-            ]
-        )
-
-        aborted, reason, feedback_z, follow_error, progress = guarded_step_abort_status(
-            controller,
-            args,
-            command_pose,
-            previous_feedback_z_mm=165.478,
-        )
-
-        self.assertFalse(aborted)
-        self.assertIsNone(reason)
-        self.assertAlmostEqual(feedback_z, 154.0)
-        self.assertAlmostEqual(follow_error, 0.0)
-        self.assertAlmostEqual(progress, 11.478)
-
-    def test_guarded_step_aborts_when_progress_does_not_reach_commanded_height(self):
-        args = make_args(
-            guarded_follow_error_mm=6.0,
-            guarded_progress_min_mm=0.5,
-            guarded_step_timeout_s=0.0,
-        )
-        command_pose = EndPose(350.0, -30.0, 154.0, 180.0, 14.795, 168.0)
-        controller = make_sequenced_feedback_controller(
-            [
-                EndPose(350.0, -30.0, 165.0, 180.0, 14.795, 168.0),
-                EndPose(350.0, -30.0, 164.4, 180.0, 14.795, 168.0),
-            ]
-        )
-
-        aborted, reason, feedback_z, follow_error, progress = guarded_step_abort_status(
-            controller,
-            args,
-            command_pose,
-            previous_feedback_z_mm=165.0,
-            commanded_drop_mm=3.0,
-        )
-
-        self.assertTrue(aborted)
-        self.assertIn("did not reach commanded height", reason)
-        self.assertAlmostEqual(feedback_z, 164.4)
-        self.assertGreater(follow_error, args.guarded_follow_error_mm)
-        self.assertGreaterEqual(progress, args.guarded_progress_min_mm)
 
     def test_handle_probe_message_only_reports_base_coordinates(self):
         args = make_args(execute=True)
@@ -2254,7 +2005,6 @@ class TestCatchServer1(unittest.TestCase):
         args = make_args(
             execute=True,
             place_pick_delay_s=0.0,
-            guarded_descent=False,
         )
         camera_to_base = np.eye(4, dtype=float)
         camera_to_base[:3, 3] = np.array([0.25, 0.00, 0.00])
@@ -2304,7 +2054,6 @@ class TestCatchServer1(unittest.TestCase):
         args = make_args(
             execute=True,
             no_wait_waypoints=True,
-            guarded_descent=False,
             motion_timeout_s=0.0,
             command_duration_s=0.0,
         )
@@ -2344,7 +2093,6 @@ class TestCatchServer1(unittest.TestCase):
             execute=True,
             grasp_only=True,
             no_return_ready=True,
-            guarded_descent=False,
             dynamic_pitch_by_x=True,
             force_pick_x_mm=350.0,
             keep_pitch_min_x_mm=300.0,
@@ -2436,7 +2184,6 @@ class TestCatchServer1(unittest.TestCase):
             execute=True,
             grasp_only=True,
             no_return_ready=True,
-            guarded_descent=False,
             dynamic_pitch_by_x=True,
             force_pick_x_mm=350.0,
             keep_pitch_min_x_mm=300.0,
@@ -2478,7 +2225,6 @@ class TestCatchServer1(unittest.TestCase):
             execute=True,
             grasp_only=True,
             no_return_ready=True,
-            guarded_descent=False,
             dynamic_pitch_by_x=True,
             dynamic_pitch_mode="planar-ik",
             force_pick_x_mm=350.0,
@@ -2540,7 +2286,6 @@ class TestCatchServer1(unittest.TestCase):
     def test_dynamic_preposition_reuses_pick_above_planar_ik_for_lift_then_places(self):
         args = make_args(
             execute=True,
-            guarded_descent=False,
             dynamic_preposition=True,
             final_action_time_s=0.0,
             dynamic_pitch_by_x=True,
@@ -2703,7 +2448,6 @@ class TestCatchServer1(unittest.TestCase):
             execute=True,
             grasp_only=True,
             no_return_ready=True,
-            guarded_descent=False,
             dynamic_preposition=True,
             final_action_time_s=0.0,
             dynamic_pitch_by_x=True,
@@ -2837,7 +2581,6 @@ class TestCatchServer1(unittest.TestCase):
             execute=True,
             grasp_only=True,
             no_return_ready=True,
-            guarded_descent=False,
             dynamic_preposition=True,
             final_action_time_s=0.0,
             dynamic_pitch_by_x=True,
@@ -3007,7 +2750,6 @@ class TestCatchServer1(unittest.TestCase):
             execute=True,
             grasp_only=True,
             no_return_ready=True,
-            guarded_descent=False,
             dynamic_pitch_by_x=True,
             force_pick_x_mm=350.0,
             keep_pitch_min_x_mm=300.0,
@@ -3057,7 +2799,6 @@ class TestCatchServer1(unittest.TestCase):
             execute=True,
             grasp_only=True,
             no_return_ready=True,
-            guarded_descent=False,
         )
         camera_to_base = np.eye(4, dtype=float)
         camera_to_base[:3, 3] = np.array([0.25, 0.00, 0.00])
@@ -3099,7 +2840,6 @@ class TestCatchServer1(unittest.TestCase):
             execute=True,
             grasp_only=True,
             no_return_ready=True,
-            guarded_descent=False,
             effort_nm=1.0,
             grasp_effort_nm=0.4,
         )
@@ -3175,14 +2915,11 @@ class TestCatchServer1(unittest.TestCase):
             ],
         )
         self.assertTrue(response["payload"]["safe_gripper"]["triggered"])
-        self.assertFalse(response["payload"]["protected_abort"])
-        self.assertIsNone(response["payload"]["protected_abort_reason"])
         self.assertEqual(
             set(response["payload"]["send_counts"].keys()),
             {
                 "ready_open",
                 "pick_above",
-                "pick_grasp_guard_start",
                 "pick_grasp",
                 "pick_lift",
             },
@@ -3192,182 +2929,6 @@ class TestCatchServer1(unittest.TestCase):
         self.assertTrue(result["stopped"])
         self.assertEqual(result["stop_action"], "disable")
         self.assertAlmostEqual(result["last_effort_nm"], 0.9)
-
-    def test_execute_static_guarded_descent_success(self):
-        args = make_args(
-            execute=True,
-            grasp_only=True,
-            no_return_ready=True,
-            guarded_descent=True,
-            guarded_descent_zone_mm=30.0,
-            guarded_descent_step_mm=10.0,
-            guarded_descent_speed=15,
-            guarded_follow_error_mm=8.0,
-            guarded_stall_s=0.0,
-        )
-        camera_to_base = np.eye(4, dtype=float)
-        camera_to_base[:3, 3] = np.array([0.25, 0.00, 0.00])
-        message = make_camera_point_message(
-            CameraPointCommand(x_m=0.0, y_m=0.0, z_m=0.30, command_id="cmd-static-guard")
-        )
-        controller = make_feedback_controller(
-            EndPose(350.0, 0.0, 253.252, -176.794223, 0.889438, -105.490597)
-        )
-
-        with contextlib.redirect_stdout(io.StringIO()):
-            response = handle_message(
-                message,
-                args=args,
-                camera_to_base=camera_to_base,
-                validator=controller,
-                controller=controller,
-            )
-
-        self.assertTrue(response["payload"]["executed"])
-        self.assertFalse(response["payload"]["protected_abort"])
-        self.assertTrue(response["payload"]["guarded_execution"]["guarded_descent_enabled"])
-        self.assertEqual(
-            set(response["payload"]["send_counts"].keys()),
-            {
-                "ready_open",
-                "pick_above",
-                "pick_grasp_guard_start",
-                "pick_grasp",
-                "pick_lift",
-            },
-        )
-        self.assertEqual(
-            response["payload"]["guarded_execution"]["guarded_descent"]["start_z_mm"],
-            args.grasp_z_mm + 30.0,
-        )
-        self.assertEqual(
-            response["payload"]["guarded_execution"]["guarded_descent"]["send_count"],
-            3,
-        )
-        gripper_calls = [call for call in controller.sdk.calls if call[0] == "GripperCtrl"]
-        self.assertEqual(
-            gripper_calls,
-            [
-                ("GripperCtrl", (0, 1000, 0x01, 0)),
-                ("GripperCtrl", (-100000, 1000, 0x01, 0)),
-            ],
-        )
-
-    def test_guarded_descent_waits_for_start_feedback_before_first_step(self):
-        args = make_args(
-            execute=True,
-            grasp_only=True,
-            no_return_ready=True,
-            guarded_descent=True,
-            guarded_descent_zone_mm=30.0,
-            guarded_descent_step_mm=3.0,
-            guarded_start_tolerance_mm=2.0,
-            guarded_start_timeout_s=0.0,
-        )
-        camera_to_base = np.eye(4, dtype=float)
-        camera_to_base[:3, 3] = np.array([0.25, 0.00, 0.00])
-        message = make_camera_point_message(
-            CameraPointCommand(x_m=0.0, y_m=0.0, z_m=0.30, command_id="cmd-guard-start")
-        )
-        controller = make_feedback_controller(
-            EndPose(350.0, 0.0, 253.252, -176.794223, 0.889438, -105.490597),
-            freeze_below_z_mm=args.transfer_z_mm,
-        )
-
-        with contextlib.redirect_stdout(io.StringIO()):
-            response = handle_message(
-                message,
-                args=args,
-                camera_to_base=camera_to_base,
-                validator=controller,
-                controller=controller,
-            )
-
-        self.assertTrue(response["payload"]["protected_abort"])
-        self.assertIn(
-            "guarded descent start not reached",
-            response["payload"]["protected_abort_reason"],
-        )
-        self.assertEqual(
-            response["payload"]["guarded_execution"]["guarded_descent"]["send_count"],
-            0,
-        )
-        end_pose_calls = [call for call in controller.sdk.calls if call[0] == "EndPoseCtrl"]
-        self.assertNotIn(
-            ("EndPoseCtrl", (250000, 0, 160252, -176794, 889, -105491)),
-            end_pose_calls,
-        )
-
-    def test_execute_static_guarded_descent_abort_skips_lift_and_place(self):
-        args = make_args(
-            execute=True,
-            grasp_only=False,
-            guarded_descent=True,
-            guarded_descent_zone_mm=30.0,
-            guarded_descent_step_mm=3.0,
-            guarded_descent_speed=15,
-            guarded_follow_error_mm=2.0,
-            guarded_stall_s=0.0,
-            guarded_progress_min_mm=0.0,
-            guarded_abort_return="pick_above",
-        )
-        camera_to_base = np.eye(4, dtype=float)
-        camera_to_base[:3, 3] = np.array([0.25, 0.00, 0.00])
-        message = make_camera_point_message(
-            CameraPointCommand(
-                x_m=0.0,
-                y_m=0.0,
-                z_m=0.30,
-                command_id="cmd-static-guard-abort",
-            )
-        )
-        controller = make_feedback_controller(
-            EndPose(350.0, 0.0, 253.252, -176.794223, 0.889438, -105.490597),
-            stall_z_mm=args.grasp_z_mm + 30.0,
-        )
-
-        with contextlib.redirect_stdout(io.StringIO()):
-            response = handle_message(
-                message,
-                args=args,
-                camera_to_base=camera_to_base,
-                validator=controller,
-                controller=controller,
-            )
-
-        self.assertTrue(response["payload"]["executed"])
-        self.assertTrue(response["payload"]["protected_abort"])
-        self.assertIn(
-            "height did not decrease",
-            response["payload"]["protected_abort_reason"],
-        )
-        self.assertIsNone(response["payload"]["guarded_execution"]["protected_abort_return"])
-        self.assertIsNone(
-            response["payload"]["guarded_execution"]["protected_abort_return_label"]
-        )
-        self.assertEqual(
-            set(response["payload"]["send_counts"].keys()),
-            {
-                "ready_open",
-                "pick_above",
-                "pick_grasp_guard_start",
-                "pick_grasp",
-            },
-        )
-        gripper_calls = [call for call in controller.sdk.calls if call[0] == "GripperCtrl"]
-        self.assertEqual(
-            gripper_calls,
-            [
-                ("GripperCtrl", (0, 1000, 0x01, 0)),
-            ],
-        )
-        self.assertEqual(
-            controller.sdk.calls.count(
-                ("EndPoseCtrl", (250000, 0, 253252, -176794, 889, -105491))
-            ),
-            1,
-        )
-        self.assertEqual(controller.sdk.calls[-1], ("EmergencyStop", (0x01,)))
 
     def test_startup_ready_uses_continuous_sequence_initial_pose(self):
         args = make_args()

@@ -219,7 +219,7 @@ def test_ready_pose_source_initial_rejects_initial_pose_source_ready_cycle():
         raise AssertionError("expected ready/initial cycle validation error")
 
 
-def test_eye_in_hand_parser_rejects_guarded_descent_options():
+def test_eye_in_hand_parser_rejects_removed_descent_protection_options():
     parser = build_parser()
 
     with contextlib.redirect_stderr(io.StringIO()):
@@ -231,18 +231,18 @@ def test_eye_in_hand_parser_rejects_guarded_descent_options():
             raise AssertionError("expected --guarded-descent to be removed")
 
 
-def test_eye_in_hand_args_hide_guarded_descent_but_server_1_copy_disables_it():
+def test_eye_in_hand_server_1_motion_args_keep_ready_planar_ik_return_disabled():
     args = build_parser().parse_args([])
 
     assert not hasattr(args, "guarded_descent")
     motion_args = server_1_motion_args(args)
 
     assert not hasattr(args, "guarded_descent")
-    assert motion_args.guarded_descent is False
-    assert motion_args.guarded_abort_return == "none"
+    assert not hasattr(motion_args, "guarded_descent")
+    assert motion_args.disable_ready_planar_ik_return is True
 
 
-def test_eye_in_hand_planar_ik_does_not_require_no_guarded_descent():
+def test_eye_in_hand_planar_ik_validates_without_extra_descent_protection_flags():
     args = build_parser().parse_args(
         [
             "--adaptive-joint-pitch-by-x",
