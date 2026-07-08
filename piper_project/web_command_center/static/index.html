@@ -9,80 +9,471 @@
   <body>
     <main class="shell">
       <header class="topbar">
-        <div>
+        <div class="brand">
           <h1>Piper Command Center</h1>
-          <p>OpenCV 动态检测与 Linux 抓取日志</p>
+          <p>动态抓取任务控制台</p>
         </div>
-        <div class="status-strip">
-          <span id="windowsStatus" class="pill">Windows idle</span>
-          <span id="linuxStatus" class="pill">Linux idle</span>
+        <div class="toolbar">
+          <input id="profileName" class="profile-name" aria-label="配置名称" />
+          <button id="saveProfile">保存配置</button>
+          <button id="validateProfile">校验</button>
+          <button id="checkLinuxPort">检查旧服务</button>
+          <button id="stopRemoteLinux" class="danger">释放旧服务</button>
+          <button id="startLinux" class="primary">启动 Linux</button>
+          <button id="startWindows" class="primary">启动 Windows</button>
+          <button id="stopAll" class="danger">全部停止</button>
         </div>
       </header>
 
-      <section class="command-grid">
-        <article class="panel">
-          <div class="panel-title">
-            <h2>Windows 命令</h2>
-            <div class="actions">
-              <button id="saveWindows">保存</button>
-              <button id="startWindows" class="primary">启动</button>
-              <button id="stopWindows" class="danger">停止</button>
-            </div>
-          </div>
-          <textarea id="windowsCommand" spellcheck="false"></textarea>
-        </article>
-
-        <article class="panel">
-          <div class="panel-title">
-            <h2>Linux 命令</h2>
-            <div class="actions">
-              <button id="saveLinux">保存</button>
-              <button id="startLinux" class="primary">启动</button>
-              <button id="stopLinux" class="danger">停止</button>
-            </div>
-          </div>
-          <textarea id="linuxCommand" spellcheck="false"></textarea>
-        </article>
+      <section class="statusbar">
+        <span id="windowsStatus" class="pill">Windows idle</span>
+        <span id="linuxStatus" class="pill">Linux idle</span>
+        <span id="linuxPortStatus" class="pill">远端服务未检查</span>
+        <span id="lastLinuxEvent" class="pill">无关键事件</span>
+        <span id="validationStatus" class="pill">配置未校验</span>
       </section>
 
-      <section class="work-grid">
-        <article class="panel preview-panel">
-          <div class="panel-title">
-            <h2>Windows 检测界面</h2>
-            <div class="preview-tabs">
-              <button class="tab active" data-preview="rgb">RGB</button>
-              <button class="tab" data-preview="mask">Mask</button>
-              <button class="tab" data-preview="depth">Depth</button>
-            </div>
-          </div>
-          <div class="preview-stage">
-            <img id="previewImage" alt="OpenCV preview" />
-            <div id="previewEmpty" class="empty">等待 Windows 检测画面</div>
-          </div>
-        </article>
+      <nav class="page-tabs" aria-label="页面切换">
+        <button class="page-tab active" data-page="controlPage">任务控制</button>
+        <button class="page-tab" data-page="logsPage">运行日志</button>
+      </nav>
 
-        <article class="panel log-panel important-panel">
-          <div class="panel-title">
-            <h2>Linux 重要日志</h2>
-            <span id="lastLinuxEvent" class="mini-status">无事件</span>
-          </div>
-          <div id="linuxImportantLog" class="important-log"></div>
-        </article>
+      <section id="controlPage" class="page active">
+        <div class="control-grid">
+          <aside class="side-scroll">
+            <section class="panel">
+              <div class="panel-title">
+                <h2>Windows 视觉</h2>
+              </div>
+              <div class="form-grid two">
+                <label>
+                  <span>传送带速度 mm/s</span>
+                  <input data-path="windows.conveyor_speed_mm_s" type="number" step="1" />
+                </label>
+                <label>
+                  <span>传送带方向</span>
+                  <select data-path="windows.conveyor_direction">
+                    <option value="positive-y">positive-y</option>
+                    <option value="negative-y">negative-y</option>
+                  </select>
+                </label>
+                <label>
+                  <span>画面宽度</span>
+                  <input data-path="windows.width" type="number" step="1" />
+                </label>
+                <label>
+                  <span>画面高度</span>
+                  <input data-path="windows.height" type="number" step="1" />
+                </label>
+              </div>
+            </section>
+
+            <section class="panel">
+              <div class="panel-title">
+                <h2>动态窗口</h2>
+              </div>
+              <div class="form-grid two">
+                <label>
+                  <span>X 最小 mm</span>
+                  <input data-path="windows.dynamic_min_x_mm" type="number" step="1" />
+                </label>
+                <label>
+                  <span>X 最大 mm</span>
+                  <input data-path="windows.dynamic_max_x_mm" type="number" step="1" />
+                </label>
+                <label>
+                  <span>Y 最小 mm</span>
+                  <input data-path="windows.dynamic_min_y_mm" type="number" step="1" />
+                </label>
+                <label>
+                  <span>Y 最大 mm</span>
+                  <input data-path="windows.dynamic_max_y_mm" type="number" step="1" />
+                </label>
+                <label class="check-row wide">
+                  <input data-path="windows.dynamic_pick_x_from_bbox_center" type="checkbox" />
+                  <span>抓取 X 使用检测中心</span>
+                </label>
+                <label>
+                  <span>抓取 Y mm</span>
+                  <input data-path="windows.dynamic_pick_y_mm" type="number" step="1" />
+                </label>
+              </div>
+            </section>
+
+            <section class="panel">
+              <div class="panel-title">
+                <h2>ROI 与阈值</h2>
+              </div>
+              <div class="form-grid four">
+                <label>
+                  <span>ROI X</span>
+                  <input data-path="windows.roi.0" type="number" step="1" />
+                </label>
+                <label>
+                  <span>ROI Y</span>
+                  <input data-path="windows.roi.1" type="number" step="1" />
+                </label>
+                <label>
+                  <span>ROI W</span>
+                  <input data-path="windows.roi.2" type="number" step="1" />
+                </label>
+                <label>
+                  <span>ROI H</span>
+                  <input data-path="windows.roi.3" type="number" step="1" />
+                </label>
+              </div>
+              <div class="form-grid three compact">
+                <label>
+                  <span>Lower H</span>
+                  <input data-path="windows.belt_lower_hsv.0" type="number" step="1" />
+                </label>
+                <label>
+                  <span>Lower S</span>
+                  <input data-path="windows.belt_lower_hsv.1" type="number" step="1" />
+                </label>
+                <label>
+                  <span>Lower V</span>
+                  <input data-path="windows.belt_lower_hsv.2" type="number" step="1" />
+                </label>
+                <label>
+                  <span>Upper H</span>
+                  <input data-path="windows.belt_upper_hsv.0" type="number" step="1" />
+                </label>
+                <label>
+                  <span>Upper S</span>
+                  <input data-path="windows.belt_upper_hsv.1" type="number" step="1" />
+                </label>
+                <label>
+                  <span>Upper V</span>
+                  <input data-path="windows.belt_upper_hsv.2" type="number" step="1" />
+                </label>
+              </div>
+            </section>
+
+            <details class="panel" open>
+              <summary>Windows 高级</summary>
+              <div class="form-grid two details-body">
+                <label class="check-row wide">
+                  <input data-path="windows.reject_highlight" type="checkbox" />
+                  <span>过滤高光</span>
+                </label>
+                <label>
+                  <span>高光 S 最大</span>
+                  <input data-path="windows.highlight_max_s" type="number" step="1" />
+                </label>
+                <label>
+                  <span>高光 V 最小</span>
+                  <input data-path="windows.highlight_min_v" type="number" step="1" />
+                </label>
+                <label>
+                  <span>最小面积 px</span>
+                  <input data-path="windows.min_area_px" type="number" step="1" />
+                </label>
+                <label>
+                  <span>最小宽度 px</span>
+                  <input data-path="windows.min_width_px" type="number" step="1" />
+                </label>
+                <label>
+                  <span>最小高度 px</span>
+                  <input data-path="windows.min_height_px" type="number" step="1" />
+                </label>
+                <label>
+                  <span>Close kernel</span>
+                  <input data-path="windows.morphology_close_kernel_size" type="number" step="1" />
+                </label>
+                <label>
+                  <span>Open kernel</span>
+                  <input data-path="windows.morphology_open_kernel_size" type="number" step="1" />
+                </label>
+                <label>
+                  <span>入口边</span>
+                  <select data-path="windows.entry_edge">
+                    <option value="right">right</option>
+                    <option value="left">left</option>
+                    <option value="top">top</option>
+                    <option value="bottom">bottom</option>
+                  </select>
+                </label>
+                <label>
+                  <span>清空帧数</span>
+                  <input data-path="windows.entry_clear_frames" type="number" step="1" />
+                </label>
+                <label class="wide">
+                  <span>手眼标定文件</span>
+                  <input data-path="windows.hand_eye_result" type="text" />
+                </label>
+              </div>
+            </details>
+          </aside>
+
+          <section class="center-stack">
+            <article class="panel preview-panel">
+              <div class="panel-title">
+                <h2>画面展示</h2>
+                <div class="segmented">
+                  <button class="preview-tab active" data-preview="rgb">RGB</button>
+                  <button class="preview-tab" data-preview="mask">Mask</button>
+                  <button class="preview-tab" data-preview="depth">Depth</button>
+                </div>
+              </div>
+              <div class="preview-stage">
+                <img id="previewImage" alt="OpenCV preview" />
+                <div id="previewEmpty" class="empty">等待 Windows 视觉画面</div>
+              </div>
+            </article>
+
+            <details class="panel command-preview">
+              <summary>
+                <span>生成命令</span>
+                <div class="segmented">
+                  <button class="command-tab active" data-command="windowsCommand">Windows</button>
+                  <button class="command-tab" data-command="linuxCommand">Linux</button>
+                </div>
+              </summary>
+              <pre id="windowsCommand" class="generated-command"></pre>
+              <pre id="linuxCommand" class="generated-command hidden"></pre>
+            </details>
+          </section>
+
+          <aside class="side-scroll">
+            <section class="panel">
+              <div class="panel-title">
+                <h2>Linux 运动</h2>
+              </div>
+              <div class="form-grid two">
+                <label class="check-row wide danger-check">
+                  <input data-path="linux.execute" type="checkbox" />
+                  <span>真实执行机械臂</span>
+                </label>
+                <label>
+                  <span>启动速度</span>
+                  <input data-path="linux.startup_speed" type="number" step="1" />
+                </label>
+                <label>
+                  <span>抓取速度</span>
+                  <input data-path="linux.speed" type="number" step="1" />
+                </label>
+                <label>
+                  <span>RX deg</span>
+                  <input data-path="linux.rx_deg" type="number" step="0.000001" />
+                </label>
+                <label>
+                  <span>RY deg</span>
+                  <input data-path="linux.ry_deg" type="number" step="0.000001" />
+                </label>
+                <label>
+                  <span>RZ deg</span>
+                  <input data-path="linux.rz_deg" type="number" step="0.000001" />
+                </label>
+              </div>
+            </section>
+
+            <section class="panel">
+              <div class="panel-title">
+                <h2>抓取目标</h2>
+              </div>
+              <div class="form-grid two">
+                <label>
+                  <span>目标 X 最小</span>
+                  <input data-path="linux.min_target_x_mm" type="number" step="1" />
+                </label>
+                <label>
+                  <span>目标 X 最大</span>
+                  <input data-path="linux.max_target_x_mm" type="number" step="1" />
+                </label>
+                <label>
+                  <span>抓取 Z</span>
+                  <input data-path="linux.grasp_z" type="number" step="1" />
+                </label>
+                <label>
+                  <span>检测 Z</span>
+                  <select data-path="linux.use_detected_z">
+                    <option value="off">off</option>
+                    <option value="center">center</option>
+                    <option value="top">top</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Z 偏移</span>
+                  <input data-path="linux.detected_z_offset_mm" type="number" step="1" />
+                </label>
+                <label>
+                  <span>Pick X 偏移</span>
+                  <input data-path="linux.pick_x_offset_mm" type="number" step="1" />
+                </label>
+                <label>
+                  <span>抓取 Z 最小</span>
+                  <input data-path="linux.min_grasp_z_mm" type="number" step="1" />
+                </label>
+                <label>
+                  <span>抓取 Z 最大</span>
+                  <input data-path="linux.max_grasp_z_mm" type="number" step="1" />
+                </label>
+              </div>
+            </section>
+
+            <section class="panel">
+              <div class="panel-title">
+                <h2>时序与夹爪</h2>
+              </div>
+              <div class="form-grid two">
+                <label>
+                  <span>指令持续 s</span>
+                  <input data-path="linux.command_duration_s" type="number" step="0.01" />
+                </label>
+                <label>
+                  <span>指令周期 s</span>
+                  <input data-path="linux.command_period_s" type="number" step="0.01" />
+                </label>
+                <label>
+                  <span>最终动作 s</span>
+                  <input data-path="linux.final_action_time_s" type="number" step="0.01" />
+                </label>
+                <label>
+                  <span>机器人时延 s</span>
+                  <input data-path="linux.t_robot_s" type="number" step="0.01" />
+                </label>
+                <label>
+                  <span>张开 mm</span>
+                  <input data-path="linux.open_command_mm" type="number" step="1" />
+                </label>
+                <label>
+                  <span>闭合 mm</span>
+                  <input data-path="linux.grasp_command_mm" type="number" step="1" />
+                </label>
+                <label>
+                  <span>力度 Nm</span>
+                  <input data-path="linux.effort_nm" type="number" step="0.1" />
+                </label>
+                <label>
+                  <span>夹爪等待 s</span>
+                  <input data-path="linux.gripper_settle_s" type="number" step="0.01" />
+                </label>
+              </div>
+            </section>
+
+            <details class="panel" open>
+              <summary>Linux 高级</summary>
+              <div class="form-grid two details-body">
+                <label class="check-row wide">
+                  <input data-path="linux.dynamic_preposition" type="checkbox" />
+                  <span>动态预定位</span>
+                </label>
+                <label>
+                  <span>预定位余量</span>
+                  <input data-path="linux.dynamic_preposition_clearance_mm" type="number" step="1" />
+                </label>
+                <label>
+                  <span>等待策略</span>
+                  <select data-path="linux.dynamic_wait_placement">
+                    <option value="nowait">nowait</option>
+                    <option value="wait">wait</option>
+                  </select>
+                </label>
+                <label class="check-row wide">
+                  <input data-path="linux.dynamic_t_robot_by_x" type="checkbox" />
+                  <span>按 X 修正时延</span>
+                </label>
+                <label>
+                  <span>参考 X</span>
+                  <input data-path="linux.dynamic_t_robot_reference_x_mm" type="number" step="1" />
+                </label>
+                <label>
+                  <span>Near 斜率</span>
+                  <input data-path="linux.dynamic_t_robot_planar_near_s_per_mm" type="number" step="0.001" />
+                </label>
+                <label>
+                  <span>Far 斜率</span>
+                  <input data-path="linux.dynamic_t_robot_planar_far_s_per_mm" type="number" step="0.001" />
+                </label>
+                <label class="check-row wide">
+                  <input data-path="linux.adaptive_joint_pitch_by_x" type="checkbox" />
+                  <span>自适应 pitch</span>
+                </label>
+                <label>
+                  <span>Pitch 模式</span>
+                  <select data-path="linux.dynamic_pitch_mode">
+                    <option value="planar-ik">planar-ik</option>
+                    <option value="joint">joint</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Keep X 最小</span>
+                  <input data-path="linux.keep_pitch_min_x_mm" type="number" step="1" />
+                </label>
+                <label>
+                  <span>Keep X 最大</span>
+                  <input data-path="linux.keep_pitch_max_x_mm" type="number" step="1" />
+                </label>
+                <label>
+                  <span>Pitch far</span>
+                  <input data-path="linux.pitch_deg_per_mm_far" type="number" step="0.001" />
+                </label>
+                <label>
+                  <span>Pitch near</span>
+                  <input data-path="linux.pitch_deg_per_mm_near" type="number" step="0.001" />
+                </label>
+                <label class="check-row wide">
+                  <input data-path="linux.grasp_yaw_by_object_short_edge" type="checkbox" />
+                  <span>按短边调整 yaw</span>
+                </label>
+                <label>
+                  <span>Yaw 最大变化</span>
+                  <input data-path="linux.grasp_yaw_max_delta_deg" type="number" step="1" />
+                </label>
+                <label>
+                  <span>Yaw 死区</span>
+                  <input data-path="linux.grasp_yaw_deadband_deg" type="number" step="1" />
+                </label>
+                <label>
+                  <span>Yaw 速度</span>
+                  <input data-path="linux.grasp_yaw_speed" type="number" step="1" />
+                </label>
+              </div>
+            </details>
+          </aside>
+        </div>
       </section>
 
-      <section class="log-grid">
-        <article class="panel log-panel">
-          <div class="panel-title">
-            <h2>Windows 输出</h2>
+      <section id="logsPage" class="page">
+        <div class="log-toolbar">
+          <div class="segmented">
+            <button class="log-filter active" data-filter="all">全部</button>
+            <button class="log-filter" data-filter="windows">Windows</button>
+            <button class="log-filter" data-filter="linux">Linux</button>
+            <button class="log-filter" data-filter="important">重要事件</button>
           </div>
-          <pre id="windowsLog"></pre>
-        </article>
-        <article class="panel log-panel">
-          <div class="panel-title">
-            <h2>Linux 输出</h2>
-          </div>
-          <pre id="linuxLog"></pre>
-        </article>
+          <label class="check-row">
+            <input id="pauseLogs" type="checkbox" />
+            <span>暂停滚动</span>
+          </label>
+        </div>
+        <section class="log-layout">
+          <article class="panel log-panel" data-log-panel="all">
+            <div class="panel-title">
+              <h2>全部日志</h2>
+            </div>
+            <pre id="allLog"></pre>
+          </article>
+          <article class="panel log-panel hidden" data-log-panel="windows">
+            <div class="panel-title">
+              <h2>Windows 日志</h2>
+            </div>
+            <pre id="windowsLog"></pre>
+          </article>
+          <article class="panel log-panel hidden" data-log-panel="linux">
+            <div class="panel-title">
+              <h2>Linux 日志</h2>
+            </div>
+            <pre id="linuxLog"></pre>
+          </article>
+          <article class="panel log-panel hidden" data-log-panel="important">
+            <div class="panel-title">
+              <h2>重要事件</h2>
+            </div>
+            <div id="linuxImportantLog" class="important-log"></div>
+          </article>
+        </section>
       </section>
     </main>
 
