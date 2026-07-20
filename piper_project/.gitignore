@@ -1,0 +1,4 @@
+
+# Ignore local model/checkpoint files
+/models/graspnet-baseline/
+checkpoint-rs.tar
