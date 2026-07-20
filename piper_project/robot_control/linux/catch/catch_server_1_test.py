@@ -30,7 +30,11 @@ from robot_control.linux.catch.catch_server_1 import (
 )
 from robot_control.linux.config.robot_config import RobotConfig
 from robot_control.shared.geometry import EndPose
-from robot_control.shared.protocol import CameraPointCommand, make_camera_point_message
+from robot_control.shared.protocol import (
+    CameraPointCommand,
+    GraspCandidate,
+    make_camera_point_message,
+)
 
 
 def make_args(**overrides: object) -> argparse.Namespace:
@@ -64,6 +68,16 @@ def make_args(**overrides: object) -> argparse.Namespace:
         "final_action_time_s": 0.55,
         "collision_protection_level": None,
         "no_start_ready": False,
+        "vision_source": "opencv",
+        "graspnet_candidate_policy": "best-reachable-score",
+        "graspnet_max_candidates": 20,
+        "graspnet_approach_distance_mm": 60.0,
+        "graspnet_lift_height_mm": 60.0,
+        "graspnet_allow_fixed_fallback": False,
+        "graspnet_tcp_rot_x_deg": 0.0,
+        "graspnet_tcp_rot_y_deg": 0.0,
+        "graspnet_tcp_rot_z_deg": 0.0,
+        "graspnet_max_rz_delta_deg": None,
         "ready_x_mm": 350.0,
         "ready_y_mm": 0.0,
         "transfer_z_mm": 253.252,
@@ -313,6 +327,13 @@ class TestCatchServer1(unittest.TestCase):
         self.assertFalse(args.dynamic_pitch_by_x)
         self.assertEqual(args.dynamic_pitch_mode, "joint")
         self.assertEqual(args.dynamic_wait_placement, "wait")
+        self.assertEqual(args.vision_source, "opencv")
+        self.assertEqual(args.graspnet_candidate_policy, "best-reachable-score")
+        self.assertEqual(args.graspnet_max_candidates, 20)
+        self.assertAlmostEqual(args.graspnet_approach_distance_mm, 60.0)
+        self.assertAlmostEqual(args.graspnet_lift_height_mm, 60.0)
+        self.assertFalse(args.graspnet_allow_fixed_fallback)
+        self.assertIsNone(args.graspnet_max_rz_delta_deg)
         self.assertAlmostEqual(args.keep_pitch_min_x_mm, 300.0)
         self.assertAlmostEqual(args.keep_pitch_max_x_mm, 380.0)
         self.assertIsNone(args.pitch_deg_per_mm)
@@ -774,6 +795,102 @@ class TestCatchServer1(unittest.TestCase):
         self.assertEqual(response["payload"]["yolo"]["bbox_format"], "xyxy")
         self.assertEqual(response["payload"]["yolo"]["label"], "bottle")
         self.assertEqual(response["payload"]["yolo"]["class_id"], 39)
+
+    def test_handle_message_graspnet_uses_candidate_pose(self):
+        args = make_args(
+            debug_plan=True,
+            vision_source="graspnet",
+            graspnet_approach_distance_mm=50.0,
+            graspnet_lift_height_mm=40.0,
+            grasp_yaw_by_object_short_edge=True,
+        )
+        camera_to_base = np.eye(4, dtype=float)
+        message = make_camera_point_message(
+            CameraPointCommand(
+                x_m=0.20,
+                y_m=0.01,
+                z_m=0.12,
+                command_id="cmd-graspnet",
+                vision_source="graspnet",
+                object_short_axis_yaw_deg=45.0,
+                grasp_candidates=(
+                    GraspCandidate(
+                        position_camera_m=(0.20, 0.01, 0.12),
+                        rotation_camera=(
+                            (1.0, 0.0, 0.0),
+                            (0.0, 1.0, 0.0),
+                            (0.0, 0.0, 1.0),
+                        ),
+                        score=0.8,
+                        width_m=0.04,
+                        approach_depth_m=0.05,
+                        index=4,
+                    ),
+                ),
+            )
+        )
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            response = handle_message(
+                message,
+                args=args,
+                camera_to_base=camera_to_base,
+                validator=make_controller(),
+            )
+
+        self.assertEqual(response["type"], "ack")
+        self.assertEqual(response["payload"]["vision_source"], "graspnet")
+        self.assertEqual(response["payload"]["graspnet_candidate"]["source_index"], 4)
+        self.assertAlmostEqual(response["payload"]["pose"]["x_mm"], 200.0)
+        self.assertAlmostEqual(response["payload"]["pose"]["y_mm"], 10.0)
+        self.assertAlmostEqual(response["payload"]["pose"]["z_mm"], 120.0)
+        self.assertEqual(
+            [step["label"] for step in response["payload"]["steps"][:4]],
+            ["ready_open", "pick_above", "pick_grasp", "pick_lift"],
+        )
+        self.assertAlmostEqual(response["payload"]["steps"][1]["pose"]["z_mm"], 70.0)
+        self.assertAlmostEqual(response["payload"]["steps"][3]["pose"]["z_mm"], 160.0)
+        self.assertEqual(response["payload"]["grasp_yaw_adjustments"], [])
+
+    def test_handle_message_graspnet_rejects_large_rz_delta(self):
+        args = make_args(
+            debug_plan=True,
+            vision_source="graspnet",
+            rz_deg=0.0,
+            graspnet_max_rz_delta_deg=20.0,
+        )
+        camera_to_base = np.eye(4, dtype=float)
+        rotation_z_90 = (
+            (0.0, -1.0, 0.0),
+            (1.0, 0.0, 0.0),
+            (0.0, 0.0, 1.0),
+        )
+        message = make_camera_point_message(
+            CameraPointCommand(
+                x_m=0.20,
+                y_m=0.01,
+                z_m=0.12,
+                command_id="cmd-graspnet-rz-limit",
+                vision_source="graspnet",
+                grasp_candidates=(
+                    GraspCandidate(
+                        position_camera_m=(0.20, 0.01, 0.12),
+                        rotation_camera=rotation_z_90,
+                        score=0.8,
+                        index=1,
+                    ),
+                ),
+            )
+        )
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(SafetyError, "rz delta"):
+                handle_message(
+                    message,
+                    args=args,
+                    camera_to_base=camera_to_base,
+                    validator=make_controller(),
+                )
 
     def test_handle_message_dry_run_returns_in_plan(self):
         args = make_args(debug_plan=True)

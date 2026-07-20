@@ -16,6 +16,23 @@ GraspMode = Literal["static", "dynamic", "probe"]
 
 
 @dataclass(frozen=True)
+class GraspCandidate:
+    """A vision-side 6D grasp candidate expressed in the camera frame."""
+
+    position_camera_m: tuple[float, float, float]
+    rotation_camera: tuple[
+        tuple[float, float, float],
+        tuple[float, float, float],
+        tuple[float, float, float],
+    ]
+    width_m: float | None = None
+    score: float | None = None
+    approach_depth_m: float | None = None
+    source: str = "graspnet"
+    index: int | None = None
+
+
+@dataclass(frozen=True)
 class CameraPointCommand:
     x_m: float
     y_m: float
@@ -57,6 +74,9 @@ class CameraPointCommand:
     object_rect_width_px: float | None = None
     object_rect_height_px: float | None = None
     object_rect_angle_deg: float | None = None
+    vision_source: str | None = None
+    selected_grasp_index: int | None = None
+    grasp_candidates: tuple[GraspCandidate, ...] = ()
 
 
 def make_camera_point_message(command: CameraPointCommand) -> dict[str, Any]:
@@ -191,6 +211,13 @@ def camera_point_from_message(message: dict[str, Any]) -> CameraPointCommand:
             object_rect_width_px=_optional_float(payload, "object_rect_width_px"),
             object_rect_height_px=_optional_float(payload, "object_rect_height_px"),
             object_rect_angle_deg=_optional_float(payload, "object_rect_angle_deg"),
+            vision_source=(
+                str(payload["vision_source"])
+                if payload.get("vision_source") is not None
+                else None
+            ),
+            selected_grasp_index=_optional_int(payload, "selected_grasp_index"),
+            grasp_candidates=_grasp_candidates(payload.get("grasp_candidates")),
             grasp_mode=cast(GraspMode, grasp_mode),
             t_arrive_s=_optional_float(payload, "t_arrive_s"),
             conveyor_speed_mm_s=_optional_float(payload, "conveyor_speed_mm_s"),
@@ -227,6 +254,86 @@ def _tuple4_float(value: Any, label: str) -> tuple[float, float, float, float]:
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{label} must contain exactly 4 numeric values") from exc
     return cast(tuple[float, float, float, float], values)
+
+
+def _tuple3_float(value: Any, label: str) -> tuple[float, float, float]:
+    if not isinstance(value, (list, tuple)) or len(value) != 3:
+        raise ValueError(f"{label} must contain exactly 3 numeric values")
+    try:
+        values = tuple(float(item) for item in value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must contain exactly 3 numeric values") from exc
+    return cast(tuple[float, float, float], values)
+
+
+def _matrix3_float(
+    value: Any,
+    label: str,
+) -> tuple[
+    tuple[float, float, float],
+    tuple[float, float, float],
+    tuple[float, float, float],
+]:
+    if not isinstance(value, (list, tuple)) or len(value) != 3:
+        raise ValueError(f"{label} must be a 3x3 numeric matrix")
+    rows = tuple(_tuple3_float(row, f"{label} row") for row in value)
+    return cast(
+        tuple[
+            tuple[float, float, float],
+            tuple[float, float, float],
+            tuple[float, float, float],
+        ],
+        rows,
+    )
+
+
+def _grasp_candidates(value: Any) -> tuple[GraspCandidate, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("grasp_candidates must be a list")
+
+    candidates: list[GraspCandidate] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, dict):
+            raise ValueError("each grasp candidate must be an object")
+        try:
+            position = _tuple3_float(
+                item["position_camera_m"],
+                f"grasp_candidates[{index}].position_camera_m",
+            )
+            rotation = _matrix3_float(
+                item["rotation_camera"],
+                f"grasp_candidates[{index}].rotation_camera",
+            )
+        except KeyError as exc:
+            raise ValueError(
+                f"missing grasp candidate field: grasp_candidates[{index}].{exc.args[0]}"
+            ) from exc
+        candidates.append(
+            GraspCandidate(
+                position_camera_m=position,
+                rotation_camera=rotation,
+                width_m=(
+                    float(item["width_m"])
+                    if item.get("width_m") is not None
+                    else None
+                ),
+                score=(
+                    float(item["score"])
+                    if item.get("score") is not None
+                    else None
+                ),
+                approach_depth_m=(
+                    float(item["approach_depth_m"])
+                    if item.get("approach_depth_m") is not None
+                    else None
+                ),
+                source=str(item.get("source", "graspnet")),
+                index=int(item["index"]) if item.get("index") is not None else index,
+            )
+        )
+    return tuple(candidates)
 
 
 def _optional_float(payload: dict[str, Any], key: str) -> float | None:

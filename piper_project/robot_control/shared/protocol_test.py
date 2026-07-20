@@ -6,6 +6,7 @@ from robot_control.shared.geometry import TOP_DOWN_TCP_ORIENTATION_DEG
 from robot_control.shared.simulated_mapping import camera_xyz_to_simulated_robot_pose
 from robot_control.shared.protocol import (
     CameraPointCommand,
+    GraspCandidate,
     camera_point_from_message,
     decode_message,
     encode_message,
@@ -56,6 +57,7 @@ class TestTcpProtocol(unittest.TestCase):
             object_rect_width_px=123.0,
             object_rect_height_px=58.0,
             object_rect_angle_deg=12.5,
+            vision_source="opencv",
         )
 
         decoded = decode_message(encode_message(make_camera_point_message(command)))
@@ -99,6 +101,55 @@ class TestTcpProtocol(unittest.TestCase):
         self.assertAlmostEqual(parsed.object_rect_width_px, 123.0)
         self.assertAlmostEqual(parsed.object_rect_height_px, 58.0)
         self.assertAlmostEqual(parsed.object_rect_angle_deg, 12.5)
+        self.assertEqual(parsed.vision_source, "opencv")
+        self.assertEqual(parsed.grasp_candidates, ())
+
+    def test_camera_point_message_round_trips_grasp_candidates(self):
+        command = CameraPointCommand(
+            x_m=0.10,
+            y_m=-0.05,
+            z_m=0.40,
+            command_id="cmd-graspnet",
+            vision_source="graspnet",
+            selected_grasp_index=0,
+            grasp_candidates=(
+                GraspCandidate(
+                    position_camera_m=(0.11, -0.04, 0.39),
+                    rotation_camera=(
+                        (1.0, 0.0, 0.0),
+                        (0.0, 1.0, 0.0),
+                        (0.0, 0.0, 1.0),
+                    ),
+                    width_m=0.045,
+                    score=0.82,
+                    approach_depth_m=0.06,
+                    source="graspnet",
+                    index=3,
+                ),
+            ),
+        )
+
+        decoded = decode_message(encode_message(make_camera_point_message(command)))
+        parsed = camera_point_from_message(decoded)
+
+        self.assertEqual(parsed.vision_source, "graspnet")
+        self.assertEqual(parsed.selected_grasp_index, 0)
+        self.assertEqual(len(parsed.grasp_candidates), 1)
+        candidate = parsed.grasp_candidates[0]
+        self.assertEqual(candidate.position_camera_m, (0.11, -0.04, 0.39))
+        self.assertEqual(
+            candidate.rotation_camera,
+            (
+                (1.0, 0.0, 0.0),
+                (0.0, 1.0, 0.0),
+                (0.0, 0.0, 1.0),
+            ),
+        )
+        self.assertAlmostEqual(candidate.width_m, 0.045)
+        self.assertAlmostEqual(candidate.score, 0.82)
+        self.assertAlmostEqual(candidate.approach_depth_m, 0.06)
+        self.assertEqual(candidate.source, "graspnet")
+        self.assertEqual(candidate.index, 3)
 
     def test_camera_point_task_defaults_to_out(self):
         message = make_camera_point_message(
