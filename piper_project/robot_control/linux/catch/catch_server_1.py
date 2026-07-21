@@ -566,6 +566,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="calibration rotation from GraspNet gripper frame to Piper TCP frame",
     )
     parser.add_argument(
+        "--graspnet-tcp-z-offset-mm",
+        type=float,
+        default=0.0,
+        help=(
+            "fixed base-Z offset applied to each resolved GraspNet TCP pose; "
+            "use this to align GraspNet candidate height with the Piper TCP/gripper"
+        ),
+    )
+    parser.add_argument(
         "--graspnet-max-rz-delta-deg",
         type=float,
         help=(
@@ -1020,6 +1029,8 @@ def validate_args(args: argparse.Namespace) -> None:
         value = float(args.graspnet_max_rz_delta_deg)
         if not math.isfinite(value) or value < 0:
             raise ValueError("--graspnet-max-rz-delta-deg must be finite and >= 0")
+    if not math.isfinite(float(args.graspnet_tcp_z_offset_mm)):
+        raise ValueError("--graspnet-tcp-z-offset-mm must be finite")
     if args.planar_ik_position_tolerance_mm <= 0.0:
         raise ValueError("--planar-ik-position-tolerance-mm must be > 0")
     if args.planar_ik_rx_tolerance_deg <= 0.0:
@@ -1365,10 +1376,14 @@ def resolve_grasp_candidate(
         @ graspnet_tcp_rotation_calibration(args)
     )
     rx_deg, ry_deg, rz_deg = euler_xyz_deg_from_rotation_matrix(rotation_base)
+    z_offset_mm = float(getattr(args, "graspnet_tcp_z_offset_mm", 0.0))
+    base_x_mm = float(position_base_m[0] * 1000.0)
+    base_y_mm = float(position_base_m[1] * 1000.0)
+    base_z_mm = float(position_base_m[2] * 1000.0) + z_offset_mm
     tcp_pose = EndPose(
-        x_mm=float(position_base_m[0] * 1000.0),
-        y_mm=float(position_base_m[1] * 1000.0),
-        z_mm=float(position_base_m[2] * 1000.0),
+        x_mm=base_x_mm,
+        y_mm=base_y_mm,
+        z_mm=base_z_mm,
         rx_deg=rx_deg,
         ry_deg=ry_deg,
         rz_deg=rz_deg,
@@ -1385,9 +1400,9 @@ def resolve_grasp_candidate(
             for row in rotation_camera
         ),
         base_position_mm=(
-            float(position_base_m[0] * 1000.0),
-            float(position_base_m[1] * 1000.0),
-            float(position_base_m[2] * 1000.0),
+            base_x_mm,
+            base_y_mm,
+            base_z_mm,
         ),
         base_rotation=rotation_base,
         tcp_pose=tcp_pose,

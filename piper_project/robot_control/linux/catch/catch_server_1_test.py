@@ -77,6 +77,7 @@ def make_args(**overrides: object) -> argparse.Namespace:
         "graspnet_tcp_rot_x_deg": 0.0,
         "graspnet_tcp_rot_y_deg": 0.0,
         "graspnet_tcp_rot_z_deg": 0.0,
+        "graspnet_tcp_z_offset_mm": 0.0,
         "graspnet_max_rz_delta_deg": None,
         "ready_x_mm": 350.0,
         "ready_y_mm": 0.0,
@@ -333,6 +334,7 @@ class TestCatchServer1(unittest.TestCase):
         self.assertAlmostEqual(args.graspnet_approach_distance_mm, 60.0)
         self.assertAlmostEqual(args.graspnet_lift_height_mm, 60.0)
         self.assertFalse(args.graspnet_allow_fixed_fallback)
+        self.assertAlmostEqual(args.graspnet_tcp_z_offset_mm, 0.0)
         self.assertIsNone(args.graspnet_max_rz_delta_deg)
         self.assertAlmostEqual(args.keep_pitch_min_x_mm, 300.0)
         self.assertAlmostEqual(args.keep_pitch_max_x_mm, 380.0)
@@ -377,6 +379,9 @@ class TestCatchServer1(unittest.TestCase):
 
         args = build_parser().parse_args(["--grasp-yaw-mode", "separate-j6"])
         self.assertEqual(args.grasp_yaw_mode, "separate-j6")
+
+        args = build_parser().parse_args(["--graspnet-tcp-z-offset-mm", "135"])
+        self.assertAlmostEqual(args.graspnet_tcp_z_offset_mm, 135.0)
 
         args = build_parser().parse_args(
             [
@@ -851,6 +856,63 @@ class TestCatchServer1(unittest.TestCase):
         self.assertAlmostEqual(response["payload"]["steps"][1]["pose"]["z_mm"], 70.0)
         self.assertAlmostEqual(response["payload"]["steps"][3]["pose"]["z_mm"], 160.0)
         self.assertEqual(response["payload"]["grasp_yaw_adjustments"], [])
+
+    def test_handle_message_graspnet_applies_tcp_z_offset(self):
+        args = make_args(
+            debug_plan=True,
+            vision_source="graspnet",
+            graspnet_tcp_z_offset_mm=135.0,
+            graspnet_approach_distance_mm=50.0,
+            graspnet_lift_height_mm=40.0,
+            min_grasp_z_mm=120.0,
+        )
+        camera_to_base = np.eye(4, dtype=float)
+        message = make_camera_point_message(
+            CameraPointCommand(
+                x_m=0.20,
+                y_m=0.01,
+                z_m=-0.008,
+                command_id="cmd-graspnet-z-offset",
+                vision_source="graspnet",
+                grasp_candidates=(
+                    GraspCandidate(
+                        position_camera_m=(0.20, 0.01, -0.008),
+                        rotation_camera=(
+                            (1.0, 0.0, 0.0),
+                            (0.0, 1.0, 0.0),
+                            (0.0, 0.0, 1.0),
+                        ),
+                        score=0.8,
+                        index=3,
+                    ),
+                ),
+            )
+        )
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            response = handle_message(
+                message,
+                args=args,
+                camera_to_base=camera_to_base,
+                validator=make_controller(),
+            )
+
+        self.assertEqual(response["type"], "ack")
+        self.assertEqual(response["payload"]["vision_source"], "graspnet")
+        self.assertAlmostEqual(response["payload"]["pose"]["z_mm"], 127.0)
+        self.assertAlmostEqual(response["payload"]["grasp_z_mm"], 127.0)
+        self.assertAlmostEqual(
+            response["payload"]["graspnet_candidate"]["base_position_mm"]["z_mm"],
+            127.0,
+        )
+        self.assertAlmostEqual(
+            response["payload"]["steps"][1]["pose"]["z_mm"],
+            77.0,
+        )
+        self.assertAlmostEqual(
+            response["payload"]["steps"][3]["pose"]["z_mm"],
+            167.0,
+        )
 
     def test_handle_message_graspnet_rejects_large_rz_delta(self):
         args = make_args(
