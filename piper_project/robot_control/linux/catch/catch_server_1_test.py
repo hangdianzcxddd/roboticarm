@@ -892,6 +892,70 @@ class TestCatchServer1(unittest.TestCase):
                     validator=make_controller(),
                 )
 
+    def test_handle_dynamic_message_graspnet_projects_candidate_to_pick_line(self):
+        args = make_args(
+            debug_plan=True,
+            vision_source="graspnet",
+            min_target_y_mm=-300.0,
+            max_target_y_mm=300.0,
+        )
+        camera_to_base = np.eye(4, dtype=float)
+        rotation_z_30 = (
+            (
+                math.cos(math.radians(30.0)),
+                -math.sin(math.radians(30.0)),
+                0.0,
+            ),
+            (
+                math.sin(math.radians(30.0)),
+                math.cos(math.radians(30.0)),
+                0.0,
+            ),
+            (0.0, 0.0, 1.0),
+        )
+        message = make_camera_point_message(
+            CameraPointCommand(
+                x_m=0.40,
+                y_m=-0.50,
+                z_m=0.12,
+                command_id="cmd-dynamic-graspnet-projected",
+                vision_source="graspnet",
+                grasp_mode="dynamic",
+                t_arrive_s=4.0,
+                conveyor_speed_mm_s=140.0,
+                pick_x_mm=405.0,
+                pick_y_mm=0.0,
+                detected_x_mm=400.0,
+                detected_y_mm=-500.0,
+                grasp_candidates=(
+                    GraspCandidate(
+                        position_camera_m=(0.398, -0.50, 0.12),
+                        rotation_camera=rotation_z_30,
+                        score=0.8,
+                        index=2,
+                    ),
+                ),
+            )
+        )
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            response = handle_message(
+                message,
+                args=args,
+                camera_to_base=camera_to_base,
+                validator=make_controller(),
+            )
+
+        self.assertEqual(response["type"], "ack")
+        self.assertEqual(response["payload"]["vision_source"], "graspnet")
+        self.assertAlmostEqual(response["payload"]["pick_x_mm"], 403.0)
+        self.assertAlmostEqual(response["payload"]["pick_y_mm"], 0.0)
+        self.assertEqual(
+            response["payload"]["pick_x_source"],
+            "graspnet_candidate_pose_dynamic_projected_x",
+        )
+        self.assertAlmostEqual(response["payload"]["pose"]["rz_deg"], 30.0)
+
     def test_handle_message_dry_run_returns_in_plan(self):
         args = make_args(debug_plan=True)
         camera_to_base = np.eye(4, dtype=float)

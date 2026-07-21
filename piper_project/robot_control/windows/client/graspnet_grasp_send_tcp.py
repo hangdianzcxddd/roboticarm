@@ -756,7 +756,7 @@ def dynamic_candidate_from_target(
         return None
     try:
         t_arrive_s, remaining_y_mm = dynamic_arrival_time_s(
-            current_y_mm=y_mm,
+            y_mm,
             pick_y_mm=pick_y_mm,
             conveyor_speed_mm_s=conveyor_speed_mm_s,
             conveyor_direction=conveyor_direction,
@@ -771,6 +771,17 @@ def dynamic_candidate_from_target(
         remaining_y_mm=remaining_y_mm,
         distance_to_pick_y_mm=abs(remaining_y_mm),
     )
+
+
+def dynamic_pick_x_mm_for_candidate(
+    candidate: DynamicGraspNetCandidate,
+    *,
+    fixed_pick_x_mm: float,
+    use_detected_x: bool,
+) -> float:
+    if use_detected_x:
+        return candidate.base_x_mm
+    return float(fixed_pick_x_mm)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -838,6 +849,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dynamic-min-y-mm", type=float, default=-30.0)
     parser.add_argument("--dynamic-max-y-mm", type=float, default=30.0)
     parser.add_argument("--dynamic-pick-x-mm", type=float, default=350.0)
+    parser.add_argument(
+        "--dynamic-pick-x-from-detected",
+        action="store_true",
+        help=(
+            "use the detected target center base-X as dynamic grasp X instead of "
+            "--dynamic-pick-x-mm; dynamic Y still comes from --dynamic-pick-y-mm"
+        ),
+    )
     parser.add_argument("--dynamic-pick-y-mm", type=float, default=-30.0)
     parser.add_argument("--dynamic-keep-running", action="store_true")
     parser.add_argument("--print-interval", type=float, default=1.0)
@@ -1111,6 +1130,11 @@ def main() -> None:
                 candidates.sort(key=lambda item: (item.t_arrive_s, item.target.rank))
                 if candidates:
                     candidate = candidates[0]
+                    pick_x_mm = dynamic_pick_x_mm_for_candidate(
+                        candidate,
+                        fixed_pick_x_mm=args.dynamic_pick_x_mm,
+                        use_detected_x=args.dynamic_pick_x_from_detected,
+                    )
                     response = sender.send_target(
                         candidate.target,
                         source=source,
@@ -1118,15 +1142,20 @@ def main() -> None:
                         grasp_mode="dynamic",
                         t_arrive_s=candidate.t_arrive_s,
                         conveyor_speed_mm_s=args.conveyor_speed_mm_s,
-                        pick_x_mm=args.dynamic_pick_x_mm,
+                        pick_x_mm=pick_x_mm,
                         pick_y_mm=args.dynamic_pick_y_mm,
                     )
                     skip_reason = dynamic_skip_reason_from_response(response)
                     if skip_reason:
                         print(f"Dynamic target skipped: {skip_reason}", flush=True)
+                    elif response.get("type") == "error":
+                        print(f"Dynamic send failed: {response}", flush=True)
                     else:
                         dynamic_sent = True
-                        print(f"Dynamic target sent: {response}", flush=True)
+                        print(
+                            f"Dynamic target sent: pick_x={pick_x_mm:.1f}mm {response}",
+                            flush=True,
+                        )
 
             if not args.no_display:
                 display = color_image.copy()

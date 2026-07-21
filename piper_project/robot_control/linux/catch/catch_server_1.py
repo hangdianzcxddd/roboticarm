@@ -1779,6 +1779,11 @@ def target_from_graspnet_candidate(
         command.z_m,
         camera_to_base,
     )
+    candidate, pick_x_source, pick_y_source = project_dynamic_graspnet_candidate(
+        command,
+        candidate,
+        base_xyz_m,
+    )
     pick_x_mm, pick_y_mm, grasp_z_mm = (
         candidate.tcp_pose.x_mm,
         candidate.tcp_pose.y_mm,
@@ -1792,8 +1797,8 @@ def target_from_graspnet_candidate(
         grasp_z_mm=float(grasp_z_mm),
         raw_pick_x_mm=float(pick_x_mm),
         raw_pick_y_mm=float(pick_y_mm),
-        pick_x_source="graspnet_candidate_pose",
-        pick_y_source="graspnet_candidate_pose",
+        pick_x_source=pick_x_source,
+        pick_y_source=pick_y_source,
         raw_grasp_z_mm=float(grasp_z_mm),
         grasp_z_source="graspnet_candidate_pose",
         uncompensated_grasp_z_mm=float(grasp_z_mm),
@@ -1805,6 +1810,61 @@ def target_from_graspnet_candidate(
     if validate:
         validate_target(target, args)
     return target
+
+
+def _finite_command_mm(value: float | None, fallback_mm: float) -> float:
+    if value is None:
+        return float(fallback_mm)
+    numeric = float(value)
+    if not math.isfinite(numeric):
+        return float(fallback_mm)
+    return numeric
+
+
+def project_dynamic_graspnet_candidate(
+    command: CameraPointCommand,
+    candidate: ResolvedGraspCandidate,
+    command_base_xyz_m: tuple[float, float, float],
+) -> tuple[ResolvedGraspCandidate, str, str]:
+    if command.grasp_mode != "dynamic":
+        return candidate, "graspnet_candidate_pose", "graspnet_candidate_pose"
+    if command.pick_x_mm is None or command.pick_y_mm is None:
+        raise ValueError("dynamic GraspNet command requires pick_x_mm and pick_y_mm")
+
+    detected_x_mm = _finite_command_mm(
+        command.detected_x_mm,
+        command_base_xyz_m[0] * 1000.0,
+    )
+    detected_y_mm = _finite_command_mm(
+        command.detected_y_mm,
+        command_base_xyz_m[1] * 1000.0,
+    )
+    candidate_pose = candidate.tcp_pose
+    projected_x_mm = (
+        float(command.pick_x_mm) + candidate_pose.x_mm - detected_x_mm
+    )
+    projected_y_mm = (
+        float(command.pick_y_mm) + candidate_pose.y_mm - detected_y_mm
+    )
+    projected_pose = replace(
+        candidate_pose,
+        x_mm=projected_x_mm,
+        y_mm=projected_y_mm,
+    )
+    projected_candidate = replace(
+        candidate,
+        base_position_mm=(
+            projected_x_mm,
+            projected_y_mm,
+            candidate.base_position_mm[2],
+        ),
+        tcp_pose=projected_pose,
+    )
+    return (
+        projected_candidate,
+        "graspnet_candidate_pose_dynamic_projected_x",
+        "graspnet_candidate_pose_dynamic_projected_y",
+    )
 
 
 def validate_target(target: YoloCatchTarget, args: argparse.Namespace) -> None:

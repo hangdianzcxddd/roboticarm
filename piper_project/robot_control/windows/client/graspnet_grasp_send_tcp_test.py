@@ -17,6 +17,8 @@ if cv2 is not None:
         GraspNetTarget,
         camera_point_command_from_target,
         colored_point_cloud_from_targets,
+        dynamic_candidate_from_target,
+        dynamic_pick_x_mm_for_candidate,
         load_intrinsics,
         point_cloud_stats_text,
         point_cloud_from_mask,
@@ -229,6 +231,64 @@ class TestGraspNetGraspSendTcp(unittest.TestCase):
         self.assertEqual(command.selected_grasp_index, 0)
         self.assertEqual(len(command.grasp_candidates), 1)
         self.assertAlmostEqual(command.detected_x_mm, 200.0)
+
+    def test_dynamic_pick_x_can_use_detected_base_x(self):
+        detection = Detection(
+            u=2,
+            v=2,
+            x=1,
+            y=1,
+            width=3,
+            height=3,
+            area=9.0,
+            label="graspnet_object",
+        )
+        segment = SegmentationDetection(
+            detection=detection,
+            mask=np.ones((4, 4), dtype=bool),
+            mask_area_px=16,
+            centroid_u=2.0,
+            centroid_v=2.0,
+        )
+        point = CameraPoint(u=2, v=2, depth_m=0.5, x_m=0.0, y_m=0.0, z_m=0.5)
+        target = GraspNetTarget(
+            rank=1,
+            segment=segment,
+            raw_point=point,
+            send_point=point,
+            base_xyz_m=(0.405, -0.50, 0.12),
+            point_cloud_camera_m=np.zeros((4, 3), dtype=np.float32),
+            grasp_candidates=(),
+        )
+        candidate = dynamic_candidate_from_target(
+            target,
+            min_x_mm=300.0,
+            max_x_mm=500.0,
+            min_y_mm=-600.0,
+            max_y_mm=-400.0,
+            pick_y_mm=0.0,
+            conveyor_speed_mm_s=140.0,
+            conveyor_direction="positive-y",
+        )
+        self.assertIsNotNone(candidate)
+        assert candidate is not None
+
+        self.assertAlmostEqual(
+            dynamic_pick_x_mm_for_candidate(
+                candidate,
+                fixed_pick_x_mm=350.0,
+                use_detected_x=False,
+            ),
+            350.0,
+        )
+        self.assertAlmostEqual(
+            dynamic_pick_x_mm_for_candidate(
+                candidate,
+                fixed_pick_x_mm=350.0,
+                use_detected_x=True,
+            ),
+            405.0,
+        )
 
 
 if __name__ == "__main__":
