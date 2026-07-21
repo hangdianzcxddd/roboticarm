@@ -15,6 +15,7 @@ if cv2 is not None:
         DepthForegroundDetector,
         DepthForegroundDetectorConfig,
         GraspNetTarget,
+        build_parser,
         camera_point_command_from_target,
         colored_point_cloud_from_targets,
         dynamic_candidate_from_target,
@@ -22,10 +23,15 @@ if cv2 is not None:
         load_intrinsics,
         point_cloud_stats_text,
         point_cloud_from_mask,
+        target_from_segment,
+        validate_args,
     )
     from robot_control.windows.client.yolo_seg_grasp_send_tcp import SegmentationDetection
     from robot_control.windows.vision.belt_depth_plane import BeltDepthPlane
-    from robot_control.windows.vision.d435i_intrinsics import DEFAULT_D435I_PARA, PinholeIntrinsics
+    from robot_control.windows.vision.d435i_intrinsics import (
+        DEFAULT_D435I_PARA,
+        PinholeIntrinsics,
+    )
     from robot_control.windows.vision.depth import CameraPoint
     from robot_control.windows.vision.detector import Detection
 
@@ -67,6 +73,23 @@ class TestGraspNetGraspSendTcp(unittest.TestCase):
 
         self.assertEqual(intrinsics.width, 1280)
         self.assertEqual(intrinsics.height, 720)
+
+    def test_dynamic_debug_candidates_argument_is_stored(self):
+        args = build_parser().parse_args(
+            [
+                "dynamic",
+                "--dry-run",
+                "--belt-depth-plane-json",
+                "belt.json",
+                "--conveyor-speed-mm-s",
+                "80",
+                "--dynamic-debug-candidates",
+            ]
+        )
+
+        validate_args(args)
+
+        self.assertTrue(args.dynamic_debug_candidates)
 
     def test_colored_point_cloud_from_targets_combines_target_points(self):
         detection = Detection(
@@ -231,6 +254,68 @@ class TestGraspNetGraspSendTcp(unittest.TestCase):
         self.assertEqual(command.selected_grasp_index, 0)
         self.assertEqual(len(command.grasp_candidates), 1)
         self.assertAlmostEqual(command.detected_x_mm, 200.0)
+
+    def test_target_from_segment_sends_detected_top_z_payload(self):
+        depth = np.full((4, 4), 0.50, dtype=np.float32)
+        depth[1, 1] = 0.44
+        depth[1, 2] = 0.48
+        depth[2, 1] = 0.46
+        depth[2, 2] = 0.49
+        mask = np.zeros((4, 4), dtype=bool)
+        mask[1:3, 1:3] = True
+        detection = Detection(
+            u=2,
+            v=2,
+            x=1,
+            y=1,
+            width=2,
+            height=2,
+            area=4.0,
+            label="graspnet_object",
+        )
+        segment = SegmentationDetection(
+            detection=detection,
+            mask=mask,
+            mask_area_px=4,
+            centroid_u=1.5,
+            centroid_v=1.5,
+        )
+        camera_to_base = np.eye(4, dtype=float)
+        camera_to_base[2, 2] = -1.0
+        camera_to_base[2, 3] = 1.0
+
+        target = target_from_segment(
+            1,
+            segment,
+            FakeDepthFrame(depth),
+            intrinsics=PinholeIntrinsics(
+                width=4,
+                height=4,
+                fx=100.0,
+                fy=100.0,
+                ppx=2.0,
+                ppy=2.0,
+            ),
+            camera_to_base=camera_to_base,
+            backend=None,
+            voxel_size_m=0.0,
+            max_points=100,
+            max_candidates=20,
+        )
+        command = camera_point_command_from_target(
+            target,
+            source="graspnet_test",
+            task="out",
+            grasp_mode="dynamic",
+            t_arrive_s=1.0,
+            conveyor_speed_mm_s=140.0,
+            pick_x_mm=350.0,
+            pick_y_mm=0.0,
+        )
+
+        self.assertEqual((command.mask_top_u, command.mask_top_v), (1.0, 1.0))
+        self.assertAlmostEqual(command.detected_top_camera_z_m, 0.44, places=5)
+        self.assertAlmostEqual(command.detected_top_z_mm, 560.0, places=4)
 
     def test_dynamic_pick_x_can_use_detected_base_x(self):
         detection = Detection(

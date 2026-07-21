@@ -131,6 +131,8 @@ class GraspNetTarget:
     base_xyz_m: tuple[float, float, float] | None
     point_cloud_camera_m: np.ndarray
     grasp_candidates: tuple[GraspCandidate, ...]
+    top_point: CameraPoint | None = None
+    top_base_xyz_m: tuple[float, float, float] | None = None
 
     @property
     def detection(self) -> Detection:
@@ -462,6 +464,63 @@ def point_cloud_from_mask(
     return points
 
 
+def top_point_from_mask(
+    depth_frame: Any,
+    mask: np.ndarray,
+    *,
+    intrinsics: PinholeIntrinsics,
+    camera_to_base: np.ndarray | None,
+) -> tuple[CameraPoint, tuple[float, float, float] | None]:
+    depth_m = depth_array_meters(depth_frame)
+    if depth_m.shape[:2] != mask.shape[:2]:
+        raise ValueError("mask and depth frame resolutions do not match")
+    rows, cols = np.nonzero(mask.astype(bool))
+    valid_depth = depth_m[rows, cols]
+    valid = np.isfinite(valid_depth) & (valid_depth > 0.0)
+    rows = rows[valid]
+    cols = cols[valid]
+    z = valid_depth[valid].astype(np.float64)
+    if z.size == 0:
+        raise ValueError("target mask contains no valid depth pixels")
+
+    x = (cols.astype(np.float64) - intrinsics.ppx) / intrinsics.fx * z
+    y = (rows.astype(np.float64) - intrinsics.ppy) / intrinsics.fy * z
+    points = np.column_stack((x, y, z))
+    finite_points = np.isfinite(points).all(axis=1)
+    if not np.any(finite_points):
+        raise ValueError("target mask contains no finite camera points")
+    rows = rows[finite_points]
+    cols = cols[finite_points]
+    points = points[finite_points]
+
+    top_base_xyz_m = None
+    if camera_to_base is None:
+        selected_index = int(np.argmin(points[:, 2]))
+    else:
+        if camera_to_base.shape != (4, 4):
+            raise ValueError("camera_to_base transform must be 4x4")
+        base_points = points @ camera_to_base[:3, :3].T + camera_to_base[:3, 3]
+        finite_base = np.isfinite(base_points).all(axis=1)
+        if not np.any(finite_base):
+            raise ValueError("target mask maps to no finite base points")
+        candidate_indexes = np.nonzero(finite_base)[0]
+        selected_index = int(
+            candidate_indexes[np.argmax(base_points[finite_base, 2])]
+        )
+        top_base_xyz_m = tuple(float(value) for value in base_points[selected_index])
+
+    selected = points[selected_index]
+    top_point = CameraPoint(
+        u=int(cols[selected_index]),
+        v=int(rows[selected_index]),
+        depth_m=float(selected[2]),
+        x_m=float(selected[0]),
+        y_m=float(selected[1]),
+        z_m=float(selected[2]),
+    )
+    return top_point, top_base_xyz_m
+
+
 def voxel_downsample(points: np.ndarray, voxel_size_m: float) -> np.ndarray:
     keys = np.floor(points / float(voxel_size_m)).astype(np.int64)
     _, unique_indexes = np.unique(keys, axis=0, return_index=True)
@@ -629,6 +688,12 @@ def target_from_segment(
         voxel_size_m=voxel_size_m,
         max_points=max_points,
     )
+    top_point, top_base_xyz_m = top_point_from_mask(
+        depth_frame,
+        mask,
+        intrinsics=intrinsics,
+        camera_to_base=camera_to_base,
+    )
     grasp_candidates = (
         ()
         if backend is None
@@ -642,6 +707,8 @@ def target_from_segment(
         base_xyz_m=base_xyz_m,
         point_cloud_camera_m=points,
         grasp_candidates=tuple(grasp_candidates),
+        top_point=top_point,
+        top_base_xyz_m=top_base_xyz_m,
     )
 
 
@@ -657,6 +724,13 @@ def camera_point_command_from_target(
     pick_y_mm: float | None = None,
 ) -> CameraPointCommand:
     detection = target.detection
+    detected_top_x_mm = None
+    detected_top_y_mm = None
+    detected_top_z_mm = None
+    if target.top_base_xyz_m is not None:
+        detected_top_x_mm = target.top_base_xyz_m[0] * 1000.0
+        detected_top_y_mm = target.top_base_xyz_m[1] * 1000.0
+        detected_top_z_mm = target.top_base_xyz_m[2] * 1000.0
     return CameraPointCommand(
         x_m=target.send_point.x_m,
         y_m=target.send_point.y_m,
@@ -679,6 +753,8 @@ def camera_point_command_from_target(
         mask_area_px=target.segment.mask_area_px,
         mask_centroid_u=target.segment.centroid_u,
         mask_centroid_v=target.segment.centroid_v,
+        mask_top_u=None if target.top_point is None else float(target.top_point.u),
+        mask_top_v=None if target.top_point is None else float(target.top_point.v),
         grasp_mode=grasp_mode,
         t_arrive_s=t_arrive_s,
         conveyor_speed_mm_s=conveyor_speed_mm_s,
@@ -692,6 +768,18 @@ def camera_point_command_from_target(
         ),
         detected_z_mm=(
             None if target.base_xyz_m is None else target.base_xyz_m[2] * 1000.0
+        ),
+        detected_top_x_mm=detected_top_x_mm,
+        detected_top_y_mm=detected_top_y_mm,
+        detected_top_z_mm=detected_top_z_mm,
+        detected_top_camera_x_m=(
+            None if target.top_point is None else target.top_point.x_m
+        ),
+        detected_top_camera_y_m=(
+            None if target.top_point is None else target.top_point.y_m
+        ),
+        detected_top_camera_z_m=(
+            None if target.top_point is None else target.top_point.z_m
         ),
         vision_source="graspnet",
         selected_grasp_index=0 if target.grasp_candidates else None,
@@ -771,6 +859,142 @@ def dynamic_candidate_from_target(
         remaining_y_mm=remaining_y_mm,
         distance_to_pick_y_mm=abs(remaining_y_mm),
     )
+
+
+def dynamic_candidate_reject_reasons(
+    target: GraspNetTarget,
+    *,
+    min_x_mm: float,
+    max_x_mm: float,
+    min_y_mm: float,
+    max_y_mm: float,
+    pick_y_mm: float,
+    conveyor_speed_mm_s: float,
+    conveyor_direction: str,
+) -> tuple[str, ...]:
+    if target.base_xyz_m is None:
+        return ("no-base-xyz",)
+    x_mm = target.base_xyz_m[0] * 1000.0
+    y_mm = target.base_xyz_m[1] * 1000.0
+    reasons: list[str] = []
+    if x_mm < min_x_mm:
+        reasons.append(f"x<{min_x_mm:.1f}")
+    elif x_mm > max_x_mm:
+        reasons.append(f"x>{max_x_mm:.1f}")
+    if y_mm < min_y_mm:
+        reasons.append(f"y<{min_y_mm:.1f}")
+    elif y_mm > max_y_mm:
+        reasons.append(f"y>{max_y_mm:.1f}")
+    try:
+        t_arrive_s, _ = dynamic_arrival_time_s(
+            y_mm,
+            pick_y_mm=pick_y_mm,
+            conveyor_speed_mm_s=conveyor_speed_mm_s,
+            conveyor_direction=conveyor_direction,
+        )
+    except ValueError as exc:
+        reasons.append(str(exc))
+    else:
+        if t_arrive_s < 0.0:
+            reasons.append("past-pick-line")
+    return tuple(reasons)
+
+
+def format_dynamic_graspnet_candidate_line(
+    target: GraspNetTarget,
+    candidate: DynamicGraspNetCandidate | None,
+    *,
+    reject_reasons: tuple[str, ...],
+) -> str:
+    if target.base_xyz_m is None:
+        base_text = "base=NA"
+    else:
+        base_text = (
+            "base="
+            f"({target.base_xyz_m[0] * 1000.0:.1f},"
+            f"{target.base_xyz_m[1] * 1000.0:.1f},"
+            f"{target.base_xyz_m[2] * 1000.0:.1f})mm"
+        )
+    top_z_text = (
+        "top_z=NA"
+        if target.top_base_xyz_m is None
+        else f"top_z={target.top_base_xyz_m[2] * 1000.0:.1f}mm"
+    )
+    if candidate is None:
+        status = (
+            "reject=" + ",".join(reject_reasons)
+            if reject_reasons
+            else "reject=unknown"
+        )
+        timing = "remain_y=NA t_arrive=NA"
+    else:
+        status = "candidate"
+        timing = (
+            f"remain_y={candidate.remaining_y_mm:.1f}mm "
+            f"t_arrive={candidate.t_arrive_s:.3f}s"
+        )
+    detection = target.detection
+    return (
+        f"rank={target.rank} "
+        f"pixel=({target.raw_point.u},{target.raw_point.v}) "
+        f"bbox=({detection.x},{detection.y},{detection.width},{detection.height}) "
+        "camera="
+        f"({target.raw_point.x_m:.4f},"
+        f"{target.raw_point.y_m:.4f},"
+        f"{target.raw_point.z_m:.4f})m "
+        f"{base_text} {top_z_text} "
+        f"grasps={len(target.grasp_candidates)} "
+        f"{timing} {status}"
+    )
+
+
+def print_dynamic_graspnet_candidate_debug(
+    targets: list[GraspNetTarget],
+    candidates_by_rank: dict[int, DynamicGraspNetCandidate],
+    *,
+    min_x_mm: float,
+    max_x_mm: float,
+    min_y_mm: float,
+    max_y_mm: float,
+    pick_y_mm: float,
+    conveyor_speed_mm_s: float,
+    conveyor_direction: str,
+) -> None:
+    print(
+        "\nDynamic GraspNet candidate debug: "
+        f"X=[{min_x_mm:.1f},{max_x_mm:.1f}]mm "
+        f"Y=[{min_y_mm:.1f},{max_y_mm:.1f}]mm "
+        f"pick_y={pick_y_mm:.1f}mm "
+        f"direction={conveyor_direction} "
+        f"speed={conveyor_speed_mm_s:.1f}mm/s",
+        flush=True,
+    )
+    if not targets:
+        print("  no point-cloud targets", flush=True)
+        return
+    for target in targets:
+        candidate = candidates_by_rank.get(target.rank)
+        reject_reasons = ()
+        if candidate is None:
+            reject_reasons = dynamic_candidate_reject_reasons(
+                target,
+                min_x_mm=min_x_mm,
+                max_x_mm=max_x_mm,
+                min_y_mm=min_y_mm,
+                max_y_mm=max_y_mm,
+                pick_y_mm=pick_y_mm,
+                conveyor_speed_mm_s=conveyor_speed_mm_s,
+                conveyor_direction=conveyor_direction,
+            )
+        print(
+            "  "
+            + format_dynamic_graspnet_candidate_line(
+                target,
+                candidate,
+                reject_reasons=reject_reasons,
+            ),
+            flush=True,
+        )
 
 
 def dynamic_pick_x_mm_for_candidate(
@@ -859,6 +1083,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--dynamic-pick-y-mm", type=float, default=-30.0)
     parser.add_argument("--dynamic-keep-running", action="store_true")
+    parser.add_argument(
+        "--dynamic-debug-candidates",
+        action="store_true",
+        help=(
+            "print per-target dynamic candidate diagnostics, including base XYZ, "
+            "top Z, window checks, and arrival time"
+        ),
+    )
     parser.add_argument("--print-interval", type=float, default=1.0)
     parser.add_argument("--hide-depth", action="store_true")
     parser.add_argument("--hide-mask", action="store_true")
@@ -1027,6 +1259,7 @@ def main() -> None:
     intrinsics: PinholeIntrinsics | None = None
     point_cloud_viewer = None
     last_point_cloud_print_s = 0.0
+    last_dynamic_debug_time_s = 0.0
 
     if args.show_point_cloud:
         point_cloud_viewer = Open3DPointCloudViewer(
@@ -1128,6 +1361,26 @@ def main() -> None:
                 ]
                 candidates = [item for item in candidates if item is not None]
                 candidates.sort(key=lambda item: (item.t_arrive_s, item.target.rank))
+                now_s = time.monotonic()
+                if (
+                    args.dynamic_debug_candidates
+                    and (
+                        args.print_interval == 0.0
+                        or now_s - last_dynamic_debug_time_s >= args.print_interval
+                    )
+                ):
+                    print_dynamic_graspnet_candidate_debug(
+                        targets,
+                        {item.target.rank: item for item in candidates},
+                        min_x_mm=args.dynamic_min_x_mm,
+                        max_x_mm=args.dynamic_max_x_mm,
+                        min_y_mm=args.dynamic_min_y_mm,
+                        max_y_mm=args.dynamic_max_y_mm,
+                        pick_y_mm=args.dynamic_pick_y_mm,
+                        conveyor_speed_mm_s=args.conveyor_speed_mm_s,
+                        conveyor_direction=args.conveyor_direction,
+                    )
+                    last_dynamic_debug_time_s = now_s
                 if candidates:
                     candidate = candidates[0]
                     pick_x_mm = dynamic_pick_x_mm_for_candidate(
