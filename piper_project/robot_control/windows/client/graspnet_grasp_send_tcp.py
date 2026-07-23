@@ -3,7 +3,7 @@
 This client keeps the ROI and entry-edge gating style from
 ``opencv_grasp_send_tcp`` but replaces color-threshold object detection with
 depth/point-cloud foreground extraction and sends 6D grasp candidates to
-``catch_server_1``.
+``catch_server_graspnet``.
 """
 
 from __future__ import annotations
@@ -73,9 +73,13 @@ from robot_control.windows.vision.detector import Detection
 
 
 DEFAULT_HAND_EYE_RESULT = (
-    PROJECT_DIR / "robot_control" / "linux" / "hand_eye" / "hand_eye_result.json"
+    PROJECT_DIR
+    / "robot_control"
+    / "linux"
+    / "hand_eye"
+    / "eye_to_hand_result_auto.json"
 )
-RGB_WINDOW_NAME = "GraspNet point-cloud grasp -> catch_server_1"
+RGB_WINDOW_NAME = "GraspNet point-cloud grasp -> catch_server_graspnet"
 MASK_WINDOW_NAME = "GraspNet depth foreground masks"
 DEPTH_WINDOW_NAME = "Aligned depth valid map"
 POINT_CLOUD_WINDOW_NAME = "GraspNet object point cloud"
@@ -1013,13 +1017,20 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Detect depth foreground objects, run a local GraspNet/AnyGrasp "
             "backend on object point clouds, and send 6D grasp candidates to "
-            "catch_server_1."
+            "catch_server_graspnet."
         )
     )
     parser.add_argument("mode", nargs="?", choices=("static", "dynamic"), default="static")
-    parser.add_argument("--host", help="Linux VM IP address running catch_server_1")
+    parser.add_argument(
+        "--host", help="Linux VM IP address running catch_server_graspnet"
+    )
     parser.add_argument("--port", type=int, default=5005)
-    parser.add_argument("--timeout-s", type=float, default=3.0)
+    parser.add_argument(
+        "--timeout-s",
+        type=float,
+        default=30.0,
+        help="TCP response timeout; full server-side IK planning can take several seconds",
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--task", choices=("out", "in"), default="out")
     parser.add_argument("--width", type=int, default=1280)

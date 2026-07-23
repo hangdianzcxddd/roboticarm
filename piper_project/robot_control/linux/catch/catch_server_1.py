@@ -32,7 +32,6 @@ from typing import Any, Literal
 import numpy as np
 
 from robot_control.linux.arm.kinematics import (
-    euler_xyz_deg_from_rotation_matrix,
     forward_kinematics_pose,
     normalize_degrees,
 )
@@ -58,7 +57,6 @@ from robot_control.shared.geometry import EndPose
 from robot_control.shared.protocol import (
     CameraPointCommand,
     CameraPointTask,
-    GraspCandidate,
     camera_point_from_message,
     make_ack_message,
     make_error_message,
@@ -75,7 +73,6 @@ Action = Literal["open", "close", None]
 JointPitchMode = Literal["disabled", "keep_fixed", "adjust"]
 DynamicPitchControlMode = Literal["joint", "planar_ik"]
 GraspYawMode = Literal["integrated-planar-ik", "separate-j6"]
-VisionSourceMode = Literal["opencv", "graspnet"]
 DEFAULT_KEEP_PITCH_MIN_X_MM = 300.0
 DEFAULT_KEEP_PITCH_MAX_X_MM = 380.0
 DEFAULT_PITCH_DEG_PER_MM_FAR = 0.04
@@ -117,8 +114,7 @@ class YoloCatchTarget:
     uncompensated_grasp_z_mm: float | None = None
     planar_ik_grasp_z_comp_mm: float = 0.0
     planar_ik_grasp_z_comp_pitch_delta_deg: float = 0.0
-    vision_source: VisionSourceMode = "opencv"
-    graspnet_candidate: "ResolvedGraspCandidate | None" = None
+    vision_source: Literal["opencv"] = "opencv"
 
 
 @dataclass(frozen=True)
@@ -126,24 +122,6 @@ class YoloCatchPlan:
     task: CameraPointTask
     target: YoloCatchTarget
     steps: tuple[SequenceStep, ...]
-
-
-@dataclass(frozen=True)
-class ResolvedGraspCandidate:
-    source_index: int | None
-    source: str
-    score: float | None
-    width_m: float | None
-    approach_depth_m: float | None
-    camera_position_m: tuple[float, float, float]
-    camera_rotation: tuple[
-        tuple[float, float, float],
-        tuple[float, float, float],
-        tuple[float, float, float],
-    ]
-    base_position_mm: tuple[float, float, float]
-    base_rotation: np.ndarray
-    tcp_pose: EndPose
 
 
 @dataclass(frozen=True)
@@ -504,83 +482,6 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=DEFAULT_HAND_EYE_RESULT,
         help="eye_to_hand result whose transform is camera -> base",
-    )
-    parser.add_argument(
-        "--vision-source",
-        choices=("opencv", "graspnet"),
-        default="opencv",
-        help=(
-            "select the incoming grasp client family. opencv keeps the legacy "
-            "fixed-orientation point/mask behavior used by opencv_grasp_send_tcp; "
-            "graspnet consumes 6D grasp candidates from graspnet_grasp_send_tcp"
-        ),
-    )
-    parser.add_argument(
-        "--graspnet-candidate-policy",
-        choices=("first-reachable", "best-score", "best-reachable-score"),
-        default="best-reachable-score",
-        help="how to choose among received GraspNet candidates after reachability checks",
-    )
-    parser.add_argument(
-        "--graspnet-max-candidates",
-        type=int,
-        default=20,
-        help="maximum received GraspNet candidates to evaluate per command",
-    )
-    parser.add_argument(
-        "--graspnet-approach-distance-mm",
-        type=float,
-        default=60.0,
-        help="approach distance opposite the candidate tool approach axis",
-    )
-    parser.add_argument(
-        "--graspnet-lift-height-mm",
-        type=float,
-        default=60.0,
-        help="base-Z lift distance after a GraspNet grasp",
-    )
-    parser.add_argument(
-        "--graspnet-allow-fixed-fallback",
-        action="store_true",
-        help=(
-            "if no GraspNet candidate validates, fall back to the legacy fixed "
-            "pose target instead of rejecting the command"
-        ),
-    )
-    parser.add_argument(
-        "--graspnet-tcp-rot-x-deg",
-        type=float,
-        default=0.0,
-        help="calibration rotation from GraspNet gripper frame to Piper TCP frame",
-    )
-    parser.add_argument(
-        "--graspnet-tcp-rot-y-deg",
-        type=float,
-        default=0.0,
-        help="calibration rotation from GraspNet gripper frame to Piper TCP frame",
-    )
-    parser.add_argument(
-        "--graspnet-tcp-rot-z-deg",
-        type=float,
-        default=0.0,
-        help="calibration rotation from GraspNet gripper frame to Piper TCP frame",
-    )
-    parser.add_argument(
-        "--graspnet-tcp-z-offset-mm",
-        type=float,
-        default=0.0,
-        help=(
-            "fixed base-Z offset applied to each resolved GraspNet TCP pose; "
-            "use this to align GraspNet candidate height with the Piper TCP/gripper"
-        ),
-    )
-    parser.add_argument(
-        "--graspnet-max-rz-delta-deg",
-        type=float,
-        help=(
-            "reject GraspNet candidates whose TCP rz differs from --rz-deg by "
-            "more than this angle; useful for limiting J6 rotation"
-        ),
     )
     parser.add_argument("--ready-x-mm", type=float, default=350.0)
     parser.add_argument("--ready-y-mm", type=float, default=0.0)
@@ -1015,22 +916,12 @@ def validate_args(args: argparse.Namespace) -> None:
         "planar_ik_grasp_z_comp_mm_per_deg",
         "planar_ik_joint_tolerance_deg",
         "planar_ik_fk_tool_z_offset_mm",
-        "graspnet_approach_distance_mm",
-        "graspnet_lift_height_mm",
     ):
         value = float(getattr(args, name))
         if not math.isfinite(value) or value < 0:
             raise ValueError(f"--{name.replace('_', '-')} must be finite and >= 0")
     if not isinstance(args.planar_ik_max_iterations, int) or args.planar_ik_max_iterations < 1:
         raise ValueError("--planar-ik-max-iterations must be an integer >= 1")
-    if not isinstance(args.graspnet_max_candidates, int) or args.graspnet_max_candidates < 1:
-        raise ValueError("--graspnet-max-candidates must be an integer >= 1")
-    if args.graspnet_max_rz_delta_deg is not None:
-        value = float(args.graspnet_max_rz_delta_deg)
-        if not math.isfinite(value) or value < 0:
-            raise ValueError("--graspnet-max-rz-delta-deg must be finite and >= 0")
-    if not math.isfinite(float(args.graspnet_tcp_z_offset_mm)):
-        raise ValueError("--graspnet-tcp-z-offset-mm must be finite")
     if args.planar_ik_position_tolerance_mm <= 0.0:
         raise ValueError("--planar-ik-position-tolerance-mm must be > 0")
     if args.planar_ik_rx_tolerance_deg <= 0.0:
@@ -1307,185 +1198,7 @@ def target_pose(
     target: YoloCatchTarget,
     z_mm: float,
 ) -> EndPose:
-    if target.graspnet_candidate is not None:
-        pose = target.graspnet_candidate.tcp_pose
-        return EndPose(
-            x_mm=pose.x_mm,
-            y_mm=pose.y_mm,
-            z_mm=float(z_mm),
-            rx_deg=pose.rx_deg,
-            ry_deg=pose.ry_deg,
-            rz_deg=pose.rz_deg,
-        )
     return fixed_pose(args, target.pick_x_mm, target.pick_y_mm, z_mm)
-
-
-def vision_source_mode(args: argparse.Namespace) -> VisionSourceMode:
-    value = getattr(args, "vision_source", "opencv")
-    if value not in ("opencv", "graspnet"):
-        raise ValueError("--vision-source must be 'opencv' or 'graspnet'")
-    return value
-
-
-def candidate_sort_key(
-    candidate: ResolvedGraspCandidate,
-    *,
-    policy: str,
-) -> tuple[float, int]:
-    score = -float("inf") if candidate.score is None else float(candidate.score)
-    index = 0 if candidate.source_index is None else int(candidate.source_index)
-    if policy == "first-reachable":
-        return (0.0, -index)
-    if policy in ("best-score", "best-reachable-score"):
-        return (score, -index)
-    raise ValueError(f"unsupported GraspNet candidate policy: {policy!r}")
-
-
-def graspnet_tcp_rotation_calibration(args: argparse.Namespace) -> np.ndarray:
-    return rotation_matrix_xyz_deg(
-        float(getattr(args, "graspnet_tcp_rot_x_deg", 0.0)),
-        float(getattr(args, "graspnet_tcp_rot_y_deg", 0.0)),
-        float(getattr(args, "graspnet_tcp_rot_z_deg", 0.0)),
-    )
-
-
-def resolve_grasp_candidate(
-    candidate: GraspCandidate,
-    camera_to_base: np.ndarray,
-    args: argparse.Namespace,
-) -> ResolvedGraspCandidate:
-    if camera_to_base.shape != (4, 4):
-        raise ValueError("camera_to_base transform must be 4x4")
-
-    position_camera = np.asarray(candidate.position_camera_m, dtype=float)
-    rotation_camera = np.asarray(candidate.rotation_camera, dtype=float)
-    if position_camera.shape != (3,):
-        raise ValueError("grasp candidate position must contain 3 values")
-    if rotation_camera.shape != (3, 3):
-        raise ValueError("grasp candidate rotation must be 3x3")
-    if not np.all(np.isfinite(position_camera)) or not np.all(np.isfinite(rotation_camera)):
-        raise ValueError("grasp candidate pose must be finite")
-
-    position_base_m = camera_to_base @ np.array(
-        [position_camera[0], position_camera[1], position_camera[2], 1.0],
-        dtype=float,
-    )
-    rotation_base = (
-        camera_to_base[:3, :3]
-        @ rotation_camera
-        @ graspnet_tcp_rotation_calibration(args)
-    )
-    rx_deg, ry_deg, rz_deg = euler_xyz_deg_from_rotation_matrix(rotation_base)
-    z_offset_mm = float(getattr(args, "graspnet_tcp_z_offset_mm", 0.0))
-    base_x_mm = float(position_base_m[0] * 1000.0)
-    base_y_mm = float(position_base_m[1] * 1000.0)
-    base_z_mm = float(position_base_m[2] * 1000.0) + z_offset_mm
-    tcp_pose = EndPose(
-        x_mm=base_x_mm,
-        y_mm=base_y_mm,
-        z_mm=base_z_mm,
-        rx_deg=rx_deg,
-        ry_deg=ry_deg,
-        rz_deg=rz_deg,
-    )
-    return ResolvedGraspCandidate(
-        source_index=candidate.index,
-        source=candidate.source,
-        score=candidate.score,
-        width_m=candidate.width_m,
-        approach_depth_m=candidate.approach_depth_m,
-        camera_position_m=tuple(float(value) for value in position_camera),
-        camera_rotation=tuple(
-            tuple(float(item) for item in row)
-            for row in rotation_camera
-        ),
-        base_position_mm=(
-            base_x_mm,
-            base_y_mm,
-            base_z_mm,
-        ),
-        base_rotation=rotation_base,
-        tcp_pose=tcp_pose,
-    )
-
-
-def validate_graspnet_candidate_orientation(
-    candidate: ResolvedGraspCandidate,
-    args: argparse.Namespace,
-) -> None:
-    max_delta = getattr(args, "graspnet_max_rz_delta_deg", None)
-    if max_delta is None:
-        return
-    delta = abs(normalize_degrees(candidate.tcp_pose.rz_deg - float(args.rz_deg)))
-    if delta > float(max_delta):
-        raise SafetyError(
-            "GraspNet candidate rz delta "
-            f"{delta:.3f}deg exceeds limit {float(max_delta):.3f}deg "
-            f"(candidate={candidate.tcp_pose.rz_deg:.3f}deg, "
-            f"reference={float(args.rz_deg):.3f}deg)"
-        )
-
-
-def graspnet_approach_pose(
-    args: argparse.Namespace,
-    candidate: ResolvedGraspCandidate,
-) -> EndPose:
-    distance_mm = float(args.graspnet_approach_distance_mm)
-    approach_axis = np.asarray(candidate.base_rotation[:, 2], dtype=float)
-    position = np.asarray(
-        [
-            candidate.tcp_pose.x_mm,
-            candidate.tcp_pose.y_mm,
-            candidate.tcp_pose.z_mm,
-        ],
-        dtype=float,
-    )
-    approach_position = position - approach_axis * distance_mm
-    return EndPose(
-        x_mm=float(approach_position[0]),
-        y_mm=float(approach_position[1]),
-        z_mm=float(approach_position[2]),
-        rx_deg=candidate.tcp_pose.rx_deg,
-        ry_deg=candidate.tcp_pose.ry_deg,
-        rz_deg=candidate.tcp_pose.rz_deg,
-    )
-
-
-def graspnet_lift_pose(
-    args: argparse.Namespace,
-    candidate: ResolvedGraspCandidate,
-) -> EndPose:
-    return EndPose(
-        x_mm=candidate.tcp_pose.x_mm,
-        y_mm=candidate.tcp_pose.y_mm,
-        z_mm=candidate.tcp_pose.z_mm + float(args.graspnet_lift_height_mm),
-        rx_deg=candidate.tcp_pose.rx_deg,
-        ry_deg=candidate.tcp_pose.ry_deg,
-        rz_deg=candidate.tcp_pose.rz_deg,
-    )
-
-
-def graspnet_candidate_to_dict(candidate: ResolvedGraspCandidate | None) -> dict[str, Any] | None:
-    if candidate is None:
-        return None
-    return {
-        "source_index": candidate.source_index,
-        "source": candidate.source,
-        "score": candidate.score,
-        "width_m": candidate.width_m,
-        "approach_depth_m": candidate.approach_depth_m,
-        "camera_position_m": {
-            "x_m": candidate.camera_position_m[0],
-            "y_m": candidate.camera_position_m[1],
-            "z_m": candidate.camera_position_m[2],
-        },
-        "base_position_mm": {
-            "x_mm": candidate.base_position_mm[0],
-            "y_mm": candidate.base_position_mm[1],
-            "z_mm": candidate.base_position_mm[2],
-        },
-        "tcp_pose": pose_to_dict(candidate.tcp_pose),
-    }
 
 
 def use_joint_pitch_adjustment(args: argparse.Namespace, pitch_source_x_mm: float) -> bool:
@@ -1780,108 +1493,6 @@ def target_from_command(
     return target
 
 
-def target_from_graspnet_candidate(
-    command: CameraPointCommand,
-    candidate: ResolvedGraspCandidate,
-    camera_to_base: Any,
-    args: argparse.Namespace,
-    *,
-    validate: bool = True,
-) -> YoloCatchTarget:
-    base_xyz_m = map_camera_point_to_base_xyz_m(
-        command.x_m,
-        command.y_m,
-        command.z_m,
-        camera_to_base,
-    )
-    candidate, pick_x_source, pick_y_source = project_dynamic_graspnet_candidate(
-        command,
-        candidate,
-        base_xyz_m,
-    )
-    pick_x_mm, pick_y_mm, grasp_z_mm = (
-        candidate.tcp_pose.x_mm,
-        candidate.tcp_pose.y_mm,
-        candidate.tcp_pose.z_mm,
-    )
-    target = YoloCatchTarget(
-        camera_command=command,
-        base_xyz_m=base_xyz_m,
-        pick_x_mm=float(pick_x_mm),
-        pick_y_mm=float(pick_y_mm),
-        grasp_z_mm=float(grasp_z_mm),
-        raw_pick_x_mm=float(pick_x_mm),
-        raw_pick_y_mm=float(pick_y_mm),
-        pick_x_source=pick_x_source,
-        pick_y_source=pick_y_source,
-        raw_grasp_z_mm=float(grasp_z_mm),
-        grasp_z_source="graspnet_candidate_pose",
-        uncompensated_grasp_z_mm=float(grasp_z_mm),
-        planar_ik_grasp_z_comp_mm=0.0,
-        planar_ik_grasp_z_comp_pitch_delta_deg=0.0,
-        vision_source="graspnet",
-        graspnet_candidate=candidate,
-    )
-    if validate:
-        validate_target(target, args)
-    return target
-
-
-def _finite_command_mm(value: float | None, fallback_mm: float) -> float:
-    if value is None:
-        return float(fallback_mm)
-    numeric = float(value)
-    if not math.isfinite(numeric):
-        return float(fallback_mm)
-    return numeric
-
-
-def project_dynamic_graspnet_candidate(
-    command: CameraPointCommand,
-    candidate: ResolvedGraspCandidate,
-    command_base_xyz_m: tuple[float, float, float],
-) -> tuple[ResolvedGraspCandidate, str, str]:
-    if command.grasp_mode != "dynamic":
-        return candidate, "graspnet_candidate_pose", "graspnet_candidate_pose"
-    if command.pick_x_mm is None or command.pick_y_mm is None:
-        raise ValueError("dynamic GraspNet command requires pick_x_mm and pick_y_mm")
-
-    detected_x_mm = _finite_command_mm(
-        command.detected_x_mm,
-        command_base_xyz_m[0] * 1000.0,
-    )
-    detected_y_mm = _finite_command_mm(
-        command.detected_y_mm,
-        command_base_xyz_m[1] * 1000.0,
-    )
-    candidate_pose = candidate.tcp_pose
-    projected_x_mm = (
-        float(command.pick_x_mm) + candidate_pose.x_mm - detected_x_mm
-    )
-    projected_y_mm = (
-        float(command.pick_y_mm) + candidate_pose.y_mm - detected_y_mm
-    )
-    projected_pose = replace(
-        candidate_pose,
-        x_mm=projected_x_mm,
-        y_mm=projected_y_mm,
-    )
-    projected_candidate = replace(
-        candidate,
-        base_position_mm=(
-            projected_x_mm,
-            projected_y_mm,
-            candidate.base_position_mm[2],
-        ),
-        tcp_pose=projected_pose,
-    )
-    return (
-        projected_candidate,
-        "graspnet_candidate_pose_dynamic_projected_x",
-        "graspnet_candidate_pose_dynamic_projected_y",
-    )
-
-
 def validate_target(target: YoloCatchTarget, args: argparse.Namespace) -> None:
     checks = (
         ("target-x", target.pick_x_mm, args.min_target_x_mm, args.max_target_x_mm),
@@ -1905,38 +1516,6 @@ def build_out_steps(
     target: YoloCatchTarget,
 ) -> tuple[SequenceStep, ...]:
     ready = ready_pose(args)
-    if target.graspnet_candidate is not None:
-        candidate = target.graspnet_candidate
-        pick_above = graspnet_approach_pose(args, candidate)
-        pick_grasp = candidate.tcp_pose
-        pick_lift = graspnet_lift_pose(args, candidate)
-        place_above = fixed_pose(args, args.place_x_mm, args.place_y_mm, args.transfer_z_mm)
-        steps: list[SequenceStep] = [
-            SequenceStep("ready_open", ready, args.transfer_mode, "open"),
-            SequenceStep("pick_above", pick_above, "L", require_reached=True),
-            SequenceStep(
-                "pick_grasp",
-                pick_grasp,
-                args.vertical_mode,
-                "close",
-                delay_before_s=args.pick_delay_s,
-            ),
-            SequenceStep("pick_lift", pick_lift, args.lift_mode),
-        ]
-        if args.grasp_only:
-            if not args.no_return_ready:
-                steps.append(SequenceStep("return_ready", ready, args.transfer_mode))
-            return tuple(steps)
-        steps.extend(
-            [
-                SequenceStep("place_above", place_above, args.transfer_mode),
-                SequenceStep("place_release", place_above, args.transfer_mode, "open"),
-            ]
-        )
-        if not args.no_return_ready:
-            steps.append(SequenceStep("return_ready", ready, args.transfer_mode))
-        return tuple(steps)
-
     pick_above = target_pose(args, target, args.transfer_z_mm)
     pick_grasp = target_pose(args, target, target.grasp_z_mm)
     place_above = fixed_pose(args, args.place_x_mm, args.place_y_mm, args.transfer_z_mm)
@@ -2020,31 +1599,6 @@ def build_in_steps(
         raise ValueError("--no-return-ready is incompatible with task 'in'")
 
     ready = ready_pose(args)
-    if target.graspnet_candidate is not None:
-        candidate = target.graspnet_candidate
-        pick_above = graspnet_approach_pose(args, candidate)
-        pick_grasp = candidate.tcp_pose
-        pick_lift = graspnet_lift_pose(args, candidate)
-        return (
-            SequenceStep("ready_open", ready, args.transfer_mode, "open"),
-            SequenceStep(
-                label="return_pick_above",
-                pose=pick_above,
-                mode="L",
-                delay_before_s=args.place_pick_delay_s,
-                require_reached=True,
-            ),
-            SequenceStep(
-                label="return_pick_grasp",
-                pose=pick_grasp,
-                mode=args.vertical_mode,
-                gripper_after="close",
-            ),
-            SequenceStep("return_pick_lift", pick_lift, args.lift_mode),
-            SequenceStep("return_ready_above", ready, args.transfer_mode),
-            SequenceStep("final_release", ready, args.transfer_mode, "open"),
-        )
-
     pick_above = target_pose(args, target, args.transfer_z_mm)
     pick_grasp = target_pose(args, target, target.grasp_z_mm)
     pitch_x_mm = pitch_source_x_mm(target)
@@ -2111,64 +1665,6 @@ def build_plan_for_target(
         target=target,
         steps=build_steps(args, target),
     )
-
-
-def select_graspnet_plan(
-    command: CameraPointCommand,
-    camera_to_base: np.ndarray,
-    args: argparse.Namespace,
-    validator: PiperController,
-) -> YoloCatchPlan:
-    if not command.grasp_candidates:
-        raise ValueError(
-            "--vision-source graspnet requires at least one grasp candidate "
-            "in the command payload"
-        )
-
-    limit = int(args.graspnet_max_candidates)
-    resolved = [
-        resolve_grasp_candidate(candidate, camera_to_base, args)
-        for candidate in command.grasp_candidates[:limit]
-    ]
-    resolved.sort(
-        key=lambda item: candidate_sort_key(
-            item,
-            policy=args.graspnet_candidate_policy,
-        ),
-        reverse=True,
-    )
-
-    failures: list[str] = []
-    for candidate in resolved:
-        try:
-            validate_graspnet_candidate_orientation(candidate, args)
-            target = target_from_graspnet_candidate(
-                command,
-                candidate,
-                camera_to_base,
-                args,
-            )
-            plan = build_plan_for_target(command, target, args)
-            validate_steps(validator, plan.steps)
-        except (SafetyError, ValueError) as exc:
-            index = "?" if candidate.source_index is None else str(candidate.source_index)
-            failures.append(f"{index}: {exc}")
-            continue
-        return plan
-
-    if bool(args.graspnet_allow_fixed_fallback):
-        target = target_from_command(command, camera_to_base, args)
-        plan = build_plan_for_target(command, target, args)
-        validate_steps(validator, plan.steps)
-        print(
-            "No GraspNet candidate validated; falling back to legacy fixed pose. "
-            + "; ".join(failures),
-            flush=True,
-        )
-        return plan
-
-    detail = "; ".join(failures) if failures else "no candidates evaluated"
-    raise SafetyError(f"no reachable GraspNet grasp candidate: {detail}")
 
 
 def dynamic_timing_from_command(
@@ -3708,10 +3204,7 @@ def compute_grasp_yaw_adjustment_result(
     *,
     execute: bool,
 ) -> tuple[GraspYawAdjustmentResult, tuple[float, ...] | None]:
-    if (
-        vision_source_mode(args) != "opencv"
-        or not getattr(args, "grasp_yaw_by_object_short_edge", False)
-    ):
+    if not getattr(args, "grasp_yaw_by_object_short_edge", False):
         return GraspYawAdjustmentResult(enabled=False, reason="disabled"), None
 
     source_yaw = target.camera_command.object_short_axis_yaw_deg
@@ -4304,22 +3797,19 @@ def handle_message(
         args,
         source_x_mm=command.pick_x_mm,
     )
+    if command.vision_source == "graspnet" or command.grasp_candidates:
+        raise ValueError(
+            "catch_server_1 no longer accepts GraspNet commands; "
+            "use catch_server_graspnet.py"
+        )
     active_validator = controller or validator
-    if vision_source_mode(args) == "graspnet":
-        plan = select_graspnet_plan(
-            command,
-            camera_to_base,
-            args,
-            active_validator,
-        )
-    else:
-        target = target_from_command(
-            command,
-            camera_to_base,
-            args,
-        )
-        plan = build_plan_for_target(command, target, args)
-        validate_steps(active_validator, plan.steps)
+    target = target_from_command(
+        command,
+        camera_to_base,
+        args,
+    )
+    plan = build_plan_for_target(command, target, args)
+    validate_steps(active_validator, plan.steps)
     target = plan.target
     planned_preposition_pose: EndPose | None = None
     planned_preposition_source: str | None = None
@@ -4448,9 +3938,6 @@ def handle_message(
                 "ry_deg": plan.steps[2].pose.ry_deg,
                 "rz_deg": plan.steps[2].pose.rz_deg,
             },
-            "graspnet_candidate": graspnet_candidate_to_dict(
-                target.graspnet_candidate
-            ),
             "dynamic_pitch": dynamic_pitch_summary(args, target),
             "joint_pitch_adjustments": [
                 joint_pitch_adjustment_to_dict(result)

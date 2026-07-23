@@ -1,5 +1,36 @@
 # 点击抓取 Server
 
+## GraspNet 6D 抓取（第一阶段）
+
+GraspNet 使用独立服务，`catch_server_1` 不再接收 GraspNet 候选：
+
+```bash
+python3 -m robot_control.linux.catch.catch_server_graspnet \
+  --host 0.0.0.0 \
+  --port 5005 \
+  --hand-eye-result robot_control/linux/hand_eye/eye_to_hand_result_auto.json \
+  --debug-plan
+```
+
+先用不带 `--execute` 的 dry-run 校验接近轴、TCP 标定、抓取高度和完整
+6 轴 IK。确认计划后再以低速加入 `--execute`。服务会检查抓取及预抓取
+位姿、连续接近路径、关节变化、关节限位余量、奇异性和最低 TCP 高度；
+这一阶段不包含障碍物模型或自动绕障，因此工作区必须清空并保持目标静止。
+官方 GraspNet rotation matrix 的接近方向默认按局部 X 轴解释；初次联调必须
+用已知的竖直抓取检查 `--approach-axis/--approach-axis-sign`，并标定
+`--tcp-rot-*-deg`、`--tcp-offset-*-mm` 和 `--fk-tool-z-offset-mm`。轴系或 TCP
+未确认前不要加 `--execute`。
+
+Windows 端继续使用：
+
+```bash
+python -m robot_control.windows.client.graspnet_grasp_send_tcp \
+  static \
+  --host <linux-vm-ip> \
+  --port 5005 \
+  --belt-depth-plane-json <belt-plane.json>
+```
+
 这个目录提供 Linux 侧点击抓取入口。它复用现有 Windows 客户端：
 
 ```bash
