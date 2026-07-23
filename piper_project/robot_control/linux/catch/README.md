@@ -16,10 +16,54 @@ python3 -m robot_control.linux.catch.catch_server_graspnet \
 6 轴 IK。确认计划后再以低速加入 `--execute`。服务会检查抓取及预抓取
 位姿、连续接近路径、关节变化、关节限位余量、奇异性和最低 TCP 高度；
 这一阶段不包含障碍物模型或自动绕障，因此工作区必须清空并保持目标静止。
+加入 `--execute` 后，服务会先运动到 `--nominal-joints-deg` 指定的初始姿态
+（默认 `0 90 -90 0 30 0` 度），到位后才开始监听抓取命令。
+启动路径和抓取路径默认都限制每个关节的总变化不超过 `60` 度，并对每个
+`8` 度关节航点等待实时反馈、检查关节限位余量、TCP 高度、规划路径偏差和
+雅可比条件数。任何启动或执行异常都会触发机械臂急停并退出服务，必须检查
+现场后人工重新启动；脚本不会自动解除急停。
 官方 GraspNet rotation matrix 的接近方向默认按局部 X 轴解释；初次联调必须
 用已知的竖直抓取检查 `--approach-axis/--approach-axis-sign`，并标定
 `--tcp-rot-*-deg`、`--tcp-offset-*-mm` 和 `--fk-tool-z-offset-mm`。轴系或 TCP
 未确认前不要加 `--execute`。
+
+安全阈值可按现场验证结果调整：
+
+```text
+--max-startup-joint-delta-deg J1 J2 J3 J4 J5 J6  启动到初始位的逐关节总变化
+--max-joint-delta-deg J1 J2 J3 J4 J5 J6          当前位到预抓取位的逐关节总变化
+--max-approach-joint-delta-deg J1 J2 J3 J4 J5 J6 预抓取到抓取位的逐关节总变化
+--max-joint-waypoint-step-deg 8                    相邻关节航点最大跨度
+--max-runtime-path-error-deg 5                     实际反馈偏离规划线段的容差
+--max-jacobian-condition 500                       奇异性条件数上限
+--joint-limit-margin-deg 5                         与绝对关节限位的最小余量
+--motion-timeout-s 8                               单个航点的到位超时
+```
+
+上述角度参数均为度。放宽阈值前应先用 dry-run 和低速空场测试；软件急停不能
+替代实体急停按钮、安全围栏或控制器自身的碰撞保护。
+
+例如使用关节弧度位姿 `0 1.5 -1 0 0.5 -1.25` 作为初始位时：
+
+```bash
+python3 -m robot_control.linux.catch.catch_server_graspnet \
+  --execute \
+  --speed 10 \
+  --nominal-joints-deg 0 85.9437 -57.2958 0 28.6479 -71.6197 \
+  --max-startup-joint-delta-deg 60 60 60 60 60 60 \
+  --max-joint-delta-deg 60 60 60 60 60 60
+```
+
+如果实时反馈到这个初始位的任一关节跨度超过 60 度，上述命令会急停并退出，
+而不是自动放宽限制。只有确认现场路径安全后，才应单独调整启动限制。
+
+如果现场要求抓取 TCP 不低于固定高度，但视觉候选存在已测量的系统性 Z 偏差，
+可用 `--grasp-z-offset-mm` 沿机器人基座 `+Z` 统一抬高候选，再由
+`--min-grasp-z-mm` 执行最低高度检查。该参数不同于沿 GraspNet 局部轴生效的
+`--tcp-offset-*-mm`；首次设置时仍应只做 dry-run。
+
+GraspNet 服务默认允许的基座 Y 抓取区间为 `[-550, -350] mm`，可通过
+`--min-target-y-mm` 和 `--max-target-y-mm` 按现场工作区调整。
 
 Windows 端继续使用：
 

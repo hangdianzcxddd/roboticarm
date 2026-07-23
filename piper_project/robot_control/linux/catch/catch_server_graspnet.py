@@ -115,6 +115,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--command-period-s", type=float, default=0.02)
     parser.add_argument("--motion-timeout-s", type=float, default=8.0)
     parser.add_argument("--joint-tolerance-deg", type=float, default=2.0)
+    parser.add_argument(
+        "--max-runtime-path-error-deg",
+        type=float,
+        default=5.0,
+        help="emergency-stop if live joints stray this far from a planned segment",
+    )
     parser.add_argument("--debug-plan", action="store_true")
     parser.add_argument("--collision-protection-level", type=int, default=2)
 
@@ -149,6 +155,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tcp-offset-y-mm", type=float, default=0.0)
     parser.add_argument("--tcp-offset-z-mm", type=float, default=0.0)
     parser.add_argument(
+        "--grasp-z-offset-mm",
+        type=float,
+        default=0.0,
+        help=(
+            "add a fixed offset along the robot base +Z axis to every vision "
+            "grasp position before safety and IK checks"
+        ),
+    )
+    parser.add_argument(
         "--fk-tool-z-offset-mm",
         type=float,
         default=82.0,
@@ -157,8 +172,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--min-target-x-mm", type=float, default=80.0)
     parser.add_argument("--max-target-x-mm", type=float, default=550.0)
-    parser.add_argument("--min-target-y-mm", type=float, default=-300.0)
-    parser.add_argument("--max-target-y-mm", type=float, default=300.0)
+    parser.add_argument(
+        "--min-target-y-mm",
+        type=float,
+        default=-550.0,
+        help="minimum allowed grasp Y in the robot base frame",
+    )
+    parser.add_argument(
+        "--max-target-y-mm",
+        type=float,
+        default=-350.0,
+        help="maximum allowed grasp Y in the robot base frame",
+    )
     parser.add_argument(
         "--min-grasp-z-mm",
         type=float,
@@ -185,16 +210,28 @@ def build_parser() -> argparse.ArgumentParser:
         "--nominal-joints-deg",
         type=float,
         nargs=6,
-        default=(0.0, 90.0, -90.0, 0.0, 0.0, 0.0),
+        default=(0.0, 90.0, -90.0, 0.0, 30.0, 0.0),
         metavar=("J1", "J2", "J3", "J4", "J5", "J6"),
-        help="planning start used only for dry-run when live feedback is unavailable",
+        help=(
+            "startup joint pose in degrees when --execute is enabled; also used "
+            "as the planning start for dry-run"
+        ),
     )
     parser.add_argument(
         "--max-joint-delta-deg",
         type=float,
         nargs=6,
-        default=(60.0, 70.0, 70.0, 90.0, 60.0, 90.0),
+        default=(60.0,) * JOINT_COUNT,
         metavar=("J1", "J2", "J3", "J4", "J5", "J6"),
+        help="maximum total change per joint from the motion start, in degrees",
+    )
+    parser.add_argument(
+        "--max-startup-joint-delta-deg",
+        type=float,
+        nargs=6,
+        default=(60.0,) * JOINT_COUNT,
+        metavar=("J1", "J2", "J3", "J4", "J5", "J6"),
+        help="maximum change per joint from the live pose to the startup pose",
     )
     parser.add_argument(
         "--max-approach-joint-delta-deg",
@@ -258,6 +295,7 @@ def validate_args(args: argparse.Namespace) -> None:
         "max_joint_waypoint_step_deg",
         "motion_timeout_s",
         "joint_tolerance_deg",
+        "max_runtime_path_error_deg",
     )
     for name in positive:
         if not math.isfinite(float(getattr(args, name))) or getattr(args, name) <= 0:
@@ -269,6 +307,7 @@ def validate_args(args: argparse.Namespace) -> None:
         "tcp_offset_x_mm",
         "tcp_offset_y_mm",
         "tcp_offset_z_mm",
+        "grasp_z_offset_mm",
         "fk_tool_z_offset_mm",
         "min_target_x_mm",
         "max_target_x_mm",
@@ -286,10 +325,20 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--min-grasp-z-mm must be >= --min-trajectory-tcp-z-mm")
     if args.min_grasp_z_mm > args.max_grasp_z_mm:
         raise ValueError("--min-grasp-z-mm must be <= --max-grasp-z-mm")
-    if any(value <= 0 for value in args.max_joint_delta_deg):
-        raise ValueError("all --max-joint-delta-deg values must be > 0")
-    if any(value <= 0 for value in args.max_approach_joint_delta_deg):
-        raise ValueError("all --max-approach-joint-delta-deg values must be > 0")
+    if args.min_target_y_mm > args.max_target_y_mm:
+        raise ValueError("--min-target-y-mm must be <= --max-target-y-mm")
+    for option in (
+        "max_joint_delta_deg",
+        "max_startup_joint_delta_deg",
+        "max_approach_joint_delta_deg",
+    ):
+        if any(
+            not math.isfinite(value) or value <= 0
+            for value in getattr(args, option)
+        ):
+            raise ValueError(
+                f"all --{option.replace('_', '-')} values must be finite and > 0"
+            )
     if args.collision_protection_level is not None and not (
         0 <= args.collision_protection_level <= 8
     ):
@@ -377,6 +426,7 @@ def resolve_candidate_variants(
         [args.tcp_offset_x_mm, args.tcp_offset_y_mm, args.tcp_offset_z_mm],
         dtype=float,
     )
+    position_mm[2] += float(args.grasp_z_offset_mm)
     if command.grasp_mode == "dynamic":
         raise SafetyError(
             "dynamic GraspNet grasp is disabled in phase 1: plan only stationary targets"
@@ -669,18 +719,34 @@ def interpolate_pose(start: EndPose, end: EndPose, alpha: float) -> EndPose:
 def validate_joint_deltas(
     start: Sequence[float], target: Sequence[float], args: argparse.Namespace
 ) -> tuple[float, float]:
+    return validate_joint_change(
+        start,
+        target,
+        args.max_joint_delta_deg,
+        label="pregrasp",
+        cost_weights=args.joint_cost_weights,
+    )
+
+
+def validate_joint_change(
+    start: Sequence[float],
+    target: Sequence[float],
+    limits_deg: Sequence[float],
+    *,
+    label: str,
+    cost_weights: Sequence[float] | None = None,
+) -> tuple[float, float]:
     deltas_deg = np.abs(np.degrees(np.asarray(target) - np.asarray(start)))
-    limits = np.asarray(args.max_joint_delta_deg, dtype=float)
+    limits = np.asarray(limits_deg, dtype=float)
     violations = [
         f"J{index + 1}={delta:.2f}deg>{limit:.2f}deg"
         for index, (delta, limit) in enumerate(zip(deltas_deg, limits))
         if delta > limit
     ]
     if violations:
-        raise SafetyError("pregrasp joint change too large: " + ", ".join(violations))
-    cost = float(
-        np.sum(np.asarray(args.joint_cost_weights, dtype=float) * deltas_deg / limits)
-    )
+        raise SafetyError(f"{label} joint change too large: " + ", ".join(violations))
+    weights = np.ones(JOINT_COUNT) if cost_weights is None else np.asarray(cost_weights)
+    cost = float(np.sum(weights * deltas_deg / limits))
     return float(np.max(deltas_deg)), cost
 
 
@@ -696,6 +762,12 @@ def validate_path_height(
     for index, joints in enumerate(path):
         pose = fk_tcp_pose(joints, args)
         controller.validate_joints(list(joints))
+        margin_deg = _joint_margin_deg(joints, controller)
+        if margin_deg < args.joint_limit_margin_deg:
+            raise SafetyError(
+                f"{label}[{index}] joint-limit margin={margin_deg:.3f}deg is below "
+                f"{args.joint_limit_margin_deg:.3f}deg"
+            )
         controller.validate_pose(pose)
         if pose.z_mm < args.min_trajectory_tcp_z_mm:
             raise SafetyError(
@@ -712,9 +784,7 @@ def validate_path_height(
                 f"{args.max_jacobian_condition:.3f}"
             )
         maximum_condition = max(maximum_condition, condition)
-        minimum_margin_deg = min(
-            minimum_margin_deg, _joint_margin_deg(joints, controller)
-        )
+        minimum_margin_deg = min(minimum_margin_deg, margin_deg)
     return minimum_margin_deg, maximum_condition
 
 
@@ -891,6 +961,58 @@ def read_live_joints(controller: PiperController) -> tuple[float, ...]:
     raise RuntimeError("fresh Piper joint feedback is required for GraspNet planning")
 
 
+def validate_runtime_joint_state(
+    current: Sequence[float],
+    segment_start: Sequence[float],
+    segment_target: Sequence[float],
+    controller: PiperController,
+    args: argparse.Namespace,
+    *,
+    label: str,
+) -> None:
+    current_array = np.asarray(current, dtype=float)
+    start_array = np.asarray(segment_start, dtype=float)
+    target_array = np.asarray(segment_target, dtype=float)
+    controller.validate_joints(list(current_array))
+    margin_deg = _joint_margin_deg(current_array, controller)
+    if margin_deg < args.joint_limit_margin_deg:
+        raise SafetyError(
+            f"{label} live joint-limit margin={margin_deg:.3f}deg is below "
+            f"{args.joint_limit_margin_deg:.3f}deg"
+        )
+
+    tolerance = math.radians(float(args.max_runtime_path_error_deg))
+    lower = np.minimum(start_array, target_array) - tolerance
+    upper = np.maximum(start_array, target_array) + tolerance
+    violations = [
+        f"J{index + 1}={math.degrees(value):.2f}deg outside "
+        f"[{math.degrees(low):.2f}, {math.degrees(high):.2f}]deg"
+        for index, (value, low, high) in enumerate(zip(current_array, lower, upper))
+        if value < low or value > high
+    ]
+    if violations:
+        raise SafetyError(
+            f"{label} live joint path deviation: " + ", ".join(violations)
+        )
+
+    pose = fk_tcp_pose(current_array, args)
+    controller.validate_pose(pose)
+    if pose.z_mm < args.min_trajectory_tcp_z_mm:
+        raise SafetyError(
+            f"{label} live TCP z={pose.z_mm:.3f} mm is below trajectory floor "
+            f"{args.min_trajectory_tcp_z_mm:.3f} mm"
+        )
+    transform = fk_tcp_transform(current_array, args)
+    condition = float(
+        np.linalg.cond(_finite_difference_jacobian(current_array, transform, args))
+    )
+    if not math.isfinite(condition) or condition > args.max_jacobian_condition:
+        raise SafetyError(
+            f"{label} live Jacobian condition={condition:.3f} exceeds "
+            f"{args.max_jacobian_condition:.3f}"
+        )
+
+
 def wait_until_joints_reached(
     controller: PiperController,
     target: Sequence[float],
@@ -898,6 +1020,7 @@ def wait_until_joints_reached(
     *,
     label: str,
     initial_stamp: float | None,
+    segment_start: Sequence[float] | None = None,
 ) -> None:
     deadline = time.monotonic() + float(args.motion_timeout_s)
     last_error = float("inf")
@@ -907,6 +1030,15 @@ def wait_until_joints_reached(
         stamp = _joint_feedback_timestamp(feedback)
         fresh = initial_stamp is None or stamp is None or stamp > initial_stamp
         if current is not None:
+            if segment_start is not None:
+                validate_runtime_joint_state(
+                    current,
+                    segment_start,
+                    target,
+                    controller,
+                    args,
+                    label=label,
+                )
             last_error = float(
                 np.max(np.abs(np.degrees(np.asarray(current) - np.asarray(target))))
             )
@@ -925,35 +1057,71 @@ def execute_joint_path(
     *,
     label: str,
     speed: int,
-    wait_each_waypoint: bool = False,
 ) -> int:
     count = 0
-    final_stamp: float | None = None
     for index, joints in enumerate(path[1:], start=1):
-        feedback = controller.get_joint_state()
-        stamp = _joint_feedback_timestamp(feedback)
+        current = read_live_joints(controller)
+        expected_start = np.asarray(path[index - 1], dtype=float)
+        start_error = float(
+            np.max(np.abs(np.degrees(np.asarray(current) - expected_start)))
+        )
+        if start_error > args.joint_tolerance_deg:
+            raise SafetyError(
+                f"{label}[{index}] starts {start_error:.3f}deg away from planned path"
+            )
+        stamp = _joint_feedback_timestamp(controller.get_joint_state())
         controller.move_joints(list(joints), speed_percent=speed)
         count += 1
-        final_stamp = stamp
-        if wait_each_waypoint:
-            wait_until_joints_reached(
-                controller,
-                joints,
-                args,
-                label=f"{label}[{index}]",
-                initial_stamp=stamp,
-            )
-        elif args.command_period_s > 0:
-            time.sleep(args.command_period_s)
-    if len(path) > 1 and not wait_each_waypoint:
         wait_until_joints_reached(
             controller,
-            path[-1],
+            joints,
             args,
-            label=f"{label}[final]",
-            initial_stamp=final_stamp,
+            label=f"{label}[{index}]",
+            initial_stamp=stamp,
+            segment_start=current,
         )
     return count
+
+
+def move_to_nominal_joints(
+    controller: PiperController, args: argparse.Namespace
+) -> tuple[float, ...]:
+    target = tuple(math.radians(value) for value in args.nominal_joints_deg)
+    controller.validate_joints(target)
+    current = read_live_joints(controller)
+    validate_joint_change(
+        current,
+        target,
+        args.max_startup_joint_delta_deg,
+        label="startup",
+    )
+    path = interpolate_joint_path(
+        current, target, args.max_joint_waypoint_step_deg
+    )
+    validate_path_height(path, controller, args, label="startup")
+    print(
+        "Moving to startup joints: "
+        + " ".join(f"{value:.3f}" for value in args.nominal_joints_deg)
+        + " deg",
+        flush=True,
+    )
+    execute_joint_path(controller, path, args, label="startup", speed=args.speed)
+    print("Startup joint pose reached", flush=True)
+    return target
+
+
+def emergency_stop_on_failure(
+    controller: PiperController, *, context: str
+) -> None:
+    try:
+        controller.emergency_stop()
+        print(f"EMERGENCY STOP triggered after {context}", file=sys.stderr, flush=True)
+    except Exception as stop_exc:  # noqa: BLE001 - preserve the original failure
+        print(
+            f"EMERGENCY STOP command failed after {context}: {stop_exc}",
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 def execute_plan(
@@ -978,7 +1146,6 @@ def execute_plan(
             args,
             label="approach",
             speed=args.grasp_speed,
-            wait_each_waypoint=True,
         ),
     }
     send_gripper(controller, args, "close")
@@ -989,7 +1156,6 @@ def execute_plan(
         args,
         label="retreat",
         speed=args.grasp_speed,
-        wait_each_waypoint=True,
     )
     return_path = tuple(reversed(plan.transfer_path))
     counts["return"] = execute_joint_path(
@@ -1084,11 +1250,15 @@ def handle_message(
                 "minimum_grasp_z_mm": args.min_grasp_z_mm,
                 "minimum_trajectory_tcp_z_mm": args.min_trajectory_tcp_z_mm,
                 "joint_limit_margin_deg": args.joint_limit_margin_deg,
+                "maximum_startup_joint_delta_deg": list(
+                    args.max_startup_joint_delta_deg
+                ),
                 "maximum_joint_delta_deg": list(args.max_joint_delta_deg),
                 "maximum_approach_joint_delta_deg": list(
                     args.max_approach_joint_delta_deg
                 ),
                 "maximum_joint_waypoint_step_deg": args.max_joint_waypoint_step_deg,
+                "maximum_runtime_path_error_deg": args.max_runtime_path_error_deg,
                 "maximum_jacobian_condition": args.max_jacobian_condition,
                 "collision_protection_level": args.collision_protection_level,
                 "obstacle_collision_planning": False,
@@ -1119,12 +1289,20 @@ def serve(args: argparse.Namespace) -> None:
     controller: PiperController | None = None
     if args.execute:
         controller = PiperController(config=config)
-        print("Connecting and enabling Piper arm...", flush=True)
-        controller.connect(enable=True)
-        print("Piper arm enabled", flush=True)
-        if args.collision_protection_level is not None:
-            controller.set_collision_protection([args.collision_protection_level] * 6)
-        maybe_prepare_gripper(controller, args)
+        try:
+            print("Connecting and enabling Piper arm...", flush=True)
+            controller.connect(enable=True)
+            print("Piper arm enabled", flush=True)
+            if args.collision_protection_level is not None:
+                controller.set_collision_protection(
+                    [args.collision_protection_level] * 6
+                )
+            move_to_nominal_joints(controller, args)
+            maybe_prepare_gripper(controller, args)
+        except BaseException:
+            emergency_stop_on_failure(controller, context="startup failure")
+            controller.disconnect()
+            raise
 
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
@@ -1154,10 +1332,18 @@ def serve(args: argparse.Namespace) -> None:
                                     validator=validator,
                                     controller=controller,
                                 )
-                            except Exception as exc:  # noqa: BLE001 - returned to client
+                            except Exception as exc:  # noqa: BLE001 - fail closed
+                                if controller is not None:
+                                    raise RuntimeError(
+                                        f"command {command_id!r} failed; arm emergency-stopped"
+                                    ) from exc
                                 response = make_error_message(command_id, str(exc))
                                 print(f"Error: {exc}", flush=True)
                             send_json_line(conn, response)
+    except BaseException:
+        if controller is not None:
+            emergency_stop_on_failure(controller, context="server shutdown")
+        raise
     finally:
         if controller is not None:
             controller.disconnect()
