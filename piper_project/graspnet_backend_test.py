@@ -28,6 +28,14 @@ class TestGraspNetBackend(unittest.TestCase):
             )
         )
 
+    def test_sample_points_for_graspnet_is_deterministic(self):
+        points = np.arange(90, dtype=np.float32).reshape(30, 3)
+
+        first = sample_points_for_graspnet(points, 12)
+        second = sample_points_for_graspnet(points, 12)
+
+        np.testing.assert_array_equal(first, second)
+
     def test_candidate_dicts_from_grasp_array_maps_official_row_layout(self):
         row = np.zeros(17, dtype=np.float32)
         row[0] = 0.91

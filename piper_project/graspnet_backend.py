@@ -53,7 +53,12 @@ def candidate_dicts_from_grasp_array(
     return result
 
 
-def sample_points_for_graspnet(points_xyz_m: np.ndarray, num_point: int) -> np.ndarray:
+def sample_points_for_graspnet(
+    points_xyz_m: np.ndarray,
+    num_point: int,
+    *,
+    seed: int = 0,
+) -> np.ndarray:
     points = np.asarray(points_xyz_m, dtype=np.float32)
     if points.ndim != 2 or points.shape[1] != 3:
         raise ValueError(f"expected point cloud shaped (N, 3), got {points.shape}")
@@ -61,11 +66,12 @@ def sample_points_for_graspnet(points_xyz_m: np.ndarray, num_point: int) -> np.n
     points = points[finite]
     if points.shape[0] == 0:
         return np.empty((0, 3), dtype=np.float32)
+    rng = np.random.default_rng(seed)
     if points.shape[0] >= num_point:
-        indexes = np.random.choice(points.shape[0], int(num_point), replace=False)
+        indexes = rng.choice(points.shape[0], int(num_point), replace=False)
     else:
         existing = np.arange(points.shape[0])
-        padded = np.random.choice(
+        padded = rng.choice(
             points.shape[0],
             int(num_point) - points.shape[0],
             replace=True,

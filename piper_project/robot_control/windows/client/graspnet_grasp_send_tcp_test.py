@@ -16,6 +16,7 @@ if cv2 is not None:
         DepthForegroundDetector,
         DepthForegroundDetectorConfig,
         GraspNetTarget,
+        StableTargetTracker,
         build_parser,
         camera_point_command_from_target,
         colored_point_cloud_from_targets,
@@ -65,6 +66,50 @@ def flat_plane(width: int, height: int, depth_m: float) -> BeltDepthPlane:
 
 @unittest.skipIf(cv2 is None, "opencv-python is required for GraspNet client tests")
 class TestGraspNetGraspSendTcp(unittest.TestCase):
+    @staticmethod
+    def make_segment(x: int, y: int, width: int, height: int, area: int):
+        detection = Detection(
+            u=x + width // 2,
+            v=y + height // 2,
+            x=x,
+            y=y,
+            width=width,
+            height=height,
+            area=float(area),
+            label="graspnet_object",
+        )
+        return SegmentationDetection(
+            detection=detection,
+            mask=np.ones((2, 2), dtype=bool),
+            mask_area_px=area,
+            centroid_u=x + width / 2.0,
+            centroid_v=y + height / 2.0,
+        )
+
+    def test_target_tracker_keeps_ids_when_area_order_changes(self):
+        tracker = StableTargetTracker(max_distance_px=50.0, max_missed_frames=2)
+        left = self.make_segment(10, 20, 20, 20, 500)
+        right = self.make_segment(200, 20, 20, 20, 400)
+
+        first = tracker.update([left, right])
+        second = tracker.update(
+            [
+                self.make_segment(201, 20, 20, 20, 600),
+                self.make_segment(11, 20, 20, 20, 300),
+            ]
+        )
+
+        self.assertEqual([(item[0], item[1].detection.x) for item in first], [(1, 10), (2, 200)])
+        self.assertEqual([(item[0], item[1].detection.x) for item in second], [(1, 11), (2, 201)])
+
+    def test_target_tracker_does_not_reassign_distant_object(self):
+        tracker = StableTargetTracker(max_distance_px=30.0, max_missed_frames=2)
+        first = tracker.update([self.make_segment(10, 20, 20, 20, 500)])
+        second = tracker.update([self.make_segment(200, 20, 20, 20, 500)])
+
+        self.assertEqual(first[0][0], 1)
+        self.assertEqual(second[0][0], 2)
+
     def test_parser_uses_aligned_realsense_intrinsics_by_default(self):
         args = build_parser().parse_args(
             ["--dry-run", "--belt-depth-plane-json", "belt.json"]

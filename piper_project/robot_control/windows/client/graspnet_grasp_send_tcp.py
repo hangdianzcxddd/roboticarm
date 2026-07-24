@@ -126,6 +126,86 @@ class _EntryClearTrack:
     clear_frames: int
 
 
+@dataclass
+class _TargetTrack:
+    target_id: int
+    bbox_xywh: tuple[int, int, int, int]
+    centroid_uv: tuple[float, float]
+    missed_frames: int = 0
+
+
+class StableTargetTracker:
+    """Keep target numbers attached to image objects instead of area ranks."""
+
+    def __init__(self, *, max_distance_px: float = 100.0, max_missed_frames: int = 15) -> None:
+        self.max_distance_px = float(max_distance_px)
+        self.max_missed_frames = int(max_missed_frames)
+        self._next_target_id = 1
+        self._tracks: dict[int, _TargetTrack] = {}
+
+    def update(
+        self,
+        segments: list[SegmentationDetection],
+    ) -> list[tuple[int, SegmentationDetection]]:
+        possible_matches: list[tuple[float, int, int]] = []
+        for target_id, track in self._tracks.items():
+            for segment_index, segment in enumerate(segments):
+                distance = float(
+                    np.hypot(
+                        segment.centroid_u - track.centroid_uv[0],
+                        segment.centroid_v - track.centroid_uv[1],
+                    )
+                )
+                if distance <= self.max_distance_px:
+                    possible_matches.append((distance, target_id, segment_index))
+
+        assignments: dict[int, int] = {}
+        used_target_ids: set[int] = set()
+        used_segment_indexes: set[int] = set()
+        for _distance, target_id, segment_index in sorted(possible_matches):
+            if target_id in used_target_ids or segment_index in used_segment_indexes:
+                continue
+            assignments[segment_index] = target_id
+            used_target_ids.add(target_id)
+            used_segment_indexes.add(segment_index)
+
+        next_tracks: dict[int, _TargetTrack] = {}
+        for target_id, track in self._tracks.items():
+            if target_id in used_target_ids:
+                continue
+            missed_frames = track.missed_frames + 1
+            if missed_frames <= self.max_missed_frames:
+                next_tracks[target_id] = _TargetTrack(
+                    target_id=target_id,
+                    bbox_xywh=track.bbox_xywh,
+                    centroid_uv=track.centroid_uv,
+                    missed_frames=missed_frames,
+                )
+
+        tracked_segments: list[tuple[int, SegmentationDetection]] = []
+        for segment_index, segment in enumerate(segments):
+            target_id = assignments.get(segment_index)
+            if target_id is None:
+                target_id = self._next_target_id
+                self._next_target_id += 1
+            detection = segment.detection
+            next_tracks[target_id] = _TargetTrack(
+                target_id=target_id,
+                bbox_xywh=(
+                    detection.x,
+                    detection.y,
+                    detection.width,
+                    detection.height,
+                ),
+                centroid_uv=(segment.centroid_u, segment.centroid_v),
+            )
+            tracked_segments.append((target_id, segment))
+
+        self._tracks = next_tracks
+        tracked_segments.sort(key=lambda item: item[0])
+        return tracked_segments
+
+
 @dataclass(frozen=True)
 class GraspNetTarget:
     rank: int
@@ -1134,6 +1214,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--entry-clear-margin-px", type=int, default=0)
     parser.add_argument("--entry-clear-frames", type=int, default=1)
     parser.add_argument("--max-results", type=int, default=10)
+    parser.add_argument(
+        "--target-track-max-distance-px",
+        type=float,
+        default=100.0,
+        help="maximum centroid movement used to keep a stable target ID",
+    )
+    parser.add_argument(
+        "--target-track-max-missed-frames",
+        type=int,
+        default=15,
+        help="retain a target ID across this many temporarily missing frames",
+    )
     parser.add_argument("--voxel-size-m", type=float, default=0.004)
     parser.add_argument("--max-point-count", type=int, default=20000)
     parser.add_argument("--max-grasp-candidates", type=int, default=20)
@@ -1206,6 +1298,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--timeout-s must be > 0")
     if args.max_results < 1:
         raise ValueError("--max-results must be >= 1")
+    if args.target_track_max_distance_px <= 0:
+        raise ValueError("--target-track-max-distance-px must be > 0")
+    if args.target_track_max_missed_frames < 0:
+        raise ValueError("--target-track-max-missed-frames must be >= 0")
     if args.max_grasp_candidates < 1:
         raise ValueError("--max-grasp-candidates must be >= 1")
     if args.max_point_count < 1:
@@ -1326,12 +1422,43 @@ def draw_targets(image: np.ndarray, targets: list[GraspNetTarget]) -> None:
         )
 
 
+def static_target_send_debug_text(
+    target: GraspNetTarget,
+    camera_to_base: np.ndarray | None,
+) -> str:
+    detected = "detected_base=NA"
+    if target.base_xyz_m is not None:
+        detected = (
+            "detected_base="
+            f"({target.base_xyz_m[0] * 1000.0:.1f},"
+            f"{target.base_xyz_m[1] * 1000.0:.1f},"
+            f"{target.base_xyz_m[2] * 1000.0:.1f})mm"
+        )
+    candidate_y_values: list[str] = []
+    if camera_to_base is not None:
+        for candidate in target.grasp_candidates[:6]:
+            point = camera_to_base @ np.array(
+                [*candidate.position_camera_m, 1.0], dtype=float
+            )
+            candidate_y_values.append(f"{point[1] * 1000.0:.1f}")
+    candidate_y = ",".join(candidate_y_values) if candidate_y_values else "NA"
+    return (
+        f"Sending displayed target #{target.rank}: "
+        f"pixel=({target.raw_point.u},{target.raw_point.v}) {detected} "
+        f"candidate_base_y_mm=[{candidate_y}]"
+    )
+
+
 def main() -> None:
     args = build_parser().parse_args()
     validate_args(args)
 
     belt_plane = load_belt_depth_plane(args.belt_depth_plane_json)
     detector = DepthForegroundDetector(belt_plane, detector_config_from_args(args))
+    target_tracker = StableTargetTracker(
+        max_distance_px=args.target_track_max_distance_px,
+        max_missed_frames=args.target_track_max_missed_frames,
+    )
     camera_to_base = None if args.no_hand_eye_result else load_camera_to_base_transform(args.hand_eye_result)
     backend = None
     if not args.no_graspnet:
@@ -1353,6 +1480,7 @@ def main() -> None:
     point_cloud_viewer = None
     last_point_cloud_print_s = 0.0
     last_dynamic_debug_time_s = 0.0
+    displayed_targets: tuple[GraspNetTarget, ...] = ()
 
     if args.show_point_cloud:
         point_cloud_viewer = Open3DPointCloudViewer(
@@ -1381,13 +1509,13 @@ def main() -> None:
                 intrinsics = load_intrinsics(args, depth_frame)
                 print(format_intrinsics(intrinsics), flush=True)
 
-            segments = detector.detect(depth_frame)
+            segments = target_tracker.update(detector.detect(depth_frame))
             targets: list[GraspNetTarget] = []
-            for rank, segment in enumerate(segments, start=1):
+            for target_id, segment in segments:
                 try:
                     targets.append(
                         target_from_segment(
-                            rank,
+                            target_id,
                             segment,
                             depth_frame,
                             intrinsics=intrinsics,
@@ -1399,7 +1527,7 @@ def main() -> None:
                         )
                     )
                 except (RuntimeError, ValueError) as exc:
-                    print(f"Skipping target {rank}: {exc}", flush=True)
+                    print(f"Skipping target {target_id}: {exc}", flush=True)
 
             if point_cloud_viewer is not None:
                 total_points = sum(
@@ -1427,10 +1555,24 @@ def main() -> None:
                     print(f"Unknown command: {command!r}", flush=True)
                 else:
                     task, rank = parsed
-                    target = next((item for item in targets if item.rank == rank), None)
+                    selectable_targets = (
+                        tuple(targets) if args.no_display else displayed_targets
+                    )
+                    target = next(
+                        (item for item in selectable_targets if item.rank == rank),
+                        None,
+                    )
                     if target is None:
-                        print(f"No target rank {rank}", flush=True)
+                        valid = ", ".join(str(item.rank) for item in selectable_targets) or "none"
+                        print(
+                            f"No displayed target #{rank}; available stable IDs: {valid}",
+                            flush=True,
+                        )
                     else:
+                        print(
+                            static_target_send_debug_text(target, camera_to_base),
+                            flush=True,
+                        )
                         response = sender.send_target(
                             target,
                             source=source,
@@ -1515,8 +1657,11 @@ def main() -> None:
                 if not args.hide_depth:
                     cv2.imshow(DEPTH_WINDOW_NAME, make_depth_colormap(depth_frame, args.max_depth_m))
                 key = cv2.waitKey(1) & 0xFF
+                displayed_targets = tuple(targets)
                 if key == 27:
                     break
+            else:
+                displayed_targets = tuple(targets)
     finally:
         pipeline.stop()
         if point_cloud_viewer is not None:
