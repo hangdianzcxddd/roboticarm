@@ -109,12 +109,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, default=5005)
     parser.add_argument("--can", default=ROBOT_CONFIG.can_name)
     parser.add_argument("--execute", action="store_true")
+    parser.add_argument(
+        "--release-software-estop-on-startup",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "release a software emergency stop before enabling the arm when "
+            "--execute is used (default: enabled)"
+        ),
+    )
     parser.add_argument("--hand-eye-result", type=Path, default=DEFAULT_HAND_EYE_RESULT)
     parser.add_argument("--speed", type=int, default=20)
     parser.add_argument("--grasp-speed", type=int, default=12)
     parser.add_argument("--command-period-s", type=float, default=0.02)
     parser.add_argument("--motion-timeout-s", type=float, default=8.0)
     parser.add_argument("--joint-tolerance-deg", type=float, default=2.0)
+    parser.add_argument(
+        "--startup-path-deviation-confirm-samples",
+        type=int,
+        default=3,
+        help="consecutive fresh startup feedback samples required before path-deviation stop",
+    )
     parser.add_argument(
         "--max-runtime-path-error-deg",
         type=float,
@@ -198,7 +213,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="reject a TCP farther below the vision-reported object top",
     )
     parser.add_argument("--min-trajectory-tcp-z-mm", type=float, default=110.0)
-    parser.add_argument("--max-gripper-width-mm", type=float, default=80.0)
+    parser.add_argument("--max-gripper-width-mm", type=float, default=100.0)
     parser.add_argument(
         "--max-candidate-center-distance-mm",
         type=float,
@@ -294,6 +309,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--speed and --grasp-speed must be in [0, 100]")
     if args.max_candidates < 1 or args.ik_seed_count < 1:
         raise ValueError("--max-candidates and --ik-seed-count must be >= 1")
+    if args.startup_path_deviation_confirm_samples < 1:
+        raise ValueError("--startup-path-deviation-confirm-samples must be >= 1")
     positive = (
         "approach_distance_mm",
         "approach_sample_distance_mm",
@@ -777,18 +794,45 @@ def validate_path_height(
     args: argparse.Namespace,
     *,
     label: str,
+    allow_start_margin_recovery: bool = False,
+    check_joint_margin: bool = True,
 ) -> tuple[float, float]:
     minimum_margin_deg = float("inf")
     maximum_condition = 0.0
+    previous_joint_margins: np.ndarray | None = None
     for index, joints in enumerate(path):
         pose = fk_tcp_pose(joints, args)
         controller.validate_joints(list(joints))
-        margin_deg = _joint_margin_deg(joints, controller)
-        if margin_deg < args.joint_limit_margin_deg:
-            raise SafetyError(
-                f"{label}[{index}] joint-limit margin={margin_deg:.3f}deg is below "
-                f"{args.joint_limit_margin_deg:.3f}deg"
+        joint_margins = np.asarray(
+            [
+                math.degrees(min(value - limit.min_value, limit.max_value - value))
+                for value, limit in zip(joints, controller.config.joint_limits_rad)
+            ],
+            dtype=float,
+        )
+        margin_deg = float(np.min(joint_margins))
+        low_margin = joint_margins < float(args.joint_limit_margin_deg)
+        if check_joint_margin and np.any(low_margin):
+            recovering = allow_start_margin_recovery and (
+                index == 0
+                or (
+                    previous_joint_margins is not None
+                    and np.all(
+                        joint_margins[low_margin]
+                        > previous_joint_margins[low_margin] + 1e-9
+                    )
+                )
             )
+            if not recovering:
+                joints_text = ", ".join(
+                    f"J{joint_index + 1}={joint_margins[joint_index]:.3f}deg"
+                    for joint_index in np.nonzero(low_margin)[0]
+                )
+                raise SafetyError(
+                    f"{label}[{index}] joint-limit margin is below "
+                    f"{args.joint_limit_margin_deg:.3f}deg: {joints_text}"
+                )
+        previous_joint_margins = joint_margins
         controller.validate_pose(pose)
         if pose.z_mm < args.min_trajectory_tcp_z_mm:
             raise SafetyError(
@@ -967,19 +1011,47 @@ def _joint_feedback_timestamp(feedback: Any) -> float | None:
     return None if value is None else float(value)
 
 
-def read_live_joints(controller: PiperController) -> tuple[float, ...]:
-    deadline = time.monotonic() + 1.0
+def read_live_joints(
+    controller: PiperController,
+    *,
+    stable_samples: int = 1,
+    timeout_s: float = 1.0,
+    stability_tolerance_deg: float = 1.0,
+) -> tuple[float, ...]:
+    deadline = time.monotonic() + float(timeout_s)
+    previous: np.ndarray | None = None
+    previous_stamp: float | None = None
+    stable_count = 0
     while time.monotonic() < deadline:
         feedback = controller.get_joint_state()
         joints = joint_feedback_to_rad(feedback)
+        stamp = _joint_feedback_timestamp(feedback)
         fresh = (
             float(getattr(feedback, "time_stamp", 0.0)) > 0.0
             or float(getattr(feedback, "Hz", 0.0)) > 0.0
         )
         if joints is not None and fresh:
-            return tuple(float(value) for value in joints)
+            current = np.asarray(joints, dtype=float)
+            stamp_advanced = (
+                previous_stamp is None
+                or stamp is None
+                or stamp > previous_stamp
+            )
+            if stamp_advanced:
+                if previous is not None and float(
+                    np.max(np.abs(np.degrees(current - previous)))
+                ) <= float(stability_tolerance_deg):
+                    stable_count += 1
+                else:
+                    stable_count = 1
+                previous = current
+                previous_stamp = stamp
+                if stable_count >= int(stable_samples):
+                    return tuple(float(value) for value in current)
         time.sleep(0.02)
-    raise RuntimeError("fresh Piper joint feedback is required for GraspNet planning")
+    raise RuntimeError(
+        "stable fresh Piper joint feedback is required for GraspNet planning"
+    )
 
 
 def validate_runtime_joint_state(
@@ -990,13 +1062,14 @@ def validate_runtime_joint_state(
     args: argparse.Namespace,
     *,
     label: str,
+    check_joint_margin: bool = True,
 ) -> None:
     current_array = np.asarray(current, dtype=float)
     start_array = np.asarray(segment_start, dtype=float)
     target_array = np.asarray(segment_target, dtype=float)
     controller.validate_joints(list(current_array))
     margin_deg = _joint_margin_deg(current_array, controller)
-    if margin_deg < args.joint_limit_margin_deg:
+    if check_joint_margin and margin_deg < args.joint_limit_margin_deg:
         raise SafetyError(
             f"{label} live joint-limit margin={margin_deg:.3f}deg is below "
             f"{args.joint_limit_margin_deg:.3f}deg"
@@ -1042,28 +1115,52 @@ def wait_until_joints_reached(
     label: str,
     initial_stamp: float | None,
     segment_start: Sequence[float] | None = None,
+    check_joint_margin: bool = True,
+    path_deviation_confirm_samples: int = 1,
 ) -> None:
     deadline = time.monotonic() + float(args.motion_timeout_s)
     last_error = float("inf")
+    consecutive_path_deviations = 0
+    last_processed_stamp = initial_stamp
     while time.monotonic() < deadline:
         feedback = controller.get_joint_state()
         current = joint_feedback_to_rad(feedback)
         stamp = _joint_feedback_timestamp(feedback)
-        fresh = initial_stamp is None or stamp is None or stamp > initial_stamp
-        if current is not None:
+        fresh = (
+            stamp is None
+            or last_processed_stamp is None
+            or stamp > last_processed_stamp
+        )
+        if current is not None and fresh:
+            if stamp is not None:
+                last_processed_stamp = stamp
             if segment_start is not None:
-                validate_runtime_joint_state(
-                    current,
-                    segment_start,
-                    target,
-                    controller,
-                    args,
-                    label=label,
-                )
+                try:
+                    validate_runtime_joint_state(
+                        current,
+                        segment_start,
+                        target,
+                        controller,
+                        args,
+                        label=label,
+                        check_joint_margin=check_joint_margin,
+                    )
+                except SafetyError as exc:
+                    if "live joint path deviation" not in str(exc):
+                        raise
+                    consecutive_path_deviations += 1
+                    if consecutive_path_deviations >= int(
+                        path_deviation_confirm_samples
+                    ):
+                        raise
+                    time.sleep(max(0.01, float(args.command_period_s)))
+                    continue
+                else:
+                    consecutive_path_deviations = 0
             last_error = float(
                 np.max(np.abs(np.degrees(np.asarray(current) - np.asarray(target))))
             )
-            if fresh and last_error <= args.joint_tolerance_deg:
+            if last_error <= args.joint_tolerance_deg:
                 return
         time.sleep(max(0.01, float(args.command_period_s)))
     raise TimeoutError(
@@ -1078,6 +1175,8 @@ def execute_joint_path(
     *,
     label: str,
     speed: int,
+    check_joint_margin: bool = True,
+    path_deviation_confirm_samples: int = 1,
 ) -> int:
     count = 0
     for index, joints in enumerate(path[1:], start=1):
@@ -1100,6 +1199,8 @@ def execute_joint_path(
             label=f"{label}[{index}]",
             initial_stamp=stamp,
             segment_start=current,
+            check_joint_margin=check_joint_margin,
+            path_deviation_confirm_samples=path_deviation_confirm_samples,
         )
     return count
 
@@ -1109,24 +1210,36 @@ def move_to_nominal_joints(
 ) -> tuple[float, ...]:
     target = tuple(math.radians(value) for value in args.nominal_joints_deg)
     controller.validate_joints(target)
-    current = read_live_joints(controller)
-    validate_joint_change(
-        current,
-        target,
-        args.max_startup_joint_delta_deg,
-        label="startup",
+    current = read_live_joints(
+        controller,
+        stable_samples=3,
+        timeout_s=min(5.0, float(args.motion_timeout_s)),
     )
     path = interpolate_joint_path(
         current, target, args.max_joint_waypoint_step_deg
     )
-    validate_path_height(path, controller, args, label="startup")
+    validate_path_height(
+        path,
+        controller,
+        args,
+        label="startup",
+        check_joint_margin=False,
+    )
     print(
         "Moving to startup joints: "
         + " ".join(f"{value:.3f}" for value in args.nominal_joints_deg)
         + " deg",
         flush=True,
     )
-    execute_joint_path(controller, path, args, label="startup", speed=args.speed)
+    execute_joint_path(
+        controller,
+        path,
+        args,
+        label="startup",
+        speed=args.speed,
+        check_joint_margin=False,
+        path_deviation_confirm_samples=args.startup_path_deviation_confirm_samples,
+    )
     print("Startup joint pose reached", flush=True)
     return target
 
@@ -1143,6 +1256,19 @@ def emergency_stop_on_failure(
             file=sys.stderr,
             flush=True,
         )
+
+
+def connect_for_execution(controller: PiperController, args: argparse.Namespace) -> None:
+    """Release this program's latched stop before enabling motion commands."""
+    print("Connecting to Piper arm...", flush=True)
+    controller.connect(enable=False)
+    if args.release_software_estop_on_startup:
+        controller.resume_from_emergency_stop()
+        time.sleep(max(0.1, float(args.command_period_s)))
+        print("Piper software emergency stop released", flush=True)
+    controller.enable()
+    time.sleep(max(0.5, float(args.command_period_s)))
+    print("Piper arm enabled", flush=True)
 
 
 def execute_plan(
@@ -1311,9 +1437,7 @@ def serve(args: argparse.Namespace) -> None:
     if args.execute:
         controller = PiperController(config=config)
         try:
-            print("Connecting and enabling Piper arm...", flush=True)
-            controller.connect(enable=True)
-            print("Piper arm enabled", flush=True)
+            connect_for_execution(controller, args)
             if args.collision_protection_level is not None:
                 controller.set_collision_protection(
                     [args.collision_protection_level] * 6

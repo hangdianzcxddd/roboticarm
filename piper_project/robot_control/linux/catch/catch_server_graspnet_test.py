@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -13,6 +14,7 @@ from robot_control.linux.catch.catch_server_graspnet import (
     ResolvedCandidate,
     approach_tilt_deg,
     build_parser,
+    connect_for_execution,
     emergency_stop_on_failure,
     fk_tcp_pose,
     fk_tcp_transform,
@@ -24,7 +26,9 @@ from robot_control.linux.catch.catch_server_graspnet import (
     validate_candidate_geometry,
     validate_joint_change,
     validate_joint_deltas,
+    validate_path_height,
     validate_runtime_joint_state,
+    wait_until_joints_reached,
 )
 from robot_control.shared.protocol import CameraPointCommand, GraspCandidate
 
@@ -83,6 +87,7 @@ class TestGraspNetCatchServer(unittest.TestCase):
         self.assertAlmostEqual(args.max_target_y_mm, -350.0)
         self.assertAlmostEqual(args.min_grasp_z_mm, 120.0)
         self.assertAlmostEqual(args.min_trajectory_tcp_z_mm, 110.0)
+        self.assertAlmostEqual(args.max_gripper_width_mm, 100.0)
         self.assertEqual(tuple(args.nominal_joints_deg), (0, 90, -90, 0, 30, 0))
         self.assertEqual(tuple(args.max_joint_delta_deg), (60,) * 6)
         self.assertEqual(tuple(args.max_startup_joint_delta_deg), (60,) * 6)
@@ -93,6 +98,55 @@ class TestGraspNetCatchServer(unittest.TestCase):
         )
         self.assertTrue(args.safe_gripper_stop_on_effort)
         self.assertEqual(args.collision_protection_level, 2)
+        self.assertTrue(args.release_software_estop_on_startup)
+        self.assertEqual(args.startup_path_deviation_confirm_samples, 3)
+
+    def test_execution_connection_releases_estop_before_enable(self):
+        args = build_parser().parse_args([])
+
+        class FakeController:
+            def __init__(self):
+                self.calls = []
+
+            def connect(self, *, enable):
+                self.calls.append(("connect", enable))
+
+            def resume_from_emergency_stop(self):
+                self.calls.append(("resume",))
+
+            def enable(self):
+                self.calls.append(("enable",))
+
+        controller = FakeController()
+        module = "robot_control.linux.catch.catch_server_graspnet"
+        with patch(f"{module}.time.sleep"):
+            connect_for_execution(controller, args)
+
+        self.assertEqual(
+            controller.calls,
+            [("connect", False), ("resume",), ("enable",)],
+        )
+
+    def test_execution_connection_can_skip_estop_release(self):
+        args = build_parser().parse_args(["--no-release-software-estop-on-startup"])
+
+        class FakeController:
+            def __init__(self):
+                self.calls = []
+
+            def connect(self, *, enable):
+                self.calls.append(("connect", enable))
+
+            def resume_from_emergency_stop(self):
+                self.calls.append(("resume",))
+
+            def enable(self):
+                self.calls.append(("enable",))
+
+        controller = FakeController()
+        connect_for_execution(controller, args)
+
+        self.assertEqual(controller.calls, [("connect", False), ("enable",)])
 
     def test_startup_move_converts_nominal_degrees_to_radians(self):
         args = build_parser().parse_args(
@@ -137,6 +191,57 @@ class TestGraspNetCatchServer(unittest.TestCase):
         np.testing.assert_allclose(path[0], (0.0,) * 6)
         np.testing.assert_allclose(path[-1], expected)
         self.assertEqual(execute_path.call_args.kwargs["speed"], args.speed)
+        self.assertFalse(validate_path.call_args.kwargs["check_joint_margin"])
+        self.assertFalse(execute_path.call_args.kwargs["check_joint_margin"])
+
+    def test_startup_move_does_not_apply_total_joint_change_limit(self):
+        args = build_parser().parse_args(
+            [
+                "--nominal-joints-deg",
+                "0",
+                "90",
+                "-90",
+                "0",
+                "30",
+                "-90",
+                "--max-startup-joint-delta-deg",
+                "1",
+                "1",
+                "1",
+                "1",
+                "1",
+                "1",
+            ]
+        )
+        controller = PiperController()
+        module = "robot_control.linux.catch.catch_server_graspnet"
+        with (
+            patch(f"{module}.read_live_joints", return_value=(0.0,) * 6),
+            patch(f"{module}.validate_path_height"),
+            patch(f"{module}.execute_joint_path"),
+        ):
+            target = move_to_nominal_joints(controller, args)
+
+        np.testing.assert_allclose(
+            np.degrees(target),
+            (0.0, 90.0, -90.0, 0.0, 30.0, -90.0),
+        )
+
+    def test_runtime_margin_check_can_be_disabled_for_startup(self):
+        args = build_parser().parse_args(
+            ["--min-trajectory-tcp-z-mm", "1", "--max-jacobian-condition", "1e20"]
+        )
+        current = np.radians((0.0, 0.0, -90.0, 0.0, 30.0, 0.0))
+
+        validate_runtime_joint_state(
+            current,
+            current,
+            np.radians((0.0, 8.0, -90.0, 0.0, 30.0, 0.0)),
+            PiperController(),
+            args,
+            label="startup[1]",
+            check_joint_margin=False,
+        )
 
     def test_startup_change_over_configured_limit_is_rejected(self):
         args = build_parser().parse_args([])
@@ -147,6 +252,44 @@ class TestGraspNetCatchServer(unittest.TestCase):
                 np.radians((0, 61, 0, 0, 0, 0)),
                 args.max_startup_joint_delta_deg,
                 label="startup",
+            )
+
+    def test_startup_path_can_move_monotonically_away_from_joint_limit(self):
+        args = build_parser().parse_args(
+            ["--min-trajectory-tcp-z-mm", "1", "--max-jacobian-condition", "1e20"]
+        )
+        controller = PiperController()
+        start = np.radians((0.0, 0.0, -90.0, 0.0, 30.0, 0.0))
+        target = np.radians((0.0, 20.0, -90.0, 0.0, 30.0, 0.0))
+        path = interpolate_joint_path(start, target, 5.0)
+
+        margin, _condition = validate_path_height(
+            path,
+            controller,
+            args,
+            label="startup",
+            allow_start_margin_recovery=True,
+        )
+
+        self.assertAlmostEqual(margin, 0.0)
+
+    def test_startup_margin_recovery_must_move_away_from_limit(self):
+        args = build_parser().parse_args(
+            ["--min-trajectory-tcp-z-mm", "1", "--max-jacobian-condition", "1e20"]
+        )
+        controller = PiperController()
+        path = (
+            tuple(np.radians((0.0, 0.0, -90.0, 0.0, 30.0, 0.0))),
+            tuple(np.radians((0.0, 0.0, -90.0, 0.0, 30.0, 0.0))),
+        )
+
+        with self.assertRaisesRegex(SafetyError, "J2=0.000deg"):
+            validate_path_height(
+                path,
+                controller,
+                args,
+                label="startup",
+                allow_start_margin_recovery=True,
             )
 
     def test_runtime_path_deviation_is_rejected(self):
@@ -165,6 +308,127 @@ class TestGraspNetCatchServer(unittest.TestCase):
                 args,
                 label="test",
             )
+
+    def test_wait_ignores_stale_feedback_before_runtime_validation(self):
+        target = tuple(np.radians((0.0, 8.0, -90.0, 0.0, 30.0, 0.0)))
+
+        def feedback(stamp, joints_deg):
+            state = SimpleNamespace(
+                **{
+                    f"joint_{index}": value * 1000.0
+                    for index, value in enumerate(joints_deg, start=1)
+                }
+            )
+            return SimpleNamespace(time_stamp=stamp, Hz=100.0, joint_state=state)
+
+        samples = iter(
+            [
+                feedback(10.0, (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)),
+                feedback(11.0, (0.0, 8.0, -90.0, 0.0, 30.0, 0.0)),
+            ]
+        )
+        controller = SimpleNamespace(get_joint_state=lambda: next(samples))
+        args = build_parser().parse_args(["--motion-timeout-s", "1"])
+        module = "robot_control.linux.catch.catch_server_graspnet"
+
+        with (
+            patch(f"{module}.validate_runtime_joint_state") as validate_runtime,
+            patch(f"{module}.time.sleep"),
+        ):
+            wait_until_joints_reached(
+                controller,
+                target,
+                args,
+                label="startup[1]",
+                initial_stamp=10.0,
+                segment_start=target,
+                check_joint_margin=False,
+            )
+
+        validate_runtime.assert_called_once()
+
+    def test_startup_requires_three_fresh_path_deviations(self):
+        target = tuple(np.radians((0.0, 8.0, -90.0, 0.0, 30.0, 0.0)))
+        state = SimpleNamespace(
+            **{
+                f"joint_{index}": value * 1000.0
+                for index, value in enumerate((0.0, 8.0, -90.0, 0.0, 30.0, 0.0), start=1)
+            }
+        )
+        stamps = iter((11.0, 12.0, 13.0))
+        controller = SimpleNamespace(
+            get_joint_state=lambda: SimpleNamespace(
+                time_stamp=next(stamps), Hz=100.0, joint_state=state
+            )
+        )
+        args = build_parser().parse_args(["--motion-timeout-s", "1"])
+        module = "robot_control.linux.catch.catch_server_graspnet"
+
+        with (
+            patch(
+                f"{module}.validate_runtime_joint_state",
+                side_effect=(
+                    SafetyError("live joint path deviation"),
+                    SafetyError("live joint path deviation"),
+                    None,
+                ),
+            ),
+            patch(f"{module}.time.sleep"),
+        ):
+            wait_until_joints_reached(
+                controller,
+                target,
+                args,
+                label="startup[1]",
+                initial_stamp=10.0,
+                segment_start=target,
+                check_joint_margin=False,
+                path_deviation_confirm_samples=3,
+            )
+
+    def test_repeated_feedback_timestamp_is_not_counted_as_fresh(self):
+        target = tuple(np.radians((0.0, 8.0, -90.0, 0.0, 30.0, 0.0)))
+
+        def feedback(stamp, joints_deg):
+            state = SimpleNamespace(
+                **{
+                    f"joint_{index}": value * 1000.0
+                    for index, value in enumerate(joints_deg, start=1)
+                }
+            )
+            return SimpleNamespace(time_stamp=stamp, Hz=100.0, joint_state=state)
+
+        samples = iter(
+            [
+                feedback(11.0, (0.0,) * 6),
+                feedback(11.0, (0.0,) * 6),
+                feedback(11.0, (0.0,) * 6),
+                feedback(12.0, (0.0, 8.0, -90.0, 0.0, 30.0, 0.0)),
+            ]
+        )
+        controller = SimpleNamespace(get_joint_state=lambda: next(samples))
+        args = build_parser().parse_args(["--motion-timeout-s", "1"])
+        module = "robot_control.linux.catch.catch_server_graspnet"
+
+        with (
+            patch(
+                f"{module}.validate_runtime_joint_state",
+                side_effect=(SafetyError("live joint path deviation"), None),
+            ) as validate_runtime,
+            patch(f"{module}.time.sleep"),
+        ):
+            wait_until_joints_reached(
+                controller,
+                target,
+                args,
+                label="startup[1]",
+                initial_stamp=10.0,
+                segment_start=target,
+                check_joint_margin=False,
+                path_deviation_confirm_samples=3,
+            )
+
+        self.assertEqual(validate_runtime.call_count, 2)
 
     def test_failure_handler_sends_emergency_stop(self):
         class FakeController:
