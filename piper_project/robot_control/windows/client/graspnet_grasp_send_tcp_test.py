@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -64,7 +65,42 @@ def flat_plane(width: int, height: int, depth_m: float) -> BeltDepthPlane:
 
 @unittest.skipIf(cv2 is None, "opencv-python is required for GraspNet client tests")
 class TestGraspNetGraspSendTcp(unittest.TestCase):
-    def test_load_intrinsics_uses_width_height_path_order(self):
+    def test_parser_uses_aligned_realsense_intrinsics_by_default(self):
+        args = build_parser().parse_args(
+            ["--dry-run", "--belt-depth-plane-json", "belt.json"]
+        )
+
+        self.assertTrue(args.use_realsense_intrinsics)
+
+    def test_load_intrinsics_uses_aligned_frame_values(self):
+        rs_intrinsics = SimpleNamespace(
+            width=1280,
+            height=720,
+            fx=910.212402,
+            fy=909.577393,
+            ppx=651.906494,
+            ppy=373.001770,
+        )
+        video_profile = SimpleNamespace(intrinsics=rs_intrinsics)
+        frame = SimpleNamespace(
+            profile=SimpleNamespace(
+                as_video_stream_profile=lambda: video_profile,
+            ),
+            get_width=lambda: 1280,
+            get_height=lambda: 720,
+        )
+        args = SimpleNamespace(use_realsense_intrinsics=True)
+
+        intrinsics = load_intrinsics(args, depth_frame=frame)
+
+        self.assertEqual((intrinsics.width, intrinsics.height), (1280, 720))
+        self.assertAlmostEqual(intrinsics.fx, 910.212402)
+        self.assertAlmostEqual(intrinsics.fy, 909.577393)
+        self.assertAlmostEqual(intrinsics.ppx, 651.906494)
+        self.assertAlmostEqual(intrinsics.ppy, 373.001770)
+        self.assertEqual(intrinsics.source, "aligned_realsense_depth_frame")
+
+    def test_load_intrinsics_can_explicitly_use_json_fallback(self):
         class Args:
             use_realsense_intrinsics = False
             intrinsics_json = DEFAULT_D435I_PARA

@@ -1094,7 +1094,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--frame-timeout-ms", type=int, default=10000)
     parser.add_argument("--max-depth-m", type=float, default=1.5)
     parser.add_argument("--intrinsics-json", type=Path, default=DEFAULT_D435I_PARA)
-    parser.add_argument("--use-realsense-intrinsics", action="store_true")
+    intrinsics_group = parser.add_mutually_exclusive_group()
+    intrinsics_group.add_argument(
+        "--use-realsense-intrinsics",
+        dest="use_realsense_intrinsics",
+        action="store_true",
+        default=True,
+        help=(
+            "use intrinsics reported by the aligned RealSense depth frame "
+            "(default; recommended)"
+        ),
+    )
+    intrinsics_group.add_argument(
+        "--use-json-intrinsics",
+        dest="use_realsense_intrinsics",
+        action="store_false",
+        help="use the static profile selected from --intrinsics-json instead",
+    )
     parser.add_argument(
         "--belt-depth-plane-json",
         type=Path,
@@ -1245,16 +1261,27 @@ def detector_config_from_args(args: argparse.Namespace) -> DepthForegroundDetect
 
 def load_intrinsics(args: argparse.Namespace, depth_frame: Any) -> PinholeIntrinsics:
     if args.use_realsense_intrinsics:
+        if depth_frame is None:
+            raise ValueError("aligned RealSense depth frame is required for live intrinsics")
         rs_intrinsics = depth_frame.profile.as_video_stream_profile().intrinsics
-        return PinholeIntrinsics(
+        intrinsics = PinholeIntrinsics(
             width=int(rs_intrinsics.width),
             height=int(rs_intrinsics.height),
             fx=float(rs_intrinsics.fx),
             fy=float(rs_intrinsics.fy),
             ppx=float(rs_intrinsics.ppx),
             ppy=float(rs_intrinsics.ppy),
-            source="realsense_frame",
+            source="aligned_realsense_depth_frame",
         )
+        frame_width = int(depth_frame.get_width())
+        frame_height = int(depth_frame.get_height())
+        if (intrinsics.width, intrinsics.height) != (frame_width, frame_height):
+            raise ValueError(
+                "RealSense intrinsics resolution "
+                f"{intrinsics.width}x{intrinsics.height} does not match aligned depth "
+                f"frame {frame_width}x{frame_height}"
+            )
+        return intrinsics
     return find_d435i_intrinsics(args.width, args.height, args.intrinsics_json)
 
 
