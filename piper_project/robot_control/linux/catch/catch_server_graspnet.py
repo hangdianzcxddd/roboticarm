@@ -199,6 +199,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--min-trajectory-tcp-z-mm", type=float, default=110.0)
     parser.add_argument("--max-gripper-width-mm", type=float, default=80.0)
+    parser.add_argument(
+        "--max-candidate-center-distance-mm",
+        type=float,
+        default=180.0,
+        help=(
+            "reject a grasp whose base-XY center is farther than this from the "
+            "vision-reported center of the selected object"
+        ),
+    )
 
     parser.add_argument("--ik-max-evaluations", type=int, default=300)
     parser.add_argument("--ik-seed-count", type=int, default=8)
@@ -296,6 +305,7 @@ def validate_args(args: argparse.Namespace) -> None:
         "motion_timeout_s",
         "joint_tolerance_deg",
         "max_runtime_path_error_deg",
+        "max_candidate_center_distance_mm",
     )
     for name in positive:
         if not math.isfinite(float(getattr(args, name))) or getattr(args, name) <= 0:
@@ -490,6 +500,17 @@ def validate_candidate_geometry(
     args: argparse.Namespace,
 ) -> None:
     pose = candidate.grasp_pose
+    if command.detected_x_mm is not None and command.detected_y_mm is not None:
+        center_distance_mm = math.hypot(
+            pose.x_mm - float(command.detected_x_mm),
+            pose.y_mm - float(command.detected_y_mm),
+        )
+        if center_distance_mm > float(args.max_candidate_center_distance_mm):
+            raise SafetyError(
+                "candidate does not belong to selected object: "
+                f"base-XY distance from detected center={center_distance_mm:.3f} mm "
+                f"exceeds {float(args.max_candidate_center_distance_mm):.3f} mm"
+            )
     checks = (
         ("x", pose.x_mm, args.min_target_x_mm, args.max_target_x_mm),
         ("y", pose.y_mm, args.min_target_y_mm, args.max_target_y_mm),

@@ -135,7 +135,11 @@ class _TargetTrack:
 
 
 class StableTargetTracker:
-    """Keep target numbers attached to image objects instead of area ranks."""
+    """Keep target numbers attached to image objects instead of area ranks.
+
+    New IDs are assigned left-to-right so a stationary scene receives the same
+    initial numbering after the client restarts.
+    """
 
     def __init__(self, *, max_distance_px: float = 100.0, max_missed_frames: int = 15) -> None:
         self.max_distance_px = float(max_distance_px)
@@ -182,12 +186,26 @@ class StableTargetTracker:
                     missed_frames=missed_frames,
                 )
 
+        unmatched_indexes = sorted(
+            (
+                index
+                for index in range(len(segments))
+                if index not in assignments
+            ),
+            key=lambda index: (
+                segments[index].centroid_u,
+                segments[index].centroid_v,
+            ),
+        )
+        for segment_index in unmatched_indexes:
+            assignments[segment_index] = self._next_target_id
+            self._next_target_id += 1
+
         tracked_segments: list[tuple[int, SegmentationDetection]] = []
         for segment_index, segment in enumerate(segments):
             target_id = assignments.get(segment_index)
-            if target_id is None:
-                target_id = self._next_target_id
-                self._next_target_id += 1
+            if target_id is None:  # pragma: no cover - assignments cover every segment
+                raise RuntimeError("target tracker failed to assign an ID")
             detection = segment.detection
             next_tracks[target_id] = _TargetTrack(
                 target_id=target_id,
@@ -549,6 +567,28 @@ def point_cloud_from_mask(
     return points
 
 
+def filter_candidates_near_point_cloud(
+    candidates: tuple[GraspCandidate, ...],
+    points_camera_m: np.ndarray,
+    *,
+    max_distance_m: float,
+) -> tuple[GraspCandidate, ...]:
+    """Reject backend grasps that do not belong to the selected object cloud."""
+    points = np.asarray(points_camera_m, dtype=np.float64)
+    points = points[np.isfinite(points).all(axis=1)]
+    if points.shape[0] == 0:
+        return ()
+    accepted: list[GraspCandidate] = []
+    for candidate in candidates:
+        position = np.asarray(candidate.position_camera_m, dtype=np.float64)
+        if position.shape != (3,) or not np.all(np.isfinite(position)):
+            continue
+        nearest_distance_m = float(np.min(np.linalg.norm(points - position, axis=1)))
+        if nearest_distance_m <= max_distance_m:
+            accepted.append(candidate)
+    return tuple(accepted)
+
+
 def top_point_from_mask(
     depth_frame: Any,
     mask: np.ndarray,
@@ -790,6 +830,7 @@ def target_from_segment(
     voxel_size_m: float,
     max_points: int,
     max_candidates: int,
+    max_candidate_cloud_distance_mm: float = 80.0,
 ) -> GraspNetTarget:
     depth_m = depth_array_meters(depth_frame)
     mask = segment.mask.astype(bool)
@@ -833,10 +874,15 @@ def target_from_segment(
         intrinsics=intrinsics,
         camera_to_base=camera_to_base,
     )
-    grasp_candidates = (
+    predicted_candidates = (
         ()
         if backend is None
         else backend.predict(points)[:max_candidates]
+    )
+    grasp_candidates = filter_candidates_near_point_cloud(
+        tuple(predicted_candidates),
+        points,
+        max_distance_m=float(max_candidate_cloud_distance_mm) / 1000.0,
     )
     return GraspNetTarget(
         rank=rank,
@@ -1199,7 +1245,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--min-height-above-belt-mm", type=float, default=8.0)
     parser.add_argument("--max-height-above-belt-mm", type=float, default=200.0)
-    parser.add_argument("--roi", type=int, nargs=4, metavar=("X", "Y", "W", "H"))
+    parser.add_argument(
+        "--roi",
+        type=int,
+        nargs=4,
+        metavar=("X", "Y", "W", "H"),
+        default=(100, 100, 940, 550),
+        help=(
+            "depth foreground detection ROI as X Y WIDTH HEIGHT; "
+            "default: 100 100 940 550"
+        ),
+    )
     parser.add_argument("--min-area-px", type=float, default=500.0)
     parser.add_argument("--max-area-px", type=float)
     parser.add_argument("--min-width-px", type=int, default=1)
@@ -1229,6 +1285,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--voxel-size-m", type=float, default=0.004)
     parser.add_argument("--max-point-count", type=int, default=20000)
     parser.add_argument("--max-grasp-candidates", type=int, default=20)
+    parser.add_argument(
+        "--max-candidate-cloud-distance-mm",
+        type=float,
+        default=80.0,
+        help="reject a GraspNet center farther than this from the selected object cloud",
+    )
     parser.add_argument("--graspnet-module", default="graspnet_backend")
     parser.add_argument("--graspnet-class", default="GraspNetPredictor")
     parser.add_argument("--graspnet-checkpoint", type=Path)
@@ -1304,6 +1366,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--target-track-max-missed-frames must be >= 0")
     if args.max_grasp_candidates < 1:
         raise ValueError("--max-grasp-candidates must be >= 1")
+    if args.max_candidate_cloud_distance_mm <= 0:
+        raise ValueError("--max-candidate-cloud-distance-mm must be > 0")
     if args.max_point_count < 1:
         raise ValueError("--max-point-count must be >= 1")
     if args.voxel_size_m < 0:
@@ -1399,7 +1463,12 @@ def draw_targets(image: np.ndarray, targets: list[GraspNetTarget]) -> None:
             markerSize=16,
             thickness=2,
         )
-        label = f"#{target.rank} grasps={len(target.grasp_candidates)}"
+        base_y_text = (
+            ""
+            if target.base_xyz_m is None
+            else f" Y={target.base_xyz_m[1] * 1000.0:.0f}mm"
+        )
+        label = f"#{target.rank}{base_y_text} grasps={len(target.grasp_candidates)}"
         cv2.putText(
             image,
             label,
@@ -1524,6 +1593,9 @@ def main() -> None:
                             voxel_size_m=args.voxel_size_m,
                             max_points=args.max_point_count,
                             max_candidates=args.max_grasp_candidates,
+                            max_candidate_cloud_distance_mm=(
+                                args.max_candidate_cloud_distance_mm
+                            ),
                         )
                     )
                 except (RuntimeError, ValueError) as exc:

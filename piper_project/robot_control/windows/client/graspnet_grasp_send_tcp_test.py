@@ -22,6 +22,7 @@ if cv2 is not None:
         colored_point_cloud_from_targets,
         dynamic_candidate_from_target,
         dynamic_pick_x_mm_for_candidate,
+        filter_candidates_near_point_cloud,
         load_intrinsics,
         object_point_cloud_stats_text,
         oriented_object_dimensions_mm,
@@ -102,6 +103,21 @@ class TestGraspNetGraspSendTcp(unittest.TestCase):
         self.assertEqual([(item[0], item[1].detection.x) for item in first], [(1, 10), (2, 200)])
         self.assertEqual([(item[0], item[1].detection.x) for item in second], [(1, 11), (2, 201)])
 
+    def test_target_tracker_initial_ids_are_left_to_right_not_area_order(self):
+        tracker = StableTargetTracker(max_distance_px=50.0, max_missed_frames=2)
+
+        tracked = tracker.update(
+            [
+                self.make_segment(200, 20, 20, 20, 900),
+                self.make_segment(10, 20, 20, 20, 300),
+            ]
+        )
+
+        self.assertEqual(
+            [(target_id, segment.detection.x) for target_id, segment in tracked],
+            [(1, 10), (2, 200)],
+        )
+
     def test_target_tracker_does_not_reassign_distant_object(self):
         tracker = StableTargetTracker(max_distance_px=30.0, max_missed_frames=2)
         first = tracker.update([self.make_segment(10, 20, 20, 20, 500)])
@@ -116,6 +132,26 @@ class TestGraspNetGraspSendTcp(unittest.TestCase):
         )
 
         self.assertTrue(args.use_realsense_intrinsics)
+
+    def test_parser_uses_default_roi_and_allows_override(self):
+        default_args = build_parser().parse_args(
+            ["--dry-run", "--belt-depth-plane-json", "belt.json"]
+        )
+        custom_args = build_parser().parse_args(
+            [
+                "--dry-run",
+                "--belt-depth-plane-json",
+                "belt.json",
+                "--roi",
+                "20",
+                "30",
+                "400",
+                "300",
+            ]
+        )
+
+        self.assertEqual(tuple(default_args.roi), (100, 100, 940, 550))
+        self.assertEqual(tuple(custom_args.roi), (20, 30, 400, 300))
 
     def test_load_intrinsics_uses_aligned_frame_values(self):
         rs_intrinsics = SimpleNamespace(
@@ -355,6 +391,19 @@ class TestGraspNetGraspSendTcp(unittest.TestCase):
 
         self.assertEqual(points.shape, (4, 3))
         self.assertTrue(np.allclose(points[:, 2], 0.50))
+
+    def test_candidates_far_from_selected_cloud_are_rejected(self):
+        rotation = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+        near = GraspCandidate((0.01, 0.0, 0.50), rotation, index=0)
+        far = GraspCandidate((0.40, 0.0, 0.50), rotation, index=1)
+
+        filtered = filter_candidates_near_point_cloud(
+            (near, far),
+            np.asarray([[0.0, 0.0, 0.50], [0.02, 0.0, 0.50]]),
+            max_distance_m=0.08,
+        )
+
+        self.assertEqual(filtered, (near,))
 
     def test_command_payload_carries_graspnet_candidates(self):
         detection = Detection(

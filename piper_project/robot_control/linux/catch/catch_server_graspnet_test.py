@@ -233,6 +233,36 @@ class TestGraspNetCatchServer(unittest.TestCase):
                 candidate, command, PiperController(), args
             )
 
+    def test_candidate_far_from_detected_object_center_is_rejected(self):
+        args = build_parser().parse_args(
+            [
+                "--min-target-y-mm",
+                "-1000",
+                "--max-target-y-mm",
+                "1000",
+                "--min-grasp-z-mm",
+                "1",
+                "--min-trajectory-tcp-z-mm",
+                "1",
+                "--max-candidate-center-distance-mm",
+                "100",
+            ]
+        )
+        command = command_from_fk(args)
+        candidate = resolve_candidate_variants(
+            command.grasp_candidates[0], command, np.eye(4), args
+        )[0]
+        command = CameraPointCommand(
+            **{
+                **command.__dict__,
+                "detected_x_mm": candidate.grasp_pose.x_mm + 250.0,
+                "detected_y_mm": candidate.grasp_pose.y_mm,
+            }
+        )
+
+        with self.assertRaisesRegex(SafetyError, "does not belong to selected object"):
+            validate_candidate_geometry(candidate, command, PiperController(), args)
+
     def test_grasp_z_offset_is_applied_along_base_z(self):
         default_args = build_parser().parse_args([])
         offset_args = build_parser().parse_args(["--grasp-z-offset-mm", "35"])
