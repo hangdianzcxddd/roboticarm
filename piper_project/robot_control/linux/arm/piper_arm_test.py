@@ -262,6 +262,13 @@ class TestMove(unittest.TestCase):
             ],
         )
 
+    def test_resume_from_emergency_stop_sends_release_code(self):
+        controller, sdk = make_controller()
+
+        controller.resume_from_emergency_stop()
+
+        self.assertEqual(sdk.calls, [("EmergencyStop", (0x02,))])
+
     def test_configure_sdk_limits_sends_configured_joint_limits(self):
         controller, sdk = make_controller()
 

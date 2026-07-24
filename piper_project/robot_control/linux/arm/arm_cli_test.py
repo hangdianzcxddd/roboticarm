@@ -1,53 +1,45 @@
 from __future__ import annotations
 
-import math
 import unittest
+from unittest.mock import patch
 
-from robot_control.linux.arm.arm_cli import (
-    build_parser,
-    joint_path,
-    validate_joint_change,
-)
-from robot_control.linux.arm.safety import SafetyError
+from robot_control.linux.arm.arm_cli import build_parser, main
 
 
 class TestArmCli(unittest.TestCase):
-    def test_joint_motion_defaults_to_sixty_degrees_per_joint(self):
+    def test_resume_command_is_available(self):
+        args = build_parser().parse_args(["resume"])
+
+        self.assertEqual(args.command, "resume")
+
+    @patch("robot_control.linux.arm.arm_cli.PiperController")
+    @patch("sys.argv", ["arm_cli.py", "resume"])
+    def test_resume_releases_stop_without_enabling_or_moving(self, controller_type):
+        controller = controller_type.return_value
+
+        with patch("builtins.print"):
+            main()
+
+        controller.connect.assert_called_once_with(enable=False)
+        controller.resume_from_emergency_stop.assert_called_once_with()
+        controller.disconnect.assert_called_once_with()
+        controller.enable.assert_not_called()
+        controller.move_joints.assert_not_called()
+
+    def test_joint_motion_has_no_added_safety_limits(self):
         args = build_parser().parse_args(
             ["joints", "0", "1", "-1", "0", "0.5", "0"]
         )
 
-        self.assertEqual(tuple(args.max_joint_delta_deg), (60,) * 6)
-
-    def test_joint_change_over_limit_is_rejected(self):
-        current = [0.0] * 6
-        target = [0.0, math.radians(61.0), 0.0, 0.0, 0.0, 0.0]
-
-        with self.assertRaisesRegex(SafetyError, "J2=61.00deg>60.00deg"):
-            validate_joint_change(current, target, (60.0,) * 6)
-
-    def test_joint_change_limit_is_adjustable(self):
-        current = [0.0] * 6
-        target = [0.0, math.radians(61.0), 0.0, 0.0, 0.0, 0.0]
-
-        validate_joint_change(
-            current,
-            target,
-            (60.0, 62.0, 60.0, 60.0, 60.0, 60.0),
-        )
-
-    def test_joint_path_respects_waypoint_limit(self):
-        path = joint_path(
-            [0.0] * 6,
-            [math.radians(19.0), math.radians(-11.0), 0.0, 0.0, 0.0, 0.0],
-            5.0,
-        )
-
-        maximum_step = max(
-            max(abs(math.degrees(end - start)) for start, end in zip(left, right))
-            for left, right in zip(path, path[1:])
-        )
-        self.assertLessEqual(maximum_step, 5.0)
+        for name in (
+            "max_joint_delta_deg",
+            "motion_timeout_s",
+            "joint_tolerance_deg",
+            "max_joint_waypoint_step_deg",
+            "max_runtime_path_error_deg",
+            "max_jacobian_condition",
+        ):
+            self.assertFalse(hasattr(args, name))
 
 
 if __name__ == "__main__":

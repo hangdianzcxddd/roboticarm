@@ -159,15 +159,13 @@ http://127.0.0.1:8088
 ```bash
 python3 -m robot_control.linux.arm.arm_cli status
 python3 -m robot_control.linux.arm.arm_cli enable
+python3 -m robot_control.linux.arm.arm_cli resume
 python3 -m robot_control.linux.arm.arm_cli pose 150 0 215 0 85 0 --speed 20 --mode P
 python3 -m robot_control.linux.arm.arm_cli joints 0 1.5 -1 0 0.5 -1.25 --speed 10
 ```
 
-`arm_cli joints` 默认限制每个关节相对实时反馈最多变化 `60` 度，并以最多
-`8` 度的关节航点逐点等待到位和检查奇异性；可通过
-`--max-joint-delta-deg`、`--max-joint-waypoint-step-deg`、
-`--max-runtime-path-error-deg`、`--max-jacobian-condition` 和
-`--motion-timeout-s` 调整。任一检查失败会触发软件急停。
+`arm_cli joints` 校验目标是否在机械臂的关节范围内，然后直接下发关节运动命令。
+`arm_cli resume` 只发送软件急停解除指令，不会下发运动指令。
 
 ### 夹爪调试
 

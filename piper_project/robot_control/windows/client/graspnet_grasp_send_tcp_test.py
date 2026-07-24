@@ -21,6 +21,8 @@ if cv2 is not None:
         dynamic_candidate_from_target,
         dynamic_pick_x_mm_for_candidate,
         load_intrinsics,
+        object_point_cloud_stats_text,
+        oriented_object_dimensions_mm,
         point_cloud_stats_text,
         point_cloud_from_mask,
         target_from_segment,
@@ -155,6 +157,56 @@ class TestGraspNetGraspSendTcp(unittest.TestCase):
         self.assertIn("span=(20.0,40.0,60.0)mm", text)
         self.assertIn("z=[+0.5000,+0.5600]m", text)
 
+    def test_oriented_object_dimensions_use_base_plane_short_side(self):
+        length_m = 0.12
+        width_m = 0.04
+        angle = np.deg2rad(37.0)
+        rotation = np.asarray(
+            [[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]]
+        )
+        footprint = np.asarray(
+            [
+                [-length_m / 2, -width_m / 2],
+                [-length_m / 2, width_m / 2],
+                [length_m / 2, -width_m / 2],
+                [length_m / 2, width_m / 2],
+            ]
+        ) @ rotation.T
+        points = np.vstack(
+            [
+                np.column_stack((footprint, np.full(4, 0.50))),
+                np.column_stack((footprint, np.full(4, 0.52))),
+            ]
+        )
+
+        length_mm, measured_width_mm, height_mm = oriented_object_dimensions_mm(
+            points,
+            np.eye(4),
+        )
+
+        self.assertAlmostEqual(length_mm, 120.0, places=3)
+        self.assertAlmostEqual(measured_width_mm, 40.0, places=3)
+        self.assertAlmostEqual(height_mm, 20.0, places=3)
+
+    def test_object_stats_report_oriented_width_in_base_frame(self):
+        text = object_point_cloud_stats_text(
+            np.asarray(
+                [
+                    [-0.05, -0.02, 0.50],
+                    [-0.05, 0.02, 0.52],
+                    [0.05, -0.02, 0.50],
+                    [0.05, 0.02, 0.52],
+                ]
+            ),
+            label="target #1",
+            camera_to_base=np.eye(4),
+        )
+
+        self.assertIn("length=100.0mm", text)
+        self.assertIn("width=40.0mm", text)
+        self.assertIn("height=20.0mm", text)
+        self.assertIn("frame=base", text)
+
     def test_depth_foreground_detector_uses_plane_roi_and_entry_edge(self):
         depth = np.full((20, 30), 0.50, dtype=np.float32)
         depth[6:12, 20:28] = 0.46
@@ -181,6 +233,25 @@ class TestGraspNetGraspSendTcp(unittest.TestCase):
         self.assertEqual(len(second_clear), 1)
         self.assertEqual(second_clear[0].detection.label, "graspnet_object")
         self.assertGreater(second_clear[0].mask_area_px, 10)
+
+    def test_segment_mask_excludes_non_foreground_depth_inside_contour(self):
+        depth = np.full((12, 12), 0.50, dtype=np.float32)
+        depth[2:10, 2:10] = 0.46
+        depth[5:7, 5:7] = 1.30
+        detector = DepthForegroundDetector(
+            flat_plane(12, 12, 0.50),
+            DepthForegroundDetectorConfig(
+                min_height_above_belt_mm=20.0,
+                max_height_above_belt_mm=80.0,
+                min_area_px=10,
+                morphology_kernel_size=1,
+            ),
+        )
+
+        segments = detector.detect(FakeDepthFrame(depth))
+
+        self.assertEqual(len(segments), 1)
+        self.assertFalse(np.any(segments[0].mask[5:7, 5:7]))
 
     def test_point_cloud_from_mask_deprojects_depth_pixels(self):
         depth = np.full((4, 4), 0.50, dtype=np.float32)

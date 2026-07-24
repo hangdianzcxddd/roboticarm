@@ -308,7 +308,8 @@ def _segments_from_contours(
 
         segment_mask = np.zeros((height, width), dtype=np.uint8)
         cv2.drawContours(segment_mask, [shape_contour], -1, 1, thickness=cv2.FILLED)
-        mask_bool = segment_mask.astype(bool)
+        # Keep only depth pixels that passed the calibrated foreground test.
+        mask_bool = segment_mask.astype(bool) & mask.astype(bool)
         try:
             centroid_u, centroid_v, mask_area_px = mask_centroid(mask_bool)
         except ValueError:
@@ -583,14 +584,68 @@ def point_cloud_stats_text(
     )
 
 
-def print_point_cloud_stats(targets: list[GraspNetTarget]) -> None:
+def oriented_object_dimensions_mm(
+    points_camera_m: np.ndarray,
+    camera_to_base: np.ndarray,
+) -> tuple[float, float, float]:
+    """Return base-plane length, width, and height from an object's 3D points."""
+    points = np.asarray(points_camera_m, dtype=np.float64)
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError(f"expected point cloud shaped (N, 3), got {points.shape}")
+    points = points[np.isfinite(points).all(axis=1)]
+    if points.shape[0] < 2:
+        raise ValueError("at least two finite points are required")
+    transform = np.asarray(camera_to_base, dtype=np.float64)
+    if transform.shape != (4, 4) or not np.all(np.isfinite(transform)):
+        raise ValueError("camera_to_base transform must be a finite 4x4 matrix")
+
+    points_base = points @ transform[:3, :3].T + transform[:3, 3]
+    rectangle = cv2.minAreaRect(points_base[:, :2].astype(np.float32))
+    planar_dimensions_mm = np.abs(np.asarray(rectangle[1], dtype=float)) * 1000.0
+    length_mm = float(np.max(planar_dimensions_mm))
+    width_mm = float(np.min(planar_dimensions_mm))
+    height_mm = float(np.ptp(points_base[:, 2]) * 1000.0)
+    return length_mm, width_mm, height_mm
+
+
+def object_point_cloud_stats_text(
+    points_camera_m: np.ndarray,
+    *,
+    label: str,
+    camera_to_base: np.ndarray | None,
+) -> str:
+    points = np.asarray(points_camera_m, dtype=np.float64)
+    finite = points[np.isfinite(points).all(axis=1)] if points.ndim == 2 else points
+    count = finite.shape[0] if finite.ndim == 2 else 0
+    if camera_to_base is None:
+        return f"{label}: count={count} object_size_base=unavailable(no hand-eye result)"
+    try:
+        length_mm, width_mm, height_mm = oriented_object_dimensions_mm(
+            finite,
+            camera_to_base,
+        )
+    except ValueError as exc:
+        return f"{label}: count={count} object_size_base=unavailable({exc})"
+    return (
+        f"{label}: count={count} "
+        f"length={length_mm:.1f}mm width={width_mm:.1f}mm "
+        f"height={height_mm:.1f}mm frame=base"
+    )
+
+
+def print_point_cloud_stats(
+    targets: list[GraspNetTarget],
+    *,
+    camera_to_base: np.ndarray | None,
+) -> None:
     all_points, _ = colored_point_cloud_from_targets(targets)
     print(point_cloud_stats_text(all_points, label="Point cloud all"), flush=True)
     for target in targets:
         print(
-            point_cloud_stats_text(
+            object_point_cloud_stats_text(
                 target.point_cloud_camera_m,
                 label=f"  target #{target.rank}",
+                camera_to_base=camera_to_base,
             ),
             flush=True,
         )
@@ -1328,7 +1383,10 @@ def main() -> None:
                 now_s = time.monotonic()
                 if now_s - last_point_cloud_print_s >= args.print_interval:
                     print(f"Point cloud targets={len(targets)} points={total_points}", flush=True)
-                    print_point_cloud_stats(targets)
+                    print_point_cloud_stats(
+                        targets,
+                        camera_to_base=camera_to_base,
+                    )
                     last_point_cloud_print_s = now_s
                 if not point_cloud_viewer.update(targets):
                     break
