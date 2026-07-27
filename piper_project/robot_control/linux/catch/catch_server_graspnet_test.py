@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 import numpy as np
 
@@ -11,16 +11,22 @@ from robot_control.linux.arm.piper_arm import PiperController
 from robot_control.linux.arm.safety import SafetyError
 from robot_control.linux.catch.catch_server_graspnet import (
     DEFAULT_HAND_EYE_RESULT,
+    GraspPlan,
+    PlanningStats,
     ResolvedCandidate,
     approach_tilt_deg,
+    build_candidate_plan,
     build_parser,
     connect_for_execution,
+    execute_plan,
     hold_position_on_exit,
     fk_tcp_pose,
     fk_tcp_transform,
     interpolate_joint_path,
+    live_path_to_target,
     move_to_nominal_joints,
     resolve_candidate_variants,
+    select_plan,
     solve_ik,
     validate_args,
     validate_candidate_geometry,
@@ -98,6 +104,137 @@ class TestGraspNetCatchServer(unittest.TestCase):
         self.assertEqual(args.collision_protection_level, 2)
         self.assertTrue(args.release_software_estop_on_startup)
         self.assertAlmostEqual(args.startup_command_duration_s, 1.0)
+        self.assertTrue(args.fast_planning)
+        self.assertEqual(args.fast_plan_count, 2)
+
+    def test_fast_planning_stops_after_requested_feasible_plans(self):
+        args = build_parser().parse_args(
+            ["--fast-plan-count", "2", "--max-candidates", "3"]
+        )
+        command = command_from_fk(args)
+        candidates = tuple(
+            GraspCandidate(
+                **{
+                    **command.grasp_candidates[0].__dict__,
+                    "index": index,
+                    "score": score,
+                }
+            )
+            for index, score in enumerate((0.9, 0.8, 0.7))
+        )
+        command = CameraPointCommand(
+            **{**command.__dict__, "grasp_candidates": candidates}
+        )
+        module = "robot_control.linux.catch.catch_server_graspnet"
+        attempted = []
+
+        def build_plan(_command, candidate, start, *_args, **_kwargs):
+            attempted.append(candidate.source_index)
+            return SimpleNamespace(total_cost=float(candidate.source_index))
+
+        with (
+            patch(f"{module}.resolve_candidate_variants") as resolve,
+            patch(f"{module}.validate_candidate_geometry"),
+            patch(f"{module}.build_candidate_plan", side_effect=build_plan),
+        ):
+            resolve.side_effect = lambda raw, *_args: (
+                SimpleNamespace(
+                    source_index=raw.index,
+                    orientation_variant="test",
+                ),
+            )
+            plan, failures, stats = select_plan(
+                command,
+                np.eye(4),
+                known_joints_rad(),
+                PiperController(),
+                args,
+            )
+
+        self.assertEqual(plan.total_cost, 0.0)
+        self.assertEqual(failures, ())
+        self.assertEqual(attempted, [0, 1])
+        self.assertEqual(stats.feasible_plans, 2)
+        self.assertTrue(stats.early_stopped)
+
+    def test_exhaustive_planning_attempts_every_geometry_valid_variant(self):
+        args = build_parser().parse_args(
+            ["--no-fast-planning", "--max-candidates", "3"]
+        )
+        command = command_from_fk(args)
+        candidates = tuple(
+            GraspCandidate(
+                **{
+                    **command.grasp_candidates[0].__dict__,
+                    "index": index,
+                    "score": 1.0 - index * 0.1,
+                }
+            )
+            for index in range(3)
+        )
+        command = CameraPointCommand(
+            **{**command.__dict__, "grasp_candidates": candidates}
+        )
+        module = "robot_control.linux.catch.catch_server_graspnet"
+        attempted = []
+
+        def build_plan(_command, candidate, *_args, **_kwargs):
+            attempted.append(candidate.source_index)
+            return SimpleNamespace(total_cost=float(candidate.source_index))
+
+        with (
+            patch(f"{module}.resolve_candidate_variants") as resolve,
+            patch(f"{module}.validate_candidate_geometry"),
+            patch(f"{module}.build_candidate_plan", side_effect=build_plan),
+        ):
+            resolve.side_effect = lambda raw, *_args: (
+                SimpleNamespace(
+                    source_index=raw.index,
+                    orientation_variant="test",
+                ),
+            )
+            _plan, _failures, stats = select_plan(
+                command,
+                np.eye(4),
+                known_joints_rad(),
+                PiperController(),
+                args,
+            )
+
+        self.assertEqual(attempted, [0, 1, 2])
+        self.assertEqual(stats.feasible_plans, 3)
+        self.assertFalse(stats.early_stopped)
+
+    def test_candidate_planning_tries_next_seed_after_complete_path_failure(self):
+        args = build_parser().parse_args([])
+        command = command_from_fk(args)
+        candidate = resolve_candidate_variants(
+            command.grasp_candidates[0], command, np.eye(4), args
+        )[0]
+        seeds = (known_joints_rad(), tuple(value + 0.01 for value in known_joints_rad()))
+        expected_plan = SimpleNamespace(total_cost=1.0)
+        module = "robot_control.linux.catch.catch_server_graspnet"
+
+        with (
+            patch(f"{module}.validate_candidate_geometry"),
+            patch(f"{module}.planning_seeds", return_value=seeds),
+            patch(f"{module}.solve_ik", return_value=SimpleNamespace()),
+            patch(
+                f"{module}._finish_candidate_plan",
+                side_effect=(SafetyError("first path failed"), expected_plan),
+            ) as finish,
+        ):
+            plan = build_candidate_plan(
+                command,
+                candidate,
+                known_joints_rad(),
+                PiperController(),
+                args,
+                stats=PlanningStats(),
+            )
+
+        self.assertIs(plan, expected_plan)
+        self.assertEqual(finish.call_count, 2)
 
     def test_execution_connection_releases_estop_before_enable(self):
         args = build_parser().parse_args([])
@@ -301,6 +438,25 @@ class TestGraspNetCatchServer(unittest.TestCase):
                 allow_start_margin_recovery=True,
             )
 
+    def test_path_validation_reuses_precomputed_jacobian_conditions(self):
+        args = build_parser().parse_args(
+            ["--min-trajectory-tcp-z-mm", "1", "--max-jacobian-condition", "1e20"]
+        )
+        joints = known_joints_rad()
+        module = "robot_control.linux.catch.catch_server_graspnet"
+
+        with patch(f"{module}._finite_difference_jacobian") as jacobian:
+            _margin, maximum = validate_path_height(
+                (joints,),
+                PiperController(),
+                args,
+                label="cached",
+                precomputed_conditions=(12.5,),
+            )
+
+        self.assertAlmostEqual(maximum, 12.5)
+        jacobian.assert_not_called()
+
     def test_runtime_path_deviation_is_rejected(self):
         args = build_parser().parse_args(["--min-trajectory-tcp-z-mm", "1"])
         controller = PiperController()
@@ -317,6 +473,83 @@ class TestGraspNetCatchServer(unittest.TestCase):
                 args,
                 label="test",
             )
+
+    def test_retreat_path_is_rebased_on_live_feedback(self):
+        args = build_parser().parse_args([])
+        current = tuple(np.radians((0.0, 110.0, -65.0, -45.0, 22.0, -95.0)))
+        target = tuple(np.radians((0.0, 100.0, -60.0, -30.0, 25.0, -85.0)))
+        module = "robot_control.linux.catch.catch_server_graspnet"
+
+        with (
+            patch(f"{module}.read_live_joints", return_value=current),
+            patch(f"{module}.validate_path_height") as validate_path,
+        ):
+            path = live_path_to_target(
+                PiperController(),
+                target,
+                args,
+                label="retreat",
+            )
+
+        np.testing.assert_allclose(path[0], current)
+        np.testing.assert_allclose(path[-1], target)
+        validate_path.assert_called_once_with(
+            path,
+            ANY,
+            args,
+            label="retreat",
+        )
+
+    def test_successful_grasp_releases_object_after_return(self):
+        args = build_parser().parse_args([])
+        joints = known_joints_rad()
+        candidate = ResolvedCandidate(
+            source_index=0,
+            source="test",
+            score=1.0,
+            width_m=0.04,
+            camera_position_m=(0.0, 0.0, 0.0),
+            grasp_pose=fk_tcp_pose(joints, args),
+            approach_axis=np.array([0.0, 0.0, -1.0]),
+            orientation_variant="test",
+        )
+        plan = GraspPlan(
+            command=command_from_fk(args),
+            candidate=candidate,
+            start_joints_rad=joints,
+            pregrasp_pose=candidate.grasp_pose,
+            grasp_pose=candidate.grasp_pose,
+            transfer_path=(joints, joints),
+            approach_path=(joints, joints),
+            transfer_cost=0.0,
+            maximum_joint_delta_deg=0.0,
+            minimum_joint_margin_deg=10.0,
+            maximum_condition_number=10.0,
+            approach_tilt_deg=0.0,
+            total_cost=0.0,
+        )
+        events = []
+        module = "robot_control.linux.catch.catch_server_graspnet"
+
+        def record_gripper(_controller, _args, action):
+            events.append(action)
+
+        def record_path(_controller, _path, _args, *, label, speed):
+            events.append(label)
+            return 1
+
+        with (
+            patch(f"{module}.read_live_joints", return_value=joints),
+            patch(f"{module}.send_gripper", side_effect=record_gripper),
+            patch(f"{module}.execute_joint_path", side_effect=record_path),
+            patch(f"{module}.live_path_to_target", return_value=(joints, joints)),
+        ):
+            execute_plan(SimpleNamespace(), plan, args)
+
+        self.assertEqual(
+            events,
+            ["open", "transfer", "approach", "close", "retreat", "return", "open"],
+        )
 
     def test_wait_ignores_stale_feedback_before_runtime_validation(self):
         target = tuple(np.radians((0.0, 8.0, -90.0, 0.0, 30.0, 0.0)))

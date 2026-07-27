@@ -28,6 +28,14 @@ python3 -m robot_control.linux.catch.catch_server_graspnet \
 客户端断开或启动/执行异常时，程序不会主动急停或失能，而是用实时关节反馈
 覆盖运动目标并保持当前位置，然后断开软件连接。若控制器自身已进入实体急停、
 碰撞或抱闸故障，软件无法保证位置保持，也不会自动复位这类硬件故障。
+一次抓取成功后，机械臂会先携带物体撤退并返回初始关节位，随后自动打开夹爪
+释放物体；不会在抓取位附近或返回运动途中提前松开。
+服务默认启用快速规划：先对按 GraspNet 分数排序的候选执行廉价几何过滤，再
+逐个执行完整 IK 和全路径安全校验；找到 2 个完整可行方案后提前停止，并从中
+选择成本最低的方案。可用 `--fast-plan-count 1` 追求最低延迟，或用
+`--no-fast-planning` 恢复对 `--max-candidates` 范围内所有变体的穷举规划。
+日志中的 `Grasp planning stats` 和 `Grasp candidate timing` 会报告候选数、实际
+尝试的变体数、IK 调用/优化次数以及各候选耗时。
 官方 GraspNet rotation matrix 的接近方向默认按局部 X 轴解释；初次联调必须
 用已知的竖直抓取检查 `--approach-axis/--approach-axis-sign`，并标定
 `--tcp-rot-*-deg`、`--tcp-offset-*-mm` 和 `--fk-tool-z-offset-mm`。轴系或 TCP

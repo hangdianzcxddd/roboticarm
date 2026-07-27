@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import argparse
 import math
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 import socket
 import sys
@@ -98,6 +98,30 @@ class GraspPlan:
     total_cost: float
 
 
+@dataclass
+class CandidatePlanningTiming:
+    source_index: int | None
+    duration_s: float = 0.0
+    resolved_variants: int = 0
+    geometry_passed_variants: int = 0
+    attempted_variants: int = 0
+    feasible_plans: int = 0
+
+
+@dataclass
+class PlanningStats:
+    candidates_received: int = 0
+    candidates_considered: int = 0
+    resolved_variants: int = 0
+    geometry_passed_variants: int = 0
+    attempted_variants: int = 0
+    feasible_plans: int = 0
+    ik_calls: int = 0
+    ik_optimizer_runs: int = 0
+    early_stopped: bool = False
+    candidate_timings: list[CandidatePlanningTiming] = field(default_factory=list)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -135,6 +159,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--collision-protection-level", type=int, default=2)
 
     parser.add_argument("--max-candidates", type=int, default=10)
+    parser.add_argument(
+        "--fast-planning",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "plan score-ordered candidates and stop after --fast-plan-count "
+            "complete feasible plans (default: enabled)"
+        ),
+    )
+    parser.add_argument(
+        "--fast-plan-count",
+        type=int,
+        default=2,
+        help="number of complete feasible plans required before fast planning stops",
+    )
     parser.add_argument("--approach-axis", choices=("x", "y", "z"), default="x")
     parser.add_argument(
         "--approach-axis-sign",
@@ -294,8 +333,10 @@ def build_parser() -> argparse.ArgumentParser:
 def validate_args(args: argparse.Namespace) -> None:
     if not 0 <= args.speed <= 100 or not 0 <= args.grasp_speed <= 100:
         raise ValueError("--speed and --grasp-speed must be in [0, 100]")
-    if args.max_candidates < 1 or args.ik_seed_count < 1:
-        raise ValueError("--max-candidates and --ik-seed-count must be >= 1")
+    if args.max_candidates < 1 or args.ik_seed_count < 1 or args.fast_plan_count < 1:
+        raise ValueError(
+            "--max-candidates, --ik-seed-count and --fast-plan-count must be >= 1"
+        )
     positive = (
         "approach_distance_mm",
         "approach_sample_distance_mm",
@@ -623,7 +664,10 @@ def solve_ik(
     *,
     reference_joints: Sequence[float],
     local_joint_delta_deg: float | None = None,
+    stats: PlanningStats | None = None,
 ) -> IkSolution:
+    if stats is not None:
+        stats.ik_calls += 1
     target = pose_transform(target_pose)
     lower, upper = _joint_bounds(controller, args)
     reference = np.asarray(reference_joints, dtype=float)
@@ -641,6 +685,8 @@ def solve_ik(
 
     solutions: list[IkSolution] = []
     for seed in unique_seeds:
+        if stats is not None:
+            stats.ik_optimizer_runs += 1
         result = least_squares(
             _ik_objective,
             seed,
@@ -785,7 +831,10 @@ def validate_path_height(
     label: str,
     allow_start_margin_recovery: bool = False,
     check_joint_margin: bool = True,
+    precomputed_conditions: Sequence[float | None] | None = None,
 ) -> tuple[float, float]:
+    if precomputed_conditions is not None and len(precomputed_conditions) != len(path):
+        raise ValueError("precomputed condition count must match path length")
     minimum_margin_deg = float("inf")
     maximum_condition = 0.0
     previous_joint_margins: np.ndarray | None = None
@@ -828,10 +877,18 @@ def validate_path_height(
                 f"{label}[{index}] TCP z={pose.z_mm:.3f} mm is below trajectory "
                 f"floor {args.min_trajectory_tcp_z_mm:.3f} mm"
             )
-        target = fk_tcp_transform(joints, args)
-        condition = float(
-            np.linalg.cond(_finite_difference_jacobian(joints, target, args))
+        condition = (
+            None
+            if precomputed_conditions is None
+            else precomputed_conditions[index]
         )
+        if condition is None:
+            target = fk_tcp_transform(joints, args)
+            condition = float(
+                np.linalg.cond(_finite_difference_jacobian(joints, target, args))
+            )
+        else:
+            condition = float(condition)
         if not math.isfinite(condition) or condition > args.max_jacobian_condition:
             raise SafetyError(
                 f"{label}[{index}] Jacobian condition={condition:.3f} exceeds "
@@ -842,23 +899,16 @@ def validate_path_height(
     return minimum_margin_deg, maximum_condition
 
 
-def build_candidate_plan(
+def _finish_candidate_plan(
     command: CameraPointCommand,
     candidate: ResolvedCandidate,
     start_joints: tuple[float, ...],
+    pre_solution: IkSolution,
     controller: PiperController,
     args: argparse.Namespace,
+    stats: PlanningStats | None,
 ) -> GraspPlan:
-    validate_candidate_geometry(candidate, command, controller, args)
     pre_pose = pregrasp_pose(candidate, args)
-    seeds = planning_seeds(start_joints, controller, args)
-    pre_solution = solve_ik(
-        pre_pose,
-        seeds,
-        controller,
-        args,
-        reference_joints=start_joints,
-    )
     max_delta, transfer_cost = validate_joint_deltas(
         start_joints, pre_solution.joints_rad, args
     )
@@ -866,7 +916,12 @@ def build_candidate_plan(
         start_joints, pre_solution.joints_rad, args.max_joint_waypoint_step_deg
     )
     transfer_margin, transfer_condition = validate_path_height(
-        transfer_path, controller, args, label="transfer"
+        transfer_path,
+        controller,
+        args,
+        label="transfer",
+        precomputed_conditions=(None,) * (len(transfer_path) - 1)
+        + (pre_solution.condition_number,),
     )
 
     distance = float(args.approach_distance_mm)
@@ -884,6 +939,7 @@ def build_candidate_plan(
             args,
             reference_joints=previous.joints_rad,
             local_joint_delta_deg=float(args.max_joint_waypoint_step_deg),
+            stats=stats,
         )
         step_delta = float(
             np.max(
@@ -920,7 +976,13 @@ def build_candidate_plan(
             + ", ".join(approach_violations)
         )
     approach_margin, approach_condition = validate_path_height(
-        approach_path, controller, args, label="approach"
+        approach_path,
+        controller,
+        args,
+        label="approach",
+        precomputed_conditions=tuple(
+            solution.condition_number for solution in approach_solutions
+        ),
     )
     min_margin = min(transfer_margin, approach_margin)
     max_condition = max(transfer_condition, approach_condition)
@@ -954,45 +1016,127 @@ def build_candidate_plan(
     )
 
 
+def build_candidate_plan(
+    command: CameraPointCommand,
+    candidate: ResolvedCandidate,
+    start_joints: tuple[float, ...],
+    controller: PiperController,
+    args: argparse.Namespace,
+    *,
+    stats: PlanningStats | None = None,
+    geometry_validated: bool = False,
+) -> GraspPlan:
+    if not geometry_validated:
+        validate_candidate_geometry(candidate, command, controller, args)
+    pre_pose = pregrasp_pose(candidate, args)
+    failures: list[str] = []
+    for seed_index, seed in enumerate(planning_seeds(start_joints, controller, args)):
+        try:
+            pre_solution = solve_ik(
+                pre_pose,
+                (seed,),
+                controller,
+                args,
+                reference_joints=start_joints,
+                stats=stats,
+            )
+            return _finish_candidate_plan(
+                command,
+                candidate,
+                start_joints,
+                pre_solution,
+                controller,
+                args,
+                stats,
+            )
+        except (ValueError, SafetyError) as exc:
+            failures.append(f"seed {seed_index}: {exc}")
+    detail = "; ".join(failures[:4])
+    raise SafetyError(f"candidate planning failed for every IK seed: {detail}")
+
+
 def select_plan(
     command: CameraPointCommand,
     camera_to_base: np.ndarray,
     start_joints: tuple[float, ...],
     controller: PiperController,
     args: argparse.Namespace,
-) -> tuple[GraspPlan, tuple[str, ...]]:
+) -> tuple[GraspPlan, tuple[str, ...], PlanningStats]:
     if not command.grasp_candidates:
         raise ValueError("GraspNet command contains no grasp candidates")
+    stats = PlanningStats(candidates_received=len(command.grasp_candidates))
     plans: list[GraspPlan] = []
     failures: list[str] = []
     candidates = sorted(
-        command.grasp_candidates[: int(args.max_candidates)],
+        command.grasp_candidates,
         key=lambda item: -float("inf") if item.score is None else item.score,
         reverse=True,
-    )
+    )[: int(args.max_candidates)]
+    eligible: list[tuple[ResolvedCandidate, CandidatePlanningTiming]] = []
+
+    # Reject invalid geometry before starting any nonlinear IK optimization.
     for raw_candidate in candidates:
+        stats.candidates_considered += 1
+        timing = CandidatePlanningTiming(source_index=raw_candidate.index)
+        stats.candidate_timings.append(timing)
+        started = time.monotonic()
         try:
             variants = resolve_candidate_variants(
                 raw_candidate, command, camera_to_base, args
             )
         except (ValueError, SafetyError) as exc:
             failures.append(f"candidate {raw_candidate.index}: {exc}")
+            timing.duration_s += time.monotonic() - started
             continue
+        timing.duration_s += time.monotonic() - started
+        timing.resolved_variants = len(variants)
+        stats.resolved_variants += len(variants)
         for variant in variants:
+            started = time.monotonic()
             try:
-                plans.append(
-                    build_candidate_plan(
-                        command, variant, start_joints, controller, args
-                    )
-                )
+                validate_candidate_geometry(variant, command, controller, args)
             except (ValueError, SafetyError) as exc:
                 failures.append(
                     f"candidate {raw_candidate.index} ({variant.orientation_variant}): {exc}"
                 )
+            else:
+                timing.geometry_passed_variants += 1
+                stats.geometry_passed_variants += 1
+                eligible.append((variant, timing))
+            finally:
+                timing.duration_s += time.monotonic() - started
+
+    for variant, timing in eligible:
+        timing.attempted_variants += 1
+        stats.attempted_variants += 1
+        started = time.monotonic()
+        try:
+            plan = build_candidate_plan(
+                command,
+                variant,
+                start_joints,
+                controller,
+                args,
+                stats=stats,
+                geometry_validated=True,
+            )
+        except (ValueError, SafetyError) as exc:
+            failures.append(
+                f"candidate {variant.source_index} ({variant.orientation_variant}): {exc}"
+            )
+        else:
+            plans.append(plan)
+            timing.feasible_plans += 1
+            stats.feasible_plans += 1
+        finally:
+            timing.duration_s += time.monotonic() - started
+        if args.fast_planning and len(plans) >= int(args.fast_plan_count):
+            stats.early_stopped = len(eligible) > stats.attempted_variants
+            break
     if not plans:
         detail = "; ".join(failures[:12])
         raise SafetyError(f"no feasible GraspNet candidate: {detail}")
-    return min(plans, key=lambda plan: plan.total_cost), tuple(failures)
+    return min(plans, key=lambda plan: plan.total_cost), tuple(failures), stats
 
 
 def _joint_feedback_timestamp(feedback: Any) -> float | None:
@@ -1194,6 +1338,24 @@ def execute_joint_path(
     return count
 
 
+def live_path_to_target(
+    controller: PiperController,
+    target: Sequence[float],
+    args: argparse.Namespace,
+    *,
+    label: str,
+) -> tuple[tuple[float, ...], ...]:
+    """Rebase a transition on live feedback after gripper/contact disturbances."""
+    current = read_live_joints(controller)
+    path = interpolate_joint_path(
+        current,
+        target,
+        args.max_joint_waypoint_step_deg,
+    )
+    validate_path_height(path, controller, args, label=label)
+    return path
+
+
 def move_to_nominal_joints(
     controller: PiperController, args: argparse.Namespace
 ) -> tuple[float, ...]:
@@ -1350,7 +1512,12 @@ def execute_plan(
     send_gripper(controller, args, "close")
     stage_timings["gripper_close_s"] = time.monotonic() - started
     print(f"Grasp stage: gripper_close {stage_timings['gripper_close_s']:.3f}s", flush=True)
-    retreat = tuple(reversed(plan.approach_path))
+    retreat = live_path_to_target(
+        controller,
+        plan.approach_path[0],
+        args,
+        label="retreat",
+    )
     print(
         f"Grasp stage: retreat started ({len(retreat) - 1} waypoint(s), "
         f"speed={args.grasp_speed}%)",
@@ -1366,7 +1533,12 @@ def execute_plan(
     )
     stage_timings["retreat_s"] = time.monotonic() - started
     print(f"Grasp stage: retreat {stage_timings['retreat_s']:.3f}s", flush=True)
-    return_path = tuple(reversed(plan.transfer_path))
+    return_path = live_path_to_target(
+        controller,
+        plan.transfer_path[0],
+        args,
+        label="return",
+    )
     print(
         f"Grasp stage: return started ({len(return_path) - 1} waypoint(s), "
         f"speed={args.speed}%)",
@@ -1378,6 +1550,15 @@ def execute_plan(
     )
     stage_timings["return_s"] = time.monotonic() - started
     print(f"Grasp stage: return {stage_timings['return_s']:.3f}s", flush=True)
+
+    print("Grasp stage: gripper_release started", flush=True)
+    started = time.monotonic()
+    send_gripper(controller, args, "open")
+    stage_timings["gripper_release_s"] = time.monotonic() - started
+    print(
+        f"Grasp stage: gripper_release {stage_timings['gripper_release_s']:.3f}s",
+        flush=True,
+    )
     return counts
 
 
@@ -1409,6 +1590,31 @@ def plan_to_dict(plan: GraspPlan) -> dict[str, Any]:
     }
 
 
+def planning_stats_to_dict(stats: PlanningStats) -> dict[str, Any]:
+    return {
+        "candidates_received": stats.candidates_received,
+        "candidates_considered": stats.candidates_considered,
+        "resolved_variants": stats.resolved_variants,
+        "geometry_passed_variants": stats.geometry_passed_variants,
+        "attempted_variants": stats.attempted_variants,
+        "feasible_plans": stats.feasible_plans,
+        "ik_calls": stats.ik_calls,
+        "ik_optimizer_runs": stats.ik_optimizer_runs,
+        "early_stopped": stats.early_stopped,
+        "candidates": [
+            {
+                "source_index": timing.source_index,
+                "duration_s": timing.duration_s,
+                "resolved_variants": timing.resolved_variants,
+                "geometry_passed_variants": timing.geometry_passed_variants,
+                "attempted_variants": timing.attempted_variants,
+                "feasible_plans": timing.feasible_plans,
+            }
+            for timing in stats.candidate_timings
+        ],
+    }
+
+
 def handle_message(
     message: dict[str, Any],
     *,
@@ -1431,11 +1637,35 @@ def handle_message(
         start_joints = read_live_joints(controller)
     validator.validate_joints(start_joints)
     planning_started = time.monotonic()
-    plan, failures = select_plan(
+    plan, failures, planning_stats = select_plan(
         command, camera_to_base, start_joints, controller or validator, args
     )
     planning_time_s = time.monotonic() - planning_started
     print(f"Grasp planning completed in {planning_time_s:.3f}s", flush=True)
+    print(
+        "Grasp planning stats: "
+        f"candidates={planning_stats.candidates_considered}/"
+        f"{planning_stats.candidates_received} "
+        f"resolved_variants={planning_stats.resolved_variants} "
+        f"geometry_variants={planning_stats.geometry_passed_variants} "
+        f"attempted_variants={planning_stats.attempted_variants} "
+        f"feasible_plans={planning_stats.feasible_plans} "
+        f"ik_calls={planning_stats.ik_calls} "
+        f"ik_optimizer_runs={planning_stats.ik_optimizer_runs} "
+        f"early_stopped={planning_stats.early_stopped}",
+        flush=True,
+    )
+    for candidate_timing in planning_stats.candidate_timings:
+        print(
+            "Grasp candidate timing: "
+            f"candidate={candidate_timing.source_index} "
+            f"duration={candidate_timing.duration_s:.3f}s "
+            f"variants={candidate_timing.resolved_variants} "
+            f"geometry_passed={candidate_timing.geometry_passed_variants} "
+            f"attempted={candidate_timing.attempted_variants} "
+            f"feasible={candidate_timing.feasible_plans}",
+            flush=True,
+        )
     if args.debug_plan or not args.execute:
         print(
             "Selected GraspNet plan: "
@@ -1474,6 +1704,7 @@ def handle_message(
             "task": command.task,
             "grasp_mode": command.grasp_mode,
             "plan": plan_to_dict(plan),
+            "planning_stats": planning_stats_to_dict(planning_stats),
             "rejected_variant_count": len(failures),
             "rejected_variants": list(failures) if args.debug_plan else [],
             "send_counts": counts,
@@ -1571,7 +1802,9 @@ def serve(args: argparse.Namespace) -> None:
                             except Exception as exc:  # noqa: BLE001 - fail closed
                                 if controller is not None:
                                     raise RuntimeError(
-                                        f"command {command_id!r} failed; arm held at current position"
+                                        f"command {command_id!r} failed: "
+                                        f"{type(exc).__name__}: {exc}; "
+                                        "arm held at current position"
                                     ) from exc
                                 response = make_error_message(command_id, str(exc))
                                 print(f"Error: {exc}", flush=True)
