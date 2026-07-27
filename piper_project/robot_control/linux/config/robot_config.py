@@ -41,6 +41,7 @@ class RobotConfig:
     judge_flag: bool = True
     connect_timeout_s: float = 3.0
     command_interval_s: float = 0.01
+    enable_command_duration_s: float = 1.0
     default_speed_percent: int = 20
     default_move_mode: MoveMode = "P"
     start_sdk_joint_limit: bool = True

@@ -18,10 +18,16 @@ python3 -m robot_control.linux.catch.catch_server_graspnet \
 这一阶段不包含障碍物模型或自动绕障，因此工作区必须清空并保持目标静止。
 加入 `--execute` 后，服务会先运动到 `--nominal-joints-deg` 指定的初始姿态
 （默认 `0 90 -90 0 30 0` 度），到位后才开始监听抓取命令。
-启动路径和抓取路径默认都限制每个关节的总变化不超过 `60` 度，并对每个
-`8` 度关节航点等待实时反馈、检查关节限位余量、TCP 高度、规划路径偏差和
-雅可比条件数。任何启动或执行异常都会触发机械臂急停并退出服务，必须检查
-现场后人工重新启动；脚本不会自动解除急停。
+启动连接会先读取控制器实时状态；正常状态下不会发送急停复位，六轴已经使能时
+也不会重复使能，避免电机短暂失能造成机械臂下坠。只有控制器明确反馈急停时
+才会执行软件急停释放并重新可靠使能。
+启动到初始姿态不限制各关节的总变化；抓取路径默认限制每个关节的总变化
+不超过 `60` 度。启动运动只校验目标是否在机械臂绝对关节硬限位内，然后直接
+下发最终初始关节位并等待到位；不应用 TCP 高度、雅可比、关节余量或运行时
+轨迹偏差检查。抓取运动仍会对每个 `8` 度关节航点执行完整安全检查。用户中断、
+客户端断开或启动/执行异常时，程序不会主动急停或失能，而是用实时关节反馈
+覆盖运动目标并保持当前位置，然后断开软件连接。若控制器自身已进入实体急停、
+碰撞或抱闸故障，软件无法保证位置保持，也不会自动复位这类硬件故障。
 官方 GraspNet rotation matrix 的接近方向默认按局部 X 轴解释；初次联调必须
 用已知的竖直抓取检查 `--approach-axis/--approach-axis-sign`，并标定
 `--tcp-rot-*-deg`、`--tcp-offset-*-mm` 和 `--fk-tool-z-offset-mm`。轴系或 TCP
@@ -30,13 +36,13 @@ python3 -m robot_control.linux.catch.catch_server_graspnet \
 安全阈值可按现场验证结果调整：
 
 ```text
---max-startup-joint-delta-deg J1 J2 J3 J4 J5 J6  启动到初始位的逐关节总变化
 --max-joint-delta-deg J1 J2 J3 J4 J5 J6          当前位到预抓取位的逐关节总变化
 --max-approach-joint-delta-deg J1 J2 J3 J4 J5 J6 预抓取到抓取位的逐关节总变化
 --max-joint-waypoint-step-deg 8                    相邻关节航点最大跨度
 --max-runtime-path-error-deg 5                     实际反馈偏离规划线段的容差
 --max-jacobian-condition 500                       奇异性条件数上限
 --joint-limit-margin-deg 5                         与绝对关节限位的最小余量
+--startup-command-duration-s 1                     初始位目标命令的重复发送时长
 --motion-timeout-s 8                               单个航点的到位超时
 ```
 
@@ -50,12 +56,11 @@ python3 -m robot_control.linux.catch.catch_server_graspnet \
   --execute \
   --speed 10 \
   --nominal-joints-deg 0 85.9437 -57.2958 0 28.6479 -71.6197 \
-  --max-startup-joint-delta-deg 60 60 60 60 60 60 \
   --max-joint-delta-deg 60 60 60 60 60 60
 ```
 
-如果实时反馈到这个初始位的任一关节跨度超过 60 度，上述命令会急停并退出，
-而不是自动放宽限制。只有确认现场路径安全后，才应单独调整启动限制。
+启动运动不会应用抓取阶段的 `--max-joint-delta-deg`、最低 TCP 高度、雅可比
+条件数或运行时轨迹限制；机械臂的绝对关节硬限位和到位超时仍然有效。
 
 如果现场要求抓取 TCP 不低于固定高度，但视觉候选存在已测量的系统性 Z 偏差，
 可用 `--grasp-z-offset-mm` 沿机器人基座 `+Z` 统一抬高候选，再由

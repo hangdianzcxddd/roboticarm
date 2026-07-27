@@ -122,14 +122,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--speed", type=int, default=20)
     parser.add_argument("--grasp-speed", type=int, default=12)
     parser.add_argument("--command-period-s", type=float, default=0.02)
+    parser.add_argument("--startup-command-duration-s", type=float, default=1.0)
     parser.add_argument("--motion-timeout-s", type=float, default=8.0)
     parser.add_argument("--joint-tolerance-deg", type=float, default=2.0)
-    parser.add_argument(
-        "--startup-path-deviation-confirm-samples",
-        type=int,
-        default=3,
-        help="consecutive fresh startup feedback samples required before path-deviation stop",
-    )
     parser.add_argument(
         "--max-runtime-path-error-deg",
         type=float,
@@ -250,14 +245,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="maximum total change per joint from the motion start, in degrees",
     )
     parser.add_argument(
-        "--max-startup-joint-delta-deg",
-        type=float,
-        nargs=6,
-        default=(60.0,) * JOINT_COUNT,
-        metavar=("J1", "J2", "J3", "J4", "J5", "J6"),
-        help="maximum change per joint from the live pose to the startup pose",
-    )
-    parser.add_argument(
         "--max-approach-joint-delta-deg",
         type=float,
         nargs=6,
@@ -309,8 +296,6 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--speed and --grasp-speed must be in [0, 100]")
     if args.max_candidates < 1 or args.ik_seed_count < 1:
         raise ValueError("--max-candidates and --ik-seed-count must be >= 1")
-    if args.startup_path_deviation_confirm_samples < 1:
-        raise ValueError("--startup-path-deviation-confirm-samples must be >= 1")
     positive = (
         "approach_distance_mm",
         "approach_sample_distance_mm",
@@ -327,6 +312,11 @@ def validate_args(args: argparse.Namespace) -> None:
     for name in positive:
         if not math.isfinite(float(getattr(args, name))) or getattr(args, name) <= 0:
             raise ValueError(f"--{name.replace('_', '-')} must be finite and > 0")
+    if (
+        not math.isfinite(float(args.startup_command_duration_s))
+        or args.startup_command_duration_s < 0
+    ):
+        raise ValueError("--startup-command-duration-s must be finite and >= 0")
     finite = (
         "tcp_rot_x_deg",
         "tcp_rot_y_deg",
@@ -356,7 +346,6 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--min-target-y-mm must be <= --max-target-y-mm")
     for option in (
         "max_joint_delta_deg",
-        "max_startup_joint_delta_deg",
         "max_approach_joint_delta_deg",
     ):
         if any(
@@ -1210,70 +1199,109 @@ def move_to_nominal_joints(
 ) -> tuple[float, ...]:
     target = tuple(math.radians(value) for value in args.nominal_joints_deg)
     controller.validate_joints(target)
-    current = read_live_joints(
-        controller,
-        stable_samples=3,
-        timeout_s=min(5.0, float(args.motion_timeout_s)),
-    )
-    path = interpolate_joint_path(
-        current, target, args.max_joint_waypoint_step_deg
-    )
-    validate_path_height(
-        path,
-        controller,
-        args,
-        label="startup",
-        check_joint_margin=False,
-    )
     print(
         "Moving to startup joints: "
         + " ".join(f"{value:.3f}" for value in args.nominal_joints_deg)
         + " deg",
         flush=True,
     )
-    execute_joint_path(
+    stamp = _joint_feedback_timestamp(controller.get_joint_state())
+    deadline = time.monotonic() + float(args.startup_command_duration_s)
+    send_count = 0
+    while send_count == 0 or time.monotonic() < deadline:
+        controller.move_joints(list(target), speed_percent=args.speed)
+        send_count += 1
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(max(0.01, float(args.command_period_s)))
+    print(f"Startup joint command sent {send_count} time(s)", flush=True)
+    wait_until_joints_reached(
         controller,
-        path,
+        target,
         args,
         label="startup",
-        speed=args.speed,
-        check_joint_margin=False,
-        path_deviation_confirm_samples=args.startup_path_deviation_confirm_samples,
+        initial_stamp=stamp,
     )
     print("Startup joint pose reached", flush=True)
     return target
 
 
-def emergency_stop_on_failure(
-    controller: PiperController, *, context: str
-) -> None:
+def hold_position_on_exit(
+    controller: PiperController,
+    args: argparse.Namespace,
+    *,
+    context: str,
+) -> bool:
+    """Replace any active motion target with the current joints before exit."""
     try:
-        controller.emergency_stop()
-        print(f"EMERGENCY STOP triggered after {context}", file=sys.stderr, flush=True)
-    except Exception as stop_exc:  # noqa: BLE001 - preserve the original failure
+        target = controller.hold_current_position(
+            speed_percent=args.speed,
+            command_duration_s=max(0.2, float(args.startup_command_duration_s)),
+            feedback_timeout_s=1.0,
+        )
+        enable_status = controller.get_enable_status()
+        joints_deg = " ".join(f"{math.degrees(value):.3f}" for value in target)
         print(
-            f"EMERGENCY STOP command failed after {context}: {stop_exc}",
+            f"Piper holding current joints after {context}: {joints_deg} deg "
+            f"(enabled={enable_status})",
             file=sys.stderr,
             flush=True,
         )
+        return True
+    except Exception as hold_exc:  # noqa: BLE001 - preserve the original failure
+        print(
+            f"Piper position hold failed after {context}: {hold_exc}. "
+            "No emergency-stop or disable command was sent.",
+            file=sys.stderr,
+            flush=True,
+        )
+        return False
 
 
 def connect_for_execution(controller: PiperController, args: argparse.Namespace) -> None:
-    """Release this program's latched stop before enabling motion commands."""
+    """Enter an enabled state without resetting an already healthy arm."""
     print("Connecting to Piper arm...", flush=True)
     controller.connect(enable=False)
-    if args.release_software_estop_on_startup:
+    arm_status = controller.wait_for_arm_status_code()
+    if arm_status == 0x01 and args.release_software_estop_on_startup:
         controller.resume_from_emergency_stop()
-        time.sleep(max(0.1, float(args.command_period_s)))
+        deadline = time.monotonic() + float(controller.config.connect_timeout_s)
+        while time.monotonic() < deadline:
+            if controller.wait_for_arm_status_code() == 0x00:
+                break
+            time.sleep(max(0.01, float(args.command_period_s)))
+        else:
+            raise TimeoutError("Piper software emergency stop release timed out")
         print("Piper software emergency stop released", flush=True)
-    controller.enable()
-    time.sleep(max(0.5, float(args.command_period_s)))
-    print("Piper arm enabled", flush=True)
+    elif arm_status == 0x01:
+        raise RuntimeError(
+            "Piper is in emergency stop; restart without "
+            "--no-release-software-estop-on-startup after checking the workspace"
+        )
+    elif arm_status != 0x00:
+        raise RuntimeError(f"Piper arm is not healthy: arm_status=0x{arm_status:02X}")
+    else:
+        print("Piper arm status normal; emergency-stop reset skipped", flush=True)
+    enable_status = controller.get_enable_status()
+    if all(enable_status):
+        print("Piper arm already enabled; enable command skipped", flush=True)
+    else:
+        controller.enable()
+        time.sleep(max(0.5, float(args.command_period_s)))
+        enable_status = controller.get_enable_status()
+    if not all(enable_status):
+        raise RuntimeError(f"Piper arm did not remain enabled: {enable_status}")
+    print(f"Piper arm enabled: {enable_status}", flush=True)
 
 
 def execute_plan(
-    controller: PiperController, plan: GraspPlan, args: argparse.Namespace
+    controller: PiperController,
+    plan: GraspPlan,
+    args: argparse.Namespace,
+    *,
+    timings: dict[str, float] | None = None,
 ) -> dict[str, int]:
+    stage_timings = timings if timings is not None else {}
     current = read_live_joints(controller)
     drift_deg = float(
         np.max(np.abs(np.degrees(np.asarray(current) - np.asarray(plan.start_joints_rad))))
@@ -1282,21 +1310,53 @@ def execute_plan(
         raise SafetyError(
             f"robot moved {drift_deg:.3f}deg after planning; refusing stale trajectory"
         )
+    print("Grasp stage: gripper_open started", flush=True)
+    started = time.monotonic()
     send_gripper(controller, args, "open")
-    counts = {
-        "transfer": execute_joint_path(
-            controller, plan.transfer_path, args, label="transfer", speed=args.speed
-        ),
-        "approach": execute_joint_path(
-            controller,
-            plan.approach_path,
-            args,
-            label="approach",
-            speed=args.grasp_speed,
-        ),
-    }
+    stage_timings["gripper_open_s"] = time.monotonic() - started
+    print(f"Grasp stage: gripper_open {stage_timings['gripper_open_s']:.3f}s", flush=True)
+
+    print(
+        f"Grasp stage: transfer started ({len(plan.transfer_path) - 1} waypoint(s), "
+        f"speed={args.speed}%)",
+        flush=True,
+    )
+    started = time.monotonic()
+    transfer_count = execute_joint_path(
+        controller, plan.transfer_path, args, label="transfer", speed=args.speed
+    )
+    stage_timings["transfer_s"] = time.monotonic() - started
+    print(f"Grasp stage: transfer {stage_timings['transfer_s']:.3f}s", flush=True)
+
+    print(
+        f"Grasp stage: approach started ({len(plan.approach_path) - 1} waypoint(s), "
+        f"speed={args.grasp_speed}%)",
+        flush=True,
+    )
+    started = time.monotonic()
+    approach_count = execute_joint_path(
+        controller,
+        plan.approach_path,
+        args,
+        label="approach",
+        speed=args.grasp_speed,
+    )
+    stage_timings["approach_s"] = time.monotonic() - started
+    print(f"Grasp stage: approach {stage_timings['approach_s']:.3f}s", flush=True)
+    counts = {"transfer": transfer_count, "approach": approach_count}
+
+    print("Grasp stage: gripper_close started", flush=True)
+    started = time.monotonic()
     send_gripper(controller, args, "close")
+    stage_timings["gripper_close_s"] = time.monotonic() - started
+    print(f"Grasp stage: gripper_close {stage_timings['gripper_close_s']:.3f}s", flush=True)
     retreat = tuple(reversed(plan.approach_path))
+    print(
+        f"Grasp stage: retreat started ({len(retreat) - 1} waypoint(s), "
+        f"speed={args.grasp_speed}%)",
+        flush=True,
+    )
+    started = time.monotonic()
     counts["retreat"] = execute_joint_path(
         controller,
         retreat,
@@ -1304,10 +1364,20 @@ def execute_plan(
         label="retreat",
         speed=args.grasp_speed,
     )
+    stage_timings["retreat_s"] = time.monotonic() - started
+    print(f"Grasp stage: retreat {stage_timings['retreat_s']:.3f}s", flush=True)
     return_path = tuple(reversed(plan.transfer_path))
+    print(
+        f"Grasp stage: return started ({len(return_path) - 1} waypoint(s), "
+        f"speed={args.speed}%)",
+        flush=True,
+    )
+    started = time.monotonic()
     counts["return"] = execute_joint_path(
         controller, return_path, args, label="return", speed=args.speed
     )
+    stage_timings["return_s"] = time.monotonic() - started
+    print(f"Grasp stage: return {stage_timings['return_s']:.3f}s", flush=True)
     return counts
 
 
@@ -1347,6 +1417,7 @@ def handle_message(
     validator: PiperController,
     controller: PiperController | None = None,
 ) -> dict[str, Any]:
+    request_started = time.monotonic()
     command = camera_point_from_message(message)
     if command.grasp_mode == "probe":
         raise ValueError("probe mode is not supported by catch_server_graspnet")
@@ -1359,9 +1430,12 @@ def handle_message(
     else:
         start_joints = read_live_joints(controller)
     validator.validate_joints(start_joints)
+    planning_started = time.monotonic()
     plan, failures = select_plan(
         command, camera_to_base, start_joints, controller or validator, args
     )
+    planning_time_s = time.monotonic() - planning_started
+    print(f"Grasp planning completed in {planning_time_s:.3f}s", flush=True)
     if args.debug_plan or not args.execute:
         print(
             "Selected GraspNet plan: "
@@ -1377,10 +1451,20 @@ def handle_message(
             flush=True,
         )
     counts: dict[str, int] = {}
+    execution_timings: dict[str, float] = {}
     if args.execute:
         if controller is None:
             raise RuntimeError("execute=True requires a connected PiperController")
-        counts = execute_plan(controller, plan, args)
+        counts = execute_plan(controller, plan, args, timings=execution_timings)
+    total_time_s = time.monotonic() - request_started
+    timing_text = " ".join(
+        f"{name}={value:.3f}s" for name, value in execution_timings.items()
+    )
+    print(
+        f"Grasp timing: planning={planning_time_s:.3f}s "
+        f"{timing_text} total={total_time_s:.3f}s",
+        flush=True,
+    )
     response = make_ack_message(
         command.command_id, pose_to_dict(plan.grasp_pose), executed=bool(args.execute)
     )
@@ -1393,13 +1477,15 @@ def handle_message(
             "rejected_variant_count": len(failures),
             "rejected_variants": list(failures) if args.debug_plan else [],
             "send_counts": counts,
+            "timing_s": {
+                "planning": planning_time_s,
+                **execution_timings,
+                "total": total_time_s,
+            },
             "safety": {
                 "minimum_grasp_z_mm": args.min_grasp_z_mm,
                 "minimum_trajectory_tcp_z_mm": args.min_trajectory_tcp_z_mm,
                 "joint_limit_margin_deg": args.joint_limit_margin_deg,
-                "maximum_startup_joint_delta_deg": list(
-                    args.max_startup_joint_delta_deg
-                ),
                 "maximum_joint_delta_deg": list(args.max_joint_delta_deg),
                 "maximum_approach_joint_delta_deg": list(
                     args.max_approach_joint_delta_deg
@@ -1444,8 +1530,13 @@ def serve(args: argparse.Namespace) -> None:
                 )
             move_to_nominal_joints(controller, args)
             maybe_prepare_gripper(controller, args)
+        except KeyboardInterrupt:
+            hold_position_on_exit(controller, args, context="startup interruption")
+            controller.disconnect()
+            print("GraspNet catch server interrupted", flush=True)
+            return
         except BaseException:
-            emergency_stop_on_failure(controller, context="startup failure")
+            hold_position_on_exit(controller, args, context="startup failure")
             controller.disconnect()
             raise
 
@@ -1480,14 +1571,18 @@ def serve(args: argparse.Namespace) -> None:
                             except Exception as exc:  # noqa: BLE001 - fail closed
                                 if controller is not None:
                                     raise RuntimeError(
-                                        f"command {command_id!r} failed; arm emergency-stopped"
+                                        f"command {command_id!r} failed; arm held at current position"
                                     ) from exc
                                 response = make_error_message(command_id, str(exc))
                                 print(f"Error: {exc}", flush=True)
                             send_json_line(conn, response)
+    except KeyboardInterrupt:
+        if controller is not None:
+            hold_position_on_exit(controller, args, context="user interruption")
+        print("GraspNet catch server interrupted", flush=True)
     except BaseException:
         if controller is not None:
-            emergency_stop_on_failure(controller, context="server shutdown")
+            hold_position_on_exit(controller, args, context="server failure")
         raise
     finally:
         if controller is not None:

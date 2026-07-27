@@ -95,10 +95,11 @@ def main() -> None:
             joints = [args.j1, args.j2, args.j3, args.j4, args.j5, args.j6]
             controller.validate_joints(joints)
             with controller:
-                controller.move_joints(
+                controller.move_joints_and_wait(
                     joints,
                     speed_percent=args.speed,
                 )
+            print("joint target reached")
         elif args.command == "joints-to-pose":
             joints = [args.j1, args.j2, args.j3, args.j4, args.j5, args.j6]
             controller.validate_joints(joints)

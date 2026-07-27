@@ -15,7 +15,7 @@ from robot_control.linux.catch.catch_server_graspnet import (
     approach_tilt_deg,
     build_parser,
     connect_for_execution,
-    emergency_stop_on_failure,
+    hold_position_on_exit,
     fk_tcp_pose,
     fk_tcp_transform,
     interpolate_joint_path,
@@ -24,7 +24,6 @@ from robot_control.linux.catch.catch_server_graspnet import (
     solve_ik,
     validate_args,
     validate_candidate_geometry,
-    validate_joint_change,
     validate_joint_deltas,
     validate_path_height,
     validate_runtime_joint_state,
@@ -90,7 +89,6 @@ class TestGraspNetCatchServer(unittest.TestCase):
         self.assertAlmostEqual(args.max_gripper_width_mm, 100.0)
         self.assertEqual(tuple(args.nominal_joints_deg), (0, 90, -90, 0, 30, 0))
         self.assertEqual(tuple(args.max_joint_delta_deg), (60,) * 6)
-        self.assertEqual(tuple(args.max_startup_joint_delta_deg), (60,) * 6)
         self.assertAlmostEqual(args.max_runtime_path_error_deg, 5.0)
         self.assertEqual(
             tuple(args.max_approach_joint_delta_deg),
@@ -99,9 +97,45 @@ class TestGraspNetCatchServer(unittest.TestCase):
         self.assertTrue(args.safe_gripper_stop_on_effort)
         self.assertEqual(args.collision_protection_level, 2)
         self.assertTrue(args.release_software_estop_on_startup)
-        self.assertEqual(args.startup_path_deviation_confirm_samples, 3)
+        self.assertAlmostEqual(args.startup_command_duration_s, 1.0)
 
     def test_execution_connection_releases_estop_before_enable(self):
+        args = build_parser().parse_args([])
+
+        class FakeController:
+            def __init__(self):
+                self.calls = []
+                self.config = SimpleNamespace(connect_timeout_s=1.0)
+                self.enable_checks = 0
+
+            def connect(self, *, enable):
+                self.calls.append(("connect", enable))
+
+            def resume_from_emergency_stop(self):
+                self.calls.append(("resume",))
+
+            def wait_for_arm_status_code(self):
+                self.calls.append(("status",))
+                return 0x01 if self.calls.count(("status",)) == 1 else 0x00
+
+            def enable(self):
+                self.calls.append(("enable",))
+
+            def get_enable_status(self):
+                self.enable_checks += 1
+                return ((False,) * 6) if self.enable_checks == 1 else ((True,) * 6)
+
+        controller = FakeController()
+        module = "robot_control.linux.catch.catch_server_graspnet"
+        with patch(f"{module}.time.sleep"):
+            connect_for_execution(controller, args)
+
+        self.assertEqual(
+            controller.calls,
+            [("connect", False), ("status",), ("resume",), ("status",), ("enable",)],
+        )
+
+    def test_execution_connection_skips_reset_when_arm_is_normal(self):
         args = build_parser().parse_args([])
 
         class FakeController:
@@ -114,39 +148,33 @@ class TestGraspNetCatchServer(unittest.TestCase):
             def resume_from_emergency_stop(self):
                 self.calls.append(("resume",))
 
-            def enable(self):
-                self.calls.append(("enable",))
-
-        controller = FakeController()
-        module = "robot_control.linux.catch.catch_server_graspnet"
-        with patch(f"{module}.time.sleep"):
-            connect_for_execution(controller, args)
-
-        self.assertEqual(
-            controller.calls,
-            [("connect", False), ("resume",), ("enable",)],
-        )
-
-    def test_execution_connection_can_skip_estop_release(self):
-        args = build_parser().parse_args(["--no-release-software-estop-on-startup"])
-
-        class FakeController:
-            def __init__(self):
-                self.calls = []
-
-            def connect(self, *, enable):
-                self.calls.append(("connect", enable))
-
-            def resume_from_emergency_stop(self):
-                self.calls.append(("resume",))
+            def wait_for_arm_status_code(self):
+                self.calls.append(("status",))
+                return 0x00
 
             def enable(self):
                 self.calls.append(("enable",))
+
+            def get_enable_status(self):
+                return (True,) * 6
 
         controller = FakeController()
         connect_for_execution(controller, args)
 
-        self.assertEqual(controller.calls, [("connect", False), ("enable",)])
+        self.assertEqual(
+            controller.calls,
+            [("connect", False), ("status",)],
+        )
+
+    def test_execution_connection_refuses_estop_when_release_is_disabled(self):
+        args = build_parser().parse_args(["--no-release-software-estop-on-startup"])
+        controller = SimpleNamespace(
+            connect=lambda **_kwargs: None,
+            wait_for_arm_status_code=lambda: 0x01,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "emergency stop"):
+            connect_for_execution(controller, args)
 
     def test_startup_move_converts_nominal_degrees_to_radians(self):
         args = build_parser().parse_args(
@@ -158,41 +186,39 @@ class TestGraspNetCatchServer(unittest.TestCase):
                 "0",
                 "30",
                 "0",
-                "--max-startup-joint-delta-deg",
-                "100",
-                "100",
-                "100",
-                "100",
-                "100",
-                "100",
             ]
         )
 
         class FakeController:
             def __init__(self):
                 self.validated = None
+                self.move = None
 
             def validate_joints(self, joints):
                 self.validated = tuple(joints)
 
+            def get_joint_state(self):
+                return SimpleNamespace(time_stamp=1.0)
+
+            def move_joints(self, joints, *, speed_percent):
+                self.move = (tuple(joints), speed_percent)
+
         controller = FakeController()
         module = "robot_control.linux.catch.catch_server_graspnet"
         with (
-            patch(f"{module}.read_live_joints", return_value=(0.0,) * 6),
             patch(f"{module}.validate_path_height") as validate_path,
-            patch(f"{module}.execute_joint_path") as execute_path,
+            patch(f"{module}.wait_until_joints_reached") as wait_until_reached,
+            patch(f"{module}.time.monotonic", side_effect=(0.0, 0.0, 1.0)),
         ):
             target = move_to_nominal_joints(controller, args)
 
         expected = (0.0, math.pi / 2, -math.pi / 2, 0.0, math.pi / 6, 0.0)
         np.testing.assert_allclose(target, expected)
         np.testing.assert_allclose(controller.validated, expected)
-        path = validate_path.call_args.args[0]
-        np.testing.assert_allclose(path[0], (0.0,) * 6)
-        np.testing.assert_allclose(path[-1], expected)
-        self.assertEqual(execute_path.call_args.kwargs["speed"], args.speed)
-        self.assertFalse(validate_path.call_args.kwargs["check_joint_margin"])
-        self.assertFalse(execute_path.call_args.kwargs["check_joint_margin"])
+        np.testing.assert_allclose(controller.move[0], expected)
+        self.assertEqual(controller.move[1], args.speed)
+        validate_path.assert_not_called()
+        self.assertIsNone(wait_until_reached.call_args.kwargs.get("segment_start"))
 
     def test_startup_move_does_not_apply_total_joint_change_limit(self):
         args = build_parser().parse_args(
@@ -204,21 +230,15 @@ class TestGraspNetCatchServer(unittest.TestCase):
                 "0",
                 "30",
                 "-90",
-                "--max-startup-joint-delta-deg",
-                "1",
-                "1",
-                "1",
-                "1",
-                "1",
-                "1",
             ]
         )
         controller = PiperController()
         module = "robot_control.linux.catch.catch_server_graspnet"
         with (
-            patch(f"{module}.read_live_joints", return_value=(0.0,) * 6),
-            patch(f"{module}.validate_path_height"),
-            patch(f"{module}.execute_joint_path"),
+            patch.object(controller, "get_joint_state", return_value=SimpleNamespace()),
+            patch.object(controller, "move_joints"),
+            patch(f"{module}.wait_until_joints_reached"),
+            patch(f"{module}.time.monotonic", side_effect=(0.0, 0.0, 1.0)),
         ):
             target = move_to_nominal_joints(controller, args)
 
@@ -242,17 +262,6 @@ class TestGraspNetCatchServer(unittest.TestCase):
             label="startup[1]",
             check_joint_margin=False,
         )
-
-    def test_startup_change_over_configured_limit_is_rejected(self):
-        args = build_parser().parse_args([])
-
-        with self.assertRaisesRegex(SafetyError, "startup.*J2=61.00deg>60.00deg"):
-            validate_joint_change(
-                np.zeros(6),
-                np.radians((0, 61, 0, 0, 0, 0)),
-                args.max_startup_joint_delta_deg,
-                label="startup",
-            )
 
     def test_startup_path_can_move_monotonically_away_from_joint_limit(self):
         args = build_parser().parse_args(
@@ -430,19 +439,49 @@ class TestGraspNetCatchServer(unittest.TestCase):
 
         self.assertEqual(validate_runtime.call_count, 2)
 
-    def test_failure_handler_sends_emergency_stop(self):
+    def test_exit_handler_holds_current_joints_without_emergency_stop(self):
         class FakeController:
             def __init__(self):
-                self.stop_count = 0
+                self.config = SimpleNamespace(connect_timeout_s=1.0)
+                self.hold_calls = []
+
+            def get_enable_status(self):
+                return (True,) * 6
+
+            def hold_current_position(self, **kwargs):
+                self.hold_calls.append(kwargs)
+                return tuple(math.radians(index) for index in range(1, 7))
 
             def emergency_stop(self):
-                self.stop_count += 1
+                raise AssertionError("exit handler must not emergency-stop")
 
         controller = FakeController()
+        args = build_parser().parse_args(
+            ["--startup-command-duration-s", "0", "--speed", "5"]
+        )
 
-        emergency_stop_on_failure(controller, context="test failure")
+        held = hold_position_on_exit(controller, args, context="test failure")
 
-        self.assertEqual(controller.stop_count, 1)
+        self.assertTrue(held)
+        self.assertEqual(controller.hold_calls[0]["speed_percent"], 5)
+
+    def test_exit_handler_never_resets_controller_fault(self):
+        controller = SimpleNamespace(
+            config=SimpleNamespace(connect_timeout_s=1.0),
+            hold_current_position=lambda **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("cannot hold position while joints are disabled")
+            ),
+            emergency_stop=lambda: self.fail("must not send emergency stop"),
+            resume_from_emergency_stop=lambda: self.fail("must not reset fault"),
+        )
+
+        held = hold_position_on_exit(
+            controller,
+            build_parser().parse_args([]),
+            context="collision",
+        )
+
+        self.assertFalse(held)
 
     def test_approach_tilt_is_measured_from_base_downward_axis(self):
         candidate = ResolvedCandidate(

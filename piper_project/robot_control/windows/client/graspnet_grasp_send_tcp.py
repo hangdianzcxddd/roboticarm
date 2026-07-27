@@ -235,6 +235,7 @@ class GraspNetTarget:
     grasp_candidates: tuple[GraspCandidate, ...]
     top_point: CameraPoint | None = None
     top_base_xyz_m: tuple[float, float, float] | None = None
+    inference_time_s: float = 0.0
 
     @property
     def detection(self) -> Detection:
@@ -874,11 +875,11 @@ def target_from_segment(
         intrinsics=intrinsics,
         camera_to_base=camera_to_base,
     )
+    inference_started = time.monotonic()
     predicted_candidates = (
-        ()
-        if backend is None
-        else backend.predict(points)[:max_candidates]
+        () if backend is None else backend.predict(points)[:max_candidates]
     )
+    inference_time_s = time.monotonic() - inference_started
     grasp_candidates = filter_candidates_near_point_cloud(
         tuple(predicted_candidates),
         points,
@@ -894,6 +895,7 @@ def target_from_segment(
         grasp_candidates=tuple(grasp_candidates),
         top_point=top_point,
         top_base_xyz_m=top_base_xyz_m,
+        inference_time_s=inference_time_s,
     )
 
 
@@ -1007,7 +1009,21 @@ class GraspNetGraspSender:
             return {"type": "dry_run", "payload": asdict(command)}
         if not self.host:
             raise ValueError("--host is required unless --dry-run is used")
-        return send_camera_point(self.host, self.port, command, self.timeout_s)
+        print(
+            f"Selected target GraspNet inference={target.inference_time_s:.3f}s; "
+            "sending request to robot server",
+            flush=True,
+        )
+        request_started = time.monotonic()
+        response = send_camera_point(self.host, self.port, command, self.timeout_s)
+        request_time_s = time.monotonic() - request_started
+        print(
+            "Grasp timing: "
+            f"inference={target.inference_time_s:.3f}s "
+            f"server_request={request_time_s:.3f}s",
+            flush=True,
+        )
+        return response
 
 
 def dynamic_candidate_from_target(

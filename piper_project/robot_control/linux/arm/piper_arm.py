@@ -30,6 +30,8 @@ class PiperSdkLike(Protocol):
 
     def EnablePiper(self) -> bool: ...
 
+    def GetArmEnableStatus(self) -> list[bool]: ...
+
     def DisablePiper(self) -> bool: ...
 
     def EmergencyStop(self, emergency_stop: int = 0) -> None: ...
@@ -176,13 +178,79 @@ class PiperController:
         self._connected = False
 
     def enable(self) -> None:
-        deadline = time.monotonic() + self.config.connect_timeout_s
+        start = time.monotonic()
+        deadline = start + self.config.connect_timeout_s
+        minimum_command_deadline = start + self.config.enable_command_duration_s
         while time.monotonic() < deadline:
-            if self.sdk.EnablePiper():
+            self.sdk.EnablePiper()
+            enabled = all(self.sdk.GetArmEnableStatus())
+            if enabled and time.monotonic() >= minimum_command_deadline:
                 self._enabled = True
                 return
             time.sleep(self.config.command_interval_s)
-        raise TimeoutError("Piper arm enable timed out")
+        raise TimeoutError(
+            f"Piper arm enable timed out: enable_status={self.sdk.GetArmEnableStatus()}"
+        )
+
+    def get_enable_status(self) -> tuple[bool, ...]:
+        return tuple(bool(value) for value in self.sdk.GetArmEnableStatus())
+
+    def hold_current_position(
+        self,
+        *,
+        speed_percent: int | None = None,
+        command_duration_s: float = 1.0,
+        feedback_timeout_s: float = 1.0,
+    ) -> tuple[float, ...]:
+        """Overwrite active motion with the live joints without changing power state."""
+        enable_status = self.get_enable_status()
+        if not all(enable_status):
+            raise RuntimeError(
+                f"cannot hold position while joints are disabled: {enable_status}"
+            )
+        deadline = time.monotonic() + feedback_timeout_s
+        target: list[float] | None = None
+        while time.monotonic() < deadline:
+            feedback = self.get_joint_state()
+            joints = self._joint_feedback_to_rad(feedback)
+            fresh = (
+                float(getattr(feedback, "time_stamp", 0.0)) > 0.0
+                or float(getattr(feedback, "Hz", 0.0)) > 0.0
+            )
+            if joints is not None and fresh:
+                target = joints
+                break
+            time.sleep(max(self.config.command_interval_s, 0.01))
+        if target is None:
+            raise RuntimeError("fresh joint feedback unavailable for position hold")
+
+        command_deadline = time.monotonic() + command_duration_s
+        send_count = 0
+        while send_count == 0 or time.monotonic() < command_deadline:
+            self.move_joints(target, speed_percent=speed_percent)
+            send_count += 1
+            if time.monotonic() >= command_deadline:
+                break
+            time.sleep(max(self.config.command_interval_s, 0.01))
+        if not all(self.get_enable_status()):
+            raise RuntimeError("joint drives became disabled during position hold")
+        return tuple(target)
+
+    def wait_for_arm_status_code(self, timeout_s: float | None = None) -> int:
+        timeout = self.config.connect_timeout_s if timeout_s is None else timeout_s
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            feedback = self.get_status()
+            fresh = (
+                float(getattr(feedback, "time_stamp", 0.0)) > 0.0
+                or float(getattr(feedback, "Hz", 0.0)) > 0.0
+            )
+            status = getattr(feedback, "arm_status", None)
+            code = getattr(status, "arm_status", None)
+            if fresh and code is not None:
+                return int(code)
+            time.sleep(self.config.command_interval_s)
+        raise TimeoutError("fresh Piper arm status feedback timed out")
 
     def disable(self) -> None:
         deadline = time.monotonic() + self.config.connect_timeout_s
@@ -223,11 +291,38 @@ class PiperController:
         if self.config.disable_park_settle_s > 0:
             time.sleep(self.config.disable_park_settle_s)
 
+    def move_joints_and_wait(
+        self,
+        joints_rad: tuple[float, ...] | list[float],
+        speed_percent: int | None = None,
+        timeout_s: float | None = None,
+        command_duration_s: float = 1.0,
+    ) -> None:
+        target = list(joints_rad)
+        self.validate_joints(target)
+        initial_feedback_stamp = self._read_joint_feedback_timestamp()
+        deadline = time.monotonic() + command_duration_s
+        send_count = 0
+        while send_count == 0 or time.monotonic() < deadline:
+            self.move_joints(target, speed_percent=speed_percent)
+            send_count += 1
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(max(self.config.command_interval_s, 0.01))
+        self._wait_until_joints_reached(
+            target,
+            self.config.disable_park_timeout_s if timeout_s is None else timeout_s,
+            initial_feedback_stamp,
+            context="joint motion",
+        )
+
     def _wait_until_joints_reached(
         self,
         target_joints_rad: list[float],
         timeout_s: float,
         initial_feedback_stamp: float | None = None,
+        *,
+        context: str = "parking before disable",
     ) -> None:
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
@@ -246,7 +341,7 @@ class PiperController:
             ):
                 return
             time.sleep(max(self.config.command_interval_s, 0.01))
-        raise TimeoutError("Piper arm parking before disable timed out")
+        raise TimeoutError(f"Piper arm {context} timed out")
 
     def _read_joint_feedback_rad(self) -> list[float] | None:
         joint_feedback = self.get_joint_state()
@@ -388,6 +483,13 @@ class PiperController:
         return self
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
-        if exc_type is not None and not issubclass(exc_type, SafetyError):
-            self.emergency_stop()
+        if exc_type is not None:
+            try:
+                self.hold_current_position()
+            except Exception as hold_exc:  # noqa: BLE001 - never replace original error
+                self._logger.error(
+                    "Position hold on controller exit failed: %s. "
+                    "No emergency-stop or disable command was sent.",
+                    hold_exc,
+                )
         self.disconnect()

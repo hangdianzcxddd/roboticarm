@@ -41,6 +41,24 @@ class TestArmCli(unittest.TestCase):
         ):
             self.assertFalse(hasattr(args, name))
 
+    @patch("robot_control.linux.arm.arm_cli.PiperController")
+    @patch(
+        "sys.argv",
+        ["arm_cli.py", "joints", "0", "0", "0", "0", "0", "0", "--speed", "10"],
+    )
+    def test_joint_motion_waits_until_target_is_reached(self, controller_type):
+        controller = controller_type.return_value
+        controller.__enter__.return_value = controller
+
+        with patch("builtins.print") as print_mock:
+            main()
+
+        controller.move_joints_and_wait.assert_called_once_with(
+            [0.0] * 6,
+            speed_percent=10,
+        )
+        print_mock.assert_called_with("joint target reached")
+
 
 if __name__ == "__main__":
     unittest.main()

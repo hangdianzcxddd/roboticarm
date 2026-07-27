@@ -37,6 +37,7 @@ class FakePiperSdk:
         self.calls: list[tuple[str, tuple[object, ...]]] = []
         self.joint_feedbacks: list[FakeJointFeedback] = []
         self.joint_feedback = FakeJointFeedback((0, 0, 0, 0, 0, 0))
+        self.enable_statuses: list[list[bool]] = []
 
     def ConnectPort(self, can_init=False, piper_init=True, start_thread=True):
         self.calls.append(("ConnectPort", (can_init, piper_init, start_thread)))
@@ -47,6 +48,11 @@ class FakePiperSdk:
     def EnablePiper(self):
         self.calls.append(("EnablePiper", ()))
         return True
+
+    def GetArmEnableStatus(self):
+        if self.enable_statuses:
+            return self.enable_statuses.pop(0)
+        return [True] * 6
 
     def DisablePiper(self):
         self.calls.append(("DisablePiper", ()))
@@ -146,7 +152,11 @@ class FakePiperSdk:
 
 def make_controller() -> tuple[PiperController, FakePiperSdk]:
     sdk = FakePiperSdk()
-    config = RobotConfig(command_interval_s=0, connect_timeout_s=0.1)
+    config = RobotConfig(
+        command_interval_s=0,
+        connect_timeout_s=0.1,
+        enable_command_duration_s=0,
+    )
     return PiperController(config=config, sdk=sdk), sdk
 
 
@@ -262,12 +272,60 @@ class TestMove(unittest.TestCase):
             ],
         )
 
+    def test_enable_ignores_stale_true_feedback_after_estop_release(self):
+        sdk = FakePiperSdk()
+        controller = PiperController(
+            config=RobotConfig(
+                command_interval_s=0.001,
+                connect_timeout_s=0.1,
+                enable_command_duration_s=0.002,
+            ),
+            sdk=sdk,
+        )
+        sdk.enable_statuses = [
+            [True] * 6,
+            [False] * 6,
+            [True] * 6,
+        ]
+
+        controller.enable()
+
+        enable_calls = [call for call in sdk.calls if call[0] == "EnablePiper"]
+        self.assertGreaterEqual(len(enable_calls), 3)
+        self.assertEqual(controller.get_enable_status(), (True,) * 6)
+
     def test_resume_from_emergency_stop_sends_release_code(self):
         controller, sdk = make_controller()
 
         controller.resume_from_emergency_stop()
 
         self.assertEqual(sdk.calls, [("EmergencyStop", (0x02,))])
+
+    def test_hold_current_position_does_not_change_power_state(self):
+        controller, sdk = make_controller()
+        sdk.joint_feedback = FakeJointFeedback(
+            (1000, 2000, -3000, 4000, 5000, -6000),
+            time_stamp=1.0,
+        )
+
+        target = controller.hold_current_position(command_duration_s=0)
+
+        self.assertEqual(
+            [call[0] for call in sdk.calls],
+            ["MotionCtrl_2", "JointCtrl"],
+        )
+        self.assertFalse(any(call[0] == "EmergencyStop" for call in sdk.calls))
+        self.assertAlmostEqual(math.degrees(target[0]), 1.0)
+
+    def test_hold_current_position_refuses_to_reenable_disabled_joints(self):
+        controller, sdk = make_controller()
+        sdk.enable_statuses = [[False] * 6]
+
+        with self.assertRaisesRegex(RuntimeError, "joints are disabled"):
+            controller.hold_current_position(command_duration_s=0)
+
+        self.assertFalse(any(call[0] == "EnablePiper" for call in sdk.calls))
+        self.assertFalse(any(call[0] == "EmergencyStop" for call in sdk.calls))
 
     def test_configure_sdk_limits_sends_configured_joint_limits(self):
         controller, sdk = make_controller()
