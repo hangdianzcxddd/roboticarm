@@ -21,7 +21,9 @@ from robot_control.linux.catch.catch_server_1_1 import (
     cartesian_only_robot_config,
     dynamic_preposition_pose,
     dynamic_timing_from_command,
+    execute_plan,
     execute_step,
+    j6_speed,
     object_grasp_orientation,
     pick_above_lift_z_mm,
     ready_pose_ik_seed,
@@ -35,6 +37,7 @@ from robot_control.linux.catch.catch_server_1_1 import (
     validate_runtime_joint_limits,
     validate_args,
     validate_target,
+    YoloCatchPlan,
 )
 from robot_control.linux.arm.safety import SafetyError
 from robot_control.shared.geometry import EndPose
@@ -59,6 +62,24 @@ def _target(yaw_deg: float = 20.0) -> YoloCatchTarget:
 
 
 class CartesianCatchServer11Test(unittest.TestCase):
+    def test_j6_speed_falls_back_to_speed_and_can_be_overridden(self) -> None:
+        args = _args(speed=47, j6_speed=None, grasp_yaw_speed=None)
+        self.assertEqual(j6_speed(args), 47)
+        args.j6_speed = 13
+        self.assertEqual(j6_speed(args), 13)
+
+    def test_grasp_yaw_direction_uses_clockwise_on_equal_angle_tie(self) -> None:
+        from robot_control.linux.catch.catch_server_1_1 import plan_grasp_yaw_delta
+
+        plan = plan_grasp_yaw_delta(
+            90.0,
+            0.0,
+            max_delta_deg=180.0,
+            min_j6_deg=-360.0,
+            max_j6_deg=360.0,
+        )
+        self.assertAlmostEqual(plan.delta_deg, -90.0)
+
     def test_wait_preposition_ignores_x_dependent_robot_timing(self) -> None:
         args = _args(
             dynamic_preposition=True,
@@ -206,21 +227,22 @@ class CartesianCatchServer11Test(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "pick-above-lift-z-gradient"):
             validate_args(_args(pick_above_lift_z_gradient=-0.1))
 
-    def test_only_grasp_uses_object_orientation_and_lift_restores_pregrasp(self) -> None:
+    def test_pick_above_keeps_prepared_orientation_until_runtime_j6_yaw(self) -> None:
         args = _args(grasp_yaw_by_object_short_edge=True)
         steps = build_out_steps(args, _target())
 
         prepared = (args.rx_deg, args.ry_deg, args.rz_deg)
-        object_orientation = object_grasp_orientation(args, _target())
-        for index in (0, 1, 3, 4, 5, 6):
+        for index in (0, 1, 2, 3, 4, 5, 6):
             pose = steps[index].pose
-            self.assertEqual((pose.rx_deg, pose.ry_deg, pose.rz_deg), prepared)
-        grasp_pose = steps[2].pose
-        self.assertEqual(
-            (grasp_pose.rx_deg, grasp_pose.ry_deg, grasp_pose.rz_deg),
-            object_orientation,
-        )
-        self.assertEqual(steps[3].pose, steps[1].pose)
+            self.assertAlmostEqual(pose.rx_deg, prepared[0])
+            self.assertAlmostEqual(pose.ry_deg, prepared[1])
+            self.assertAlmostEqual(pose.rz_deg, prepared[2])
+
+        # The object-aligned Cartesian orientation is still computed for the
+        # post-J6 descent, but is deliberately not used as the high pick-above
+        # IK target.
+        object_orientation = object_grasp_orientation(args, _target())
+        self.assertNotEqual(object_orientation, prepared)
 
     def test_every_planned_waypoint_is_cartesian_move_p(self) -> None:
         steps = build_out_steps(_args(), _target())
@@ -228,6 +250,42 @@ class CartesianCatchServer11Test(unittest.TestCase):
         self.assertTrue(all(not step.planar_ik for step in steps))
         self.assertTrue(all(not step.joint_pitch_before_pose for step in steps))
         self.assertTrue(all(not step.joint_pitch_after_pose for step in steps))
+
+    def test_execute_plan_rotates_after_pick_above_and_reuses_feedback_orientation(self) -> None:
+        args = _args(grasp_yaw_by_object_short_edge=True, print_feedback=False)
+        target = _target()
+        plan = YoloCatchPlan("out", target, build_out_steps(args, target))
+        post_yaw = EndPose(345.0, -25.0, 160.0, -170.0, 2.0, -30.0)
+        calls: list[tuple[str, EndPose]] = []
+
+        def fake_execute_step(controller, args, step, **kwargs):
+            calls.append((step.label, step.pose))
+            return 1, None
+
+        controller = object()
+        with (
+            mock.patch(
+                "robot_control.linux.catch.catch_server_1_1.execute_step",
+                side_effect=fake_execute_step,
+            ),
+            mock.patch(
+                "robot_control.linux.catch.catch_server_1_1.apply_grasp_yaw_and_get_orientation",
+                return_value=post_yaw,
+            ) as apply_yaw,
+            mock.patch("builtins.print"),
+        ):
+            result = execute_plan(controller, args, plan)
+
+        self.assertEqual(
+            [label for label, _pose in calls],
+            [step.label for step in plan.steps],
+        )
+        self.assertEqual(apply_yaw.call_count, 1)
+        self.assertEqual(apply_yaw.call_args.kwargs["phase"], "after pick_above")
+        self.assertEqual(calls[1][1].rz_deg, args.rz_deg)  # Cartesian target stays prepared
+        self.assertEqual(calls[2][1].rz_deg, post_yaw.rz_deg)
+        self.assertEqual(calls[3][1].rz_deg, args.rz_deg)  # outbound lift restores prepared
+        self.assertEqual(result.grasp_yaw_adjustments, ())
 
     def test_only_j6_uses_a_software_angle_limit(self) -> None:
         config = cartesian_only_robot_config("can0")

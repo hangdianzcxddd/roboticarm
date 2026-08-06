@@ -13,9 +13,11 @@ ready/open -> selected target above -> selected target grasp/close -> lift
 -> return ready/open.
 
 Home, pregrasp, place and back-home keep the configured prepared orientation.
-The grasp uses a complete Cartesian orientation aligned to the object's
-reported short edge. For an outbound catch, pick_lift rotates the gripper back
-to the pregrasp orientation while ascending. Every waypoint is sent through
+The arm first reaches ``pick_above`` with that prepared Cartesian orientation,
+then performs the object-short-edge correction as an independent J6 move at
+that safe height. The resulting feedback orientation is inherited by the
+descent (and by the inbound lift); outbound ``pick_lift`` returns to the
+prepared orientation while ascending. Every Cartesian waypoint is sent through
 Piper Cartesian MOVE P; no joint-space waypoint is used. A YOLO bbox by itself
 is not enough for 3D grasping; the Windows side should send the bbox-selected
 point after RealSense depth deprojection as ``x_m/y_m/z_m``.
@@ -372,6 +374,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--speed", type=int, default=40)
     parser.add_argument(
+        "--j6-speed",
+        type=int,
+        default=None,
+        help=(
+            "speed percent for J6-only grasp-yaw JointCtrl moves; when omitted, "
+            "J6 uses --speed"
+        ),
+    )
+    parser.add_argument(
         "--startup-speed",
         type=int,
         default=10,
@@ -624,8 +635,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--grasp-yaw-speed",
         type=int,
-        default=20,
-        help="speed percent for object-short-edge J6 yaw alignment",
+        default=None,
+        help=(
+            "legacy alias for --j6-speed; when neither option is supplied, "
+            "J6 uses --speed"
+        ),
     )
     parser.add_argument(
         "--force-pick-x-mm",
@@ -988,6 +1002,12 @@ def validate_args(args: argparse.Namespace) -> None:
     normalize_dynamic_pitch_args(args)
     if not isinstance(args.speed, int) or not 0 <= args.speed <= 100:
         raise ValueError("--speed must be an integer in [0, 100]")
+    for name in ("j6_speed", "grasp_yaw_speed"):
+        value = getattr(args, name, None)
+        if value is not None and (
+            not isinstance(value, int) or not 0 <= value <= 100
+        ):
+            raise ValueError(f"--{name.replace('_', '-')} must be an integer in [0, 100]")
     if not isinstance(args.startup_speed, int) or not 0 <= args.startup_speed <= 100:
         raise ValueError("--startup-speed must be an integer in [0, 100]")
     if args.planar_ik_speed is not None and (
@@ -1062,11 +1082,6 @@ def validate_args(args: argparse.Namespace) -> None:
         or not 0 <= args.dynamic_pitch_speed <= 100
     ):
         raise ValueError("--dynamic-pitch-speed must be an integer in [0, 100]")
-    if (
-        not isinstance(args.grasp_yaw_speed, int)
-        or not 0 <= args.grasp_yaw_speed <= 100
-    ):
-        raise ValueError("--grasp-yaw-speed must be an integer in [0, 100]")
     for name in (
         "dynamic_preposition_clearance_mm",
         "pick_above_lift_z_gradient",
@@ -1729,13 +1744,12 @@ def build_out_steps(
 ) -> tuple[SequenceStep, ...]:
     ready = ready_pose(args)
     pick_above = target_pose(args, target, pick_above_lift_z_mm(args, target))
-    # Home/pregrasp/lift/place/return retain the prepared orientation. The
-    # grasp alone uses the complete object orientation; pick_lift reuses the
-    # exact pregrasp pose so the gripper rotates back while ascending.
-    pick_grasp = grasp_oriented_pose(
-        args, target, target_pose(args, target, target.grasp_z_mm)
-    )
-    pick_lift = pick_above
+    # The object yaw is applied after this waypoint is reached (see
+    # ``execute_plan``). Keep all planned Cartesian orientations on the
+    # prepared branch so the software pre-check does not ask IK to solve an
+    # orientation that is only reachable after a J6-only rotation.
+    pick_grasp = target_pose(args, target, target.grasp_z_mm)
+    pick_lift = target_pose(args, target, pick_above_lift_z_mm(args, target))
     place_above = fixed_pose(args, args.place_x_mm, args.place_y_mm, args.transfer_z_mm)
     # 1_1 is Cartesian-only.  The legacy joint-pitch/planar-IK branches are
     # intentionally disabled so no JointCtrl command can be emitted.
@@ -1794,10 +1808,11 @@ def build_in_steps(
 
     ready = ready_pose(args)
     pick_above = target_pose(args, target, pick_above_lift_z_mm(args, target))
-    pick_grasp = grasp_oriented_pose(
-        args, target, target_pose(args, target, target.grasp_z_mm)
-    )
-    pick_lift = grasp_oriented_pose(args, target, pick_above)
+    # As with the outbound sequence, rotate J6 only after reaching the safe
+    # above waypoint. Runtime execution replaces the descent/lift orientation
+    # with the post-rotation feedback pose.
+    pick_grasp = target_pose(args, target, target.grasp_z_mm)
+    pick_lift = target_pose(args, target, pick_above_lift_z_mm(args, target))
     return (
         SequenceStep("ready_open", ready, "P", "open"),
         SequenceStep(
@@ -2926,6 +2941,7 @@ def print_plan(
         f"steps={','.join(sorted(MULTI_START_CARTESIAN_IK_STEP_LABELS))}",
         flush=True,
     )
+    print(f"  speed: sequence={int(args.speed)}% j6={j6_speed(args)}%", flush=True)
     print(
         "  camera: "
         f"u={command.u} v={command.v} "
@@ -3568,6 +3584,20 @@ def execute_joints_for_duration(
     return send_count
 
 
+def j6_speed(args: argparse.Namespace) -> int:
+    """Return the effective speed for a J6-only rotation.
+
+    ``--j6-speed`` is the explicit option.  ``--grasp-yaw-speed`` remains
+    accepted as a compatibility alias for callers using the older name.  If
+    neither is provided, J6 follows the normal sequence ``--speed``.
+    """
+
+    value = getattr(args, "j6_speed", None)
+    if value is None:
+        value = getattr(args, "grasp_yaw_speed", None)
+    return int(args.speed if value is None else value)
+
+
 def planar_ik_speed(args: argparse.Namespace) -> int:
     value = getattr(args, "planar_ik_speed", None)
     return int(args.speed if value is None else value)
@@ -4181,6 +4211,17 @@ def plan_grasp_yaw_delta(
     min_j6_deg: float,
     max_j6_deg: float,
 ) -> GraspYawPlan:
+    """Choose the shortest reachable rotation for the gripper's axis.
+
+    The closing axis is unoriented, so both ``target`` and ``target + 180°``
+    describe the same grasp.  Each equivalent target is evaluated in its
+    shortest signed direction (positive is counter-clockwise, negative is
+    clockwise), then the candidate with the smallest resulting axis error is
+    selected.  If both directions are equally good, clockwise is selected
+    deterministically (the requested policy is "counter-clockwise only when
+    it is strictly shorter; otherwise clockwise").
+    """
+
     candidates: list[GraspYawPlan] = []
     target_axis_deg = normalize_degrees(target_deg)
     for equivalent_target_deg in (
@@ -4222,6 +4263,9 @@ def plan_grasp_yaw_delta(
             candidate.axis_error_deg,
             candidate.limit_clamped,
             abs(candidate.delta_deg),
+            # On an exact tie prefer clockwise (negative delta).  This also
+            # makes the 90°/90° axis case follow the documented policy.
+            candidate.delta_deg >= 0.0,
         ),
     )
 
@@ -4317,7 +4361,7 @@ def compute_grasp_yaw_adjustment_result(
         send_count = execute_joints_for_duration(
             controller,
             target_joints,
-            int(args.grasp_yaw_speed),
+            j6_speed(args),
             float(args.command_duration_s),
             float(args.command_period_s),
         )
@@ -4527,12 +4571,19 @@ def execute_plan(
     planar_ik_results: list[PlanarIkExecutionResult] = []
     planar_ik_reuse_state = PlanarIkReuseState()
     post_yaw_orientation: EndPose | None = None
-    for index, step in enumerate(plan.steps):
+    for step in plan.steps:
         active_step = step
-        # Object orientation is resolved when the Cartesian plan is built.
-        # Do not insert a separate J6 move here: that would violate the
-        # Cartesian-only contract and would also rotate the pregrasp/home
-        # waypoints away from the prepared orientation.
+        if (
+            post_yaw_orientation is not None
+            and (
+                active_step.label in ("pick_grasp", "return_pick_grasp")
+                or (plan.task == "in" and active_step.label == "return_pick_lift")
+            )
+        ):
+            active_step = replace(
+                active_step,
+                pose=with_current_orientation(active_step.pose, post_yaw_orientation),
+            )
         send_count, gripper_result = execute_step(
             controller,
             args,
@@ -4545,6 +4596,26 @@ def execute_plan(
         counts[active_step.label] = send_count
         record_gripper_result(gripper_results, gripper_result)
 
+        # Reach the safe above waypoint with the prepared orientation first.
+        # Only then rotate J6 in place; the resulting feedback orientation is
+        # used for the vertical descent. This keeps the difficult high-Z
+        # Cartesian IK solve on the known prepared branch.
+        if active_step.label in ("pick_above", "return_pick_above"):
+            post_yaw_orientation = apply_grasp_yaw_and_get_orientation(
+                controller,
+                args,
+                plan.target,
+                grasp_yaw_adjustments,
+                phase="after pick_above",
+            )
+            if post_yaw_orientation is not None:
+                print(
+                    "Using post-yaw orientation for grasp descent: "
+                    f"orientation=({post_yaw_orientation.rx_deg:.3f}, "
+                    f"{post_yaw_orientation.ry_deg:.3f}, "
+                    f"{post_yaw_orientation.rz_deg:.3f})",
+                    flush=True,
+                )
     if args.print_feedback:
         time.sleep(0.1)
         after_pose = feedback_to_pose(controller.get_end_pose())
@@ -4625,9 +4696,32 @@ def execute_dynamic_preposition_plan(
         planar_ik_results,
         planar_ik_reuse_state,
     )
-    # The pregrasp remains in the prepared orientation. In the outbound plan,
-    # grasp carries the full object orientation and pick_lift returns to the
-    # pregrasp orientation; no J6-only pre-rotation is performed here.
+    # Rotate only after reaching pick_above. The dynamic preposition and grasp
+    # descent then inherit the actual post-J6 feedback orientation. This is
+    # intentionally one yaw operation per catch.
+    post_yaw_orientation = apply_grasp_yaw_and_get_orientation(
+        controller,
+        args,
+        plan.target,
+        grasp_yaw_adjustments,
+        phase="after pick_above",
+    )
+    if post_yaw_orientation is not None:
+        preposition_step = replace(
+            preposition_step,
+            pose=with_current_orientation(preposition_step.pose, post_yaw_orientation),
+        )
+        grasp_step = replace(
+            grasp_step,
+            pose=with_current_orientation(grasp_step.pose, post_yaw_orientation),
+        )
+        print(
+            "Using post-yaw orientation for dynamic descent: "
+            f"orientation=({post_yaw_orientation.rx_deg:.3f}, "
+            f"{post_yaw_orientation.ry_deg:.3f}, "
+            f"{post_yaw_orientation.rz_deg:.3f})",
+            flush=True,
+        )
     counts[preposition_step.label] = execute_and_record_step(
         controller,
         args,
@@ -4918,6 +5012,8 @@ def handle_message(
                 "pick_back_from_place": pick_from_place,
             },
             "gripper_enabled": not args.no_gripper,
+            "speed_percent": int(args.speed),
+            "j6_speed_percent": j6_speed(args),
             "grasp_effort_nm": grasp_effort_nm(args),
             "safe_gripper": {
                 "enabled": bool(args.safe_gripper_stop_on_effort),
@@ -5021,7 +5117,8 @@ def serve(args: argparse.Namespace) -> None:
             server.listen(1)
             print(
                 f"Listening on {args.host}:{args.port}, execute={args.execute}, "
-                f"speed={args.speed}, startup_speed={args.startup_speed}, "
+                f"speed={args.speed}, j6_speed={j6_speed(args)}, "
+                f"startup_speed={args.startup_speed}, "
                 f"fixed_orientation="
                 f"({args.rx_deg:.3f}, {args.ry_deg:.3f}, {args.rz_deg:.3f})",
                 flush=True,
