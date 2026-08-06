@@ -640,11 +640,15 @@ def build_linux_python_parts(profile: dict[str, Any]) -> list[Any]:
     add_option(parts, "--dynamic-wait-placement", linux.get("dynamic_wait_placement"))
     add_number_option(parts, "--pick-x-offset-mm", linux.get("pick_x_offset_mm"))
     add_number_option(parts, "--t-robot-s", linux.get("t_robot_s"))
-    add_flag(parts, linux.get("dynamic_t_robot_by_x"), "--dynamic-t-robot-by-x")
-    add_number_option(parts, "--dynamic-t-robot-reference-x-mm", linux.get("dynamic_t_robot_reference_x_mm"))
-    add_number_option(parts, "--dynamic-t-robot-s-per-mm", linux.get("dynamic_t_robot_s_per_mm"))
-    add_number_option(parts, "--dynamic-t-robot-planar-near-s-per-mm", linux.get("dynamic_t_robot_planar_near_s_per_mm"))
-    add_number_option(parts, "--dynamic-t-robot-planar-far-s-per-mm", linux.get("dynamic_t_robot_planar_far_s_per_mm"))
+    # A preposition+wait catch is already at the target-side waiting pose and
+    # schedules only the final descent/close from --final-action-time-s. Raw-X
+    # timing slopes are needed only when nowait schedules departure from ready.
+    if linux.get("dynamic_wait_placement") == "nowait":
+        add_flag(parts, linux.get("dynamic_t_robot_by_x"), "--dynamic-t-robot-by-x")
+        add_number_option(parts, "--dynamic-t-robot-reference-x-mm", linux.get("dynamic_t_robot_reference_x_mm"))
+        add_number_option(parts, "--dynamic-t-robot-s-per-mm", linux.get("dynamic_t_robot_s_per_mm"))
+        add_number_option(parts, "--dynamic-t-robot-planar-near-s-per-mm", linux.get("dynamic_t_robot_planar_near_s_per_mm"))
+        add_number_option(parts, "--dynamic-t-robot-planar-far-s-per-mm", linux.get("dynamic_t_robot_planar_far_s_per_mm"))
     add_flag(parts, linux.get("grasp_yaw_by_object_short_edge"), "--grasp-yaw-by-object-short-edge")
     add_number_option(parts, "--gripper-close-axis-offset-deg", linux.get("gripper_close_axis_offset_deg"))
     add_number_option(parts, "--grasp-yaw-max-delta-deg", linux.get("grasp_yaw_max_delta_deg"))

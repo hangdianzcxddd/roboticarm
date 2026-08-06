@@ -75,6 +75,9 @@ class RobotConfig:
             PoseLimit(math.radians(-120.0), math.radians(120.0)),
         )
     )
+    joint_software_limit_enabled: tuple[bool, ...] = field(
+        default_factory=lambda: (True, True, True, True, True, True)
+    )
     joint_max_speeds_rad_s: tuple[float, ...] = field(
         default_factory=lambda: (
             math.radians(180.0),

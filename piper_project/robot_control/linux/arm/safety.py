@@ -61,11 +61,16 @@ class SafetyChecker:
     def validate_joints_rad(self, joints_rad: tuple[float, ...] | list[float]) -> None:
         if len(joints_rad) != 6:
             raise SafetyError(f"Motion rejected: expected 6 joint angles, got {len(joints_rad)}")
-        for index, (value, limit) in enumerate(
-            zip(joints_rad, self.config.joint_limits_rad), start=1
+        for index, (value, limit, limit_enabled) in enumerate(
+            zip(
+                joints_rad,
+                self.config.joint_limits_rad,
+                self.config.joint_software_limit_enabled,
+            ),
+            start=1,
         ):
             self._validate_finite(f"joint_{index}", value)
-            if not limit.contains(value):
+            if limit_enabled and not limit.contains(value):
                 raise SafetyError(
                     f"Motion rejected: joint_{index}={value} rad is outside the "
                     f"allowed range [{limit.min_value}, {limit.max_value}]"
