@@ -296,6 +296,10 @@ python3 -m robot_control.linux.catch.scripted_catch_demo \
 
 ## 常用调参
 
+- `catch_server_1_1.py --grasp-yaw-timing pick_above|pick_grasp`：选择视觉物体方向对应的
+  J6 旋转时机。默认 `pick_above` 在安全高度旋转后下降；`pick_grasp` 先下降到抓取高度，
+  再旋转并闭合夹爪。该参数需要同时启用 `--grasp-yaw-by-object-short-edge`，且视觉消息
+  包含有效的 `object_short_axis_yaw_deg`。
 - `--hand-eye-result robot_control/linux/hand_eye/hand_eye_result.json`：使用手眼标定 `camera -> base` 变换。
 - `--tcp-offset-z-mm 145`：官方夹爪默认值，等于 `0.145 m`。
 - `--approach-height-mm 40`：先移动到目标 TCP 上方多少毫米。

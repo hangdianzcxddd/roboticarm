@@ -13,14 +13,13 @@ ready/open -> selected target above -> selected target grasp/close -> lift
 -> return ready/open.
 
 Home, pregrasp, place and back-home keep the configured prepared orientation.
-The arm first reaches ``pick_above`` with that prepared Cartesian orientation,
-then performs the object-short-edge correction as an independent J6 move at
-that safe height. The resulting feedback orientation is inherited by the
-descent (and by the inbound lift); outbound ``pick_lift`` returns to the
-prepared orientation while ascending. Every Cartesian waypoint is sent through
-Piper Cartesian MOVE P; no joint-space waypoint is used. A YOLO bbox by itself
-is not enough for 3D grasping; the Windows side should send the bbox-selected
-point after RealSense depth deprojection as ``x_m/y_m/z_m``.
+The object-short-edge correction can be performed either after reaching
+``pick_above`` (the default) or after descending to ``pick_grasp``. The
+resulting feedback orientation is inherited by the remaining grasp/lift steps
+where appropriate. Every Cartesian waypoint is sent through Piper Cartesian
+MOVE P; no joint-space waypoint is used. A YOLO bbox by itself is not enough
+for 3D grasping; the Windows side should send the bbox-selected point after
+RealSense depth deprojection as ``x_m/y_m/z_m``.
 """
 
 from __future__ import annotations
@@ -80,6 +79,8 @@ Action = Literal["open", "close", None]
 JointPitchMode = Literal["disabled", "keep_fixed", "adjust"]
 DynamicPitchControlMode = Literal["joint", "planar_ik"]
 GraspYawMode = Literal["integrated-planar-ik", "separate-j6"]
+GraspYawTiming = Literal["pick_above", "pick_grasp"]
+DEFAULT_GRASP_YAW_TIMING: GraspYawTiming = "pick_above"
 DEFAULT_KEEP_PITCH_MIN_X_MM = 300.0
 DEFAULT_KEEP_PITCH_MAX_X_MM = 380.0
 DEFAULT_PITCH_DEG_PER_MM_FAR = 0.04
@@ -170,6 +171,12 @@ class YoloCatchTarget:
     planar_ik_grasp_z_comp_mm: float = 0.0
     planar_ik_grasp_z_comp_pitch_delta_deg: float = 0.0
     vision_source: Literal["opencv"] = "opencv"
+    pick_x_perspective_reference_mm: float | None = None
+    pick_x_perspective_camera_z_mm: float | None = None
+    pick_x_perspective_source_z_mm: float | None = None
+    pick_x_perspective_target_z_mm: float | None = None
+    pick_x_perspective_scale: float | None = None
+    pick_x_perspective_compensation_mm: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -633,6 +640,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="skip J6 yaw correction when the required delta is within this band",
     )
     parser.add_argument(
+        "--grasp-yaw-timing",
+        "--gripper-rotation-timing",
+        dest="grasp_yaw_timing",
+        choices=("pick_above", "pick_grasp"),
+        default=DEFAULT_GRASP_YAW_TIMING,
+        help=(
+            "when to apply the object-short-edge J6 rotation: pick_above "
+            "rotates at the safe height before descent (default), while "
+            "pick_grasp descends with the prepared orientation, rotates at "
+            "the grasp height, then closes the gripper"
+        ),
+    )
+    parser.add_argument(
         "--grasp-yaw-speed",
         type=int,
         default=None,
@@ -650,12 +670,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--pick-x-perspective-reference-mm",
+        "--pick-x-reference-mm",
         "--pick-x-offset-mm",
         type=float,
-        default=0.0,
         help=(
-            "Cartesian X offset applied to the final pick coordinate; raw X is "
-            "still retained for dynamic timing diagnostics"
+            "enable perspective X compensation using this base-frame X as the "
+            "zero-error reference (for example 300). The old "
+            "--pick-x-offset-mm spelling is retained as an alias but now also "
+            "expects this reference X, not a fixed offset. The conveyor plane is "
+            "assumed to be base Z=0; camera Z comes from the hand-eye transform "
+            "and target Z comes from vision. The corrected X contracts toward "
+            "the reference as target height and distance from the reference grow"
         ),
     )
     parser.add_argument(
@@ -968,7 +994,21 @@ def build_parser() -> argparse.ArgumentParser:
             "the gripper at the current open command"
         ),
     )
-    parser.add_argument("--gripper-settle-s", type=float, default=0.6)
+    parser.add_argument(
+        "--grasp-settle-s",
+        type=float,
+        default=0.0,
+        help=(
+            "pause after closing the gripper at pick_grasp before starting the "
+            "lift; default 0 sends the lift immediately after the close command"
+        ),
+    )
+    parser.add_argument(
+        "--gripper-settle-s",
+        type=float,
+        default=0.6,
+        help="pause after opening the gripper; close uses --grasp-settle-s",
+    )
     parser.add_argument("--clear-gripper-error", action="store_true")
     parser.add_argument("--no-pre-open", action="store_true")
     parser.add_argument("--no-gripper", action="store_true")
@@ -1000,6 +1040,7 @@ def normalize_dynamic_pitch_args(args: argparse.Namespace) -> None:
 
 def validate_args(args: argparse.Namespace) -> None:
     normalize_dynamic_pitch_args(args)
+    grasp_yaw_timing_value(args)
     if not isinstance(args.speed, int) or not 0 <= args.speed <= 100:
         raise ValueError("--speed must be an integer in [0, 100]")
     for name in ("j6_speed", "grasp_yaw_speed"):
@@ -1025,6 +1066,7 @@ def validate_args(args: argparse.Namespace) -> None:
         "pick_delay_s",
         "place_pick_delay_s",
         "safe_gripper_monitor_s",
+        "grasp_settle_s",
         "gripper_settle_s",
         "planar_ik_position_tolerance_mm",
         "planar_ik_rx_tolerance_deg",
@@ -1127,7 +1169,7 @@ def validate_args(args: argparse.Namespace) -> None:
         "grasp_yaw_max_delta_deg",
         "grasp_yaw_deadband_deg",
         "force_pick_x_mm",
-        "pick_x_offset_mm",
+        "pick_x_perspective_reference_mm",
         "force_pick_y_mm",
         "dynamic_t_robot_reference_x_mm",
         "dynamic_t_robot_s_per_mm",
@@ -1448,6 +1490,27 @@ def use_planar_ik_yaw(args: argparse.Namespace) -> bool:
     )
 
 
+def grasp_yaw_timing_value(args: argparse.Namespace) -> GraspYawTiming:
+    """Return the configured phase for the object-short-edge J6 rotation."""
+
+    value = getattr(args, "grasp_yaw_timing", DEFAULT_GRASP_YAW_TIMING)
+    if value not in ("pick_above", "pick_grasp"):
+        raise ValueError(
+            "--grasp-yaw-timing must be either 'pick_above' or 'pick_grasp'"
+        )
+    return value  # type: ignore[return-value]
+
+
+def should_apply_grasp_yaw_after_step(
+    args: argparse.Namespace,
+    step_label: str,
+) -> bool:
+    timing = grasp_yaw_timing_value(args)
+    if timing == "pick_above":
+        return step_label in ("pick_above", "return_pick_above")
+    return step_label in ("pick_grasp", "return_pick_grasp")
+
+
 def dynamic_pitch_summary(
     args: argparse.Namespace,
     target: YoloCatchTarget,
@@ -1604,6 +1667,69 @@ def dynamic_t_robot_s_for_x(
     }
 
 
+def detected_target_z_mm_for_pick_x_perspective(
+    command: CameraPointCommand,
+    base_xyz_m: tuple[float, float, float],
+) -> float:
+    """Return the best available measured source height for X parallax."""
+
+    for value in (
+        command.detected_top_z_mm,
+        command.detected_z_mm,
+        float(base_xyz_m[2]) * 1000.0,
+    ):
+        if value is not None and math.isfinite(float(value)):
+            return float(value)
+    raise ValueError("perspective X compensation requires a finite detected source Z")
+
+
+def compensate_pick_x_perspective_mm(
+    raw_x_mm: float,
+    *,
+    reference_x_mm: float,
+    camera_z_mm: float,
+    source_z_mm: float,
+    target_z_mm: float,
+) -> tuple[float, float, float]:
+    """Map X between two heights using the similar-triangle relation.
+
+    ``raw_x_mm`` is the mapped detection position at ``source_z_mm`` and
+    ``target_z_mm`` is the final pick-plane height.  The position relative to
+    ``reference_x_mm`` scales by
+    ``(camera_z-target_z)/(camera_z-source_z)``.  This is the same similar-
+    triangle relation that makes a shadow stretch with distance from a light;
+    depending on the two heights it may expand or contract. The reference
+    itself always has zero compensation.
+    """
+
+    values = {
+        "raw_x_mm": raw_x_mm,
+        "reference_x_mm": reference_x_mm,
+        "camera_z_mm": camera_z_mm,
+        "source_z_mm": source_z_mm,
+        "target_z_mm": target_z_mm,
+    }
+    for label, value in values.items():
+        if not math.isfinite(float(value)):
+            raise ValueError(f"perspective X compensation {label} must be finite")
+
+    source_camera_distance_mm = float(camera_z_mm) - float(source_z_mm)
+    target_camera_distance_mm = float(camera_z_mm) - float(target_z_mm)
+    if source_camera_distance_mm <= 0.0 or target_camera_distance_mm <= 0.0:
+        raise ValueError(
+            "perspective X compensation requires source and target Z below camera Z: "
+            f"source={source_z_mm:.3f}mm target={target_z_mm:.3f}mm "
+            f"camera={camera_z_mm:.3f}mm"
+        )
+
+    scale = target_camera_distance_mm / source_camera_distance_mm
+    corrected_x_mm = float(reference_x_mm) + scale * (
+        float(raw_x_mm) - float(reference_x_mm)
+    )
+    compensation_mm = corrected_x_mm - float(raw_x_mm)
+    return corrected_x_mm, compensation_mm, scale
+
+
 def target_from_command(
     command: CameraPointCommand,
     camera_to_base: Any,
@@ -1634,10 +1760,16 @@ def target_from_command(
     if args.force_pick_x_mm is not None:
         pick_x_mm = float(args.force_pick_x_mm)
         pick_x_source = "forced_pick_x"
-    pick_x_offset_mm = float(getattr(args, "pick_x_offset_mm", 0.0))
-    if not math.isclose(pick_x_offset_mm, 0.0, rel_tol=0.0, abs_tol=1e-9):
-        pick_x_mm = float(pick_x_mm) + pick_x_offset_mm
-        pick_x_source = f"{pick_x_source}_cartesian_offset"
+    perspective_reference_x_mm = getattr(
+        args,
+        "pick_x_perspective_reference_mm",
+        None,
+    )
+    perspective_camera_z_mm: float | None = None
+    perspective_source_z_mm: float | None = None
+    perspective_target_z_mm: float | None = None
+    perspective_scale: float | None = None
+    perspective_compensation_mm = 0.0
     if args.force_pick_y_mm is not None:
         pick_y_mm = float(args.force_pick_y_mm)
         pick_y_source = "forced_pick_y"
@@ -1670,6 +1802,7 @@ def target_from_command(
             grasp_z_source = f"{grasp_z_source}_clamped_to_fixed_grasp_z"
     else:
         grasp_z_mm = args.grasp_z_mm
+
     uncompensated_grasp_z_mm = float(grasp_z_mm)
     grasp_z_comp_mm, grasp_z_comp_pitch_delta_deg = planar_ik_grasp_z_compensation(
         args,
@@ -1678,6 +1811,27 @@ def target_from_command(
     if grasp_z_comp_mm > 0.0:
         grasp_z_mm = float(grasp_z_mm) - grasp_z_comp_mm
         grasp_z_source = f"{grasp_z_source}_planar_ik_pitch_z_comp"
+
+    if perspective_reference_x_mm is not None:
+        perspective_reference_x_mm = float(perspective_reference_x_mm)
+        perspective_camera_z_mm = float(camera_to_base[2, 3]) * 1000.0
+        perspective_source_z_mm = detected_target_z_mm_for_pick_x_perspective(
+            command,
+            base_xyz_m,
+        )
+        perspective_target_z_mm = float(grasp_z_mm)
+        (
+            pick_x_mm,
+            perspective_compensation_mm,
+            perspective_scale,
+        ) = compensate_pick_x_perspective_mm(
+            float(pick_x_mm),
+            reference_x_mm=perspective_reference_x_mm,
+            camera_z_mm=perspective_camera_z_mm,
+            source_z_mm=perspective_source_z_mm,
+            target_z_mm=perspective_target_z_mm,
+        )
+        pick_x_source = f"{pick_x_source}_perspective_compensated"
     target = YoloCatchTarget(
         camera_command=command,
         base_xyz_m=base_xyz_m,
@@ -1694,6 +1848,12 @@ def target_from_command(
         planar_ik_grasp_z_comp_mm=grasp_z_comp_mm,
         planar_ik_grasp_z_comp_pitch_delta_deg=grasp_z_comp_pitch_delta_deg,
         vision_source="opencv",
+        pick_x_perspective_reference_mm=perspective_reference_x_mm,
+        pick_x_perspective_camera_z_mm=perspective_camera_z_mm,
+        pick_x_perspective_source_z_mm=perspective_source_z_mm,
+        pick_x_perspective_target_z_mm=perspective_target_z_mm,
+        pick_x_perspective_scale=perspective_scale,
+        pick_x_perspective_compensation_mm=perspective_compensation_mm,
     )
     if validate:
         validate_target(target, args)
@@ -3007,6 +3167,22 @@ def print_plan(
             f"y_source={plan.target.pick_y_source}",
             flush=True,
         )
+    if plan.target.pick_x_perspective_reference_mm is not None:
+        print(
+            "  pick_x_perspective: "
+            f"reference={plan.target.pick_x_perspective_reference_mm:.3f}mm "
+            f"camera_z={plan.target.pick_x_perspective_camera_z_mm:.3f}mm "
+            f"source_z={plan.target.pick_x_perspective_source_z_mm:.3f}mm "
+            f"target_z={plan.target.pick_x_perspective_target_z_mm:.3f}mm "
+            f"scale={plan.target.pick_x_perspective_scale:.6f} "
+            f"compensation={plan.target.pick_x_perspective_compensation_mm:.3f}mm",
+            flush=True,
+        )
+    print(
+        "  grasp_yaw_timing: "
+        f"{grasp_yaw_timing_value(args)}",
+        flush=True,
+    )
     pitch = dynamic_pitch_summary(args, plan.target)
     if pitch["enabled"]:
         print(
@@ -3209,8 +3385,13 @@ def send_gripper(
     controller.set_gripper(command_mm, effort_nm, enable=True)
     if action == "close" and args.safe_gripper_stop_on_effort:
         return monitor_safe_gripper_effort(controller, args)
-    if args.gripper_settle_s > 0:
-        time.sleep(args.gripper_settle_s)
+    settle_s = (
+        float(getattr(args, "grasp_settle_s", 0.0))
+        if action == "close"
+        else float(args.gripper_settle_s)
+    )
+    if settle_s > 0:
+        time.sleep(settle_s)
     return SafeGripperResult(
         action=action,
         command_mm=float(command_mm),
@@ -4571,6 +4752,7 @@ def execute_plan(
     planar_ik_results: list[PlanarIkExecutionResult] = []
     planar_ik_reuse_state = PlanarIkReuseState()
     post_yaw_orientation: EndPose | None = None
+    yaw_timing = grasp_yaw_timing_value(args)
     for step in plan.steps:
         active_step = step
         if (
@@ -4584,10 +4766,23 @@ def execute_plan(
                 active_step,
                 pose=with_current_orientation(active_step.pose, post_yaw_orientation),
             )
+        rotate_at_grasp = (
+            yaw_timing == "pick_grasp"
+            and active_step.label in ("pick_grasp", "return_pick_grasp")
+        )
+        # A pick_grasp step normally closes immediately after the Cartesian
+        # descent.  When rotation is requested at that phase, defer the close
+        # until after the J6 move so the gripper rotates while still open at
+        # the grasp height.
+        step_for_execution = (
+            replace(active_step, gripper_after=None)
+            if rotate_at_grasp
+            else active_step
+        )
         send_count, gripper_result = execute_step(
             controller,
             args,
-            active_step,
+            step_for_execution,
             joint_pitch_adjustments=joint_pitch_adjustments,
             grasp_yaw_adjustments=grasp_yaw_adjustments,
             planar_ik_results=planar_ik_results,
@@ -4596,26 +4791,28 @@ def execute_plan(
         counts[active_step.label] = send_count
         record_gripper_result(gripper_results, gripper_result)
 
-        # Reach the safe above waypoint with the prepared orientation first.
-        # Only then rotate J6 in place; the resulting feedback orientation is
-        # used for the vertical descent. This keeps the difficult high-Z
-        # Cartesian IK solve on the known prepared branch.
-        if active_step.label in ("pick_above", "return_pick_above"):
+        # Apply the object yaw at the configured phase.  At pick_above the
+        # result is inherited by the descent; at pick_grasp it is applied after
+        # the descent and before the close command.
+        if should_apply_grasp_yaw_after_step(args, active_step.label):
             post_yaw_orientation = apply_grasp_yaw_and_get_orientation(
                 controller,
                 args,
                 plan.target,
                 grasp_yaw_adjustments,
-                phase="after pick_above",
+                phase=f"after {active_step.label}",
             )
             if post_yaw_orientation is not None:
                 print(
-                    "Using post-yaw orientation for grasp descent: "
+                    "Using post-yaw orientation: "
                     f"orientation=({post_yaw_orientation.rx_deg:.3f}, "
                     f"{post_yaw_orientation.ry_deg:.3f}, "
                     f"{post_yaw_orientation.rz_deg:.3f})",
                     flush=True,
                 )
+        if rotate_at_grasp:
+            close_result = send_gripper(controller, args, active_step.gripper_after)
+            record_gripper_result(gripper_results, close_result)
     if args.print_feedback:
         time.sleep(0.1)
         after_pose = feedback_to_pose(controller.get_end_pose())
@@ -4652,6 +4849,7 @@ def execute_dynamic_preposition_plan(
     planar_ik_results: list[PlanarIkExecutionResult] = []
     planar_ik_reuse_state = PlanarIkReuseState()
     started_s = time.monotonic()
+    yaw_timing = grasp_yaw_timing_value(args)
     ready_step = plan.steps[0]
     pick_above_step = plan.steps[1]
     grasp_step = replace(plan.steps[2], delay_before_s=0.0)
@@ -4696,32 +4894,34 @@ def execute_dynamic_preposition_plan(
         planar_ik_results,
         planar_ik_reuse_state,
     )
-    # Rotate only after reaching pick_above. The dynamic preposition and grasp
-    # descent then inherit the actual post-J6 feedback orientation. This is
-    # intentionally one yaw operation per catch.
-    post_yaw_orientation = apply_grasp_yaw_and_get_orientation(
-        controller,
-        args,
-        plan.target,
-        grasp_yaw_adjustments,
-        phase="after pick_above",
-    )
-    if post_yaw_orientation is not None:
-        preposition_step = replace(
-            preposition_step,
-            pose=with_current_orientation(preposition_step.pose, post_yaw_orientation),
+    # With the default timing, rotate at the safe pick_above height and let
+    # the dynamic preposition/descent inherit the feedback orientation.  With
+    # pick_grasp timing, keep the prepared orientation through the descent and
+    # rotate only after reaching the grasp pose.
+    if yaw_timing == "pick_above":
+        post_yaw_orientation = apply_grasp_yaw_and_get_orientation(
+            controller,
+            args,
+            plan.target,
+            grasp_yaw_adjustments,
+            phase="after pick_above",
         )
-        grasp_step = replace(
-            grasp_step,
-            pose=with_current_orientation(grasp_step.pose, post_yaw_orientation),
-        )
-        print(
-            "Using post-yaw orientation for dynamic descent: "
-            f"orientation=({post_yaw_orientation.rx_deg:.3f}, "
-            f"{post_yaw_orientation.ry_deg:.3f}, "
-            f"{post_yaw_orientation.rz_deg:.3f})",
-            flush=True,
-        )
+        if post_yaw_orientation is not None:
+            preposition_step = replace(
+                preposition_step,
+                pose=with_current_orientation(preposition_step.pose, post_yaw_orientation),
+            )
+            grasp_step = replace(
+                grasp_step,
+                pose=with_current_orientation(grasp_step.pose, post_yaw_orientation),
+            )
+            print(
+                "Using post-yaw orientation for dynamic descent: "
+                f"orientation=({post_yaw_orientation.rx_deg:.3f}, "
+                f"{post_yaw_orientation.ry_deg:.3f}, "
+                f"{post_yaw_orientation.rz_deg:.3f})",
+                flush=True,
+            )
     counts[preposition_step.label] = execute_and_record_step(
         controller,
         args,
@@ -4740,10 +4940,16 @@ def execute_dynamic_preposition_plan(
     )
     final_action_late_s = max(0.0, preposition_elapsed_s - final_action_due_s)
 
+    rotate_at_grasp = yaw_timing == "pick_grasp"
+    grasp_step_for_execution = (
+        replace(grasp_step, gripper_after=None)
+        if rotate_at_grasp
+        else grasp_step
+    )
     send_count, gripper_result = execute_step(
         controller,
         args,
-        grasp_step,
+        grasp_step_for_execution,
         joint_pitch_adjustments=joint_pitch_adjustments,
         grasp_yaw_adjustments=grasp_yaw_adjustments,
         planar_ik_results=planar_ik_results,
@@ -4751,6 +4957,24 @@ def execute_dynamic_preposition_plan(
     )
     counts[grasp_step.label] = send_count
     record_gripper_result(gripper_results, gripper_result)
+    if rotate_at_grasp:
+        post_yaw_orientation = apply_grasp_yaw_and_get_orientation(
+            controller,
+            args,
+            plan.target,
+            grasp_yaw_adjustments,
+            phase="after pick_grasp",
+        )
+        if post_yaw_orientation is not None:
+            print(
+                "Using post-yaw orientation after dynamic grasp: "
+                f"orientation=({post_yaw_orientation.rx_deg:.3f}, "
+                f"{post_yaw_orientation.ry_deg:.3f}, "
+                f"{post_yaw_orientation.rz_deg:.3f})",
+                flush=True,
+            )
+        close_result = send_gripper(controller, args, grasp_step.gripper_after)
+        record_gripper_result(gripper_results, close_result)
 
     counts[lift_step.label] = execute_and_record_step(
         controller,
@@ -4940,6 +5164,22 @@ def handle_message(
             "raw_pick_y_mm": target.raw_pick_y_mm,
             "pick_x_source": target.pick_x_source,
             "pick_y_source": target.pick_y_source,
+            "pick_x_perspective_reference_mm": (
+                target.pick_x_perspective_reference_mm
+            ),
+            "pick_x_perspective_camera_z_mm": (
+                target.pick_x_perspective_camera_z_mm
+            ),
+            "pick_x_perspective_source_z_mm": (
+                target.pick_x_perspective_source_z_mm
+            ),
+            "pick_x_perspective_target_z_mm": (
+                target.pick_x_perspective_target_z_mm
+            ),
+            "pick_x_perspective_scale": target.pick_x_perspective_scale,
+            "pick_x_perspective_compensation_mm": (
+                target.pick_x_perspective_compensation_mm
+            ),
             "grasp_z_mm": target.grasp_z_mm,
             "raw_grasp_z_mm": target.raw_grasp_z_mm,
             "grasp_z_source": target.grasp_z_source,
@@ -4990,6 +5230,7 @@ def handle_message(
                 "ry_deg": plan.steps[2].pose.ry_deg,
                 "rz_deg": plan.steps[2].pose.rz_deg,
             },
+            "grasp_yaw_timing": grasp_yaw_timing_value(args),
             "dynamic_pitch": dynamic_pitch_summary(args, target),
             "joint_pitch_adjustments": [
                 joint_pitch_adjustment_to_dict(result)

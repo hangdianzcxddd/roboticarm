@@ -19,6 +19,7 @@ from robot_control.linux.catch.catch_server_1_1 import (
     build_out_steps,
     build_parser,
     cartesian_only_robot_config,
+    compensate_pick_x_perspective_mm,
     dynamic_preposition_pose,
     dynamic_timing_from_command,
     execute_plan,
@@ -27,6 +28,7 @@ from robot_control.linux.catch.catch_server_1_1 import (
     object_grasp_orientation,
     pick_above_lift_z_mm,
     ready_pose_ik_seed,
+    send_gripper,
     target_from_command,
     validate_cartesian_joint_limits,
     validate_multistart_cartesian_joint_limits,
@@ -37,6 +39,7 @@ from robot_control.linux.catch.catch_server_1_1 import (
     validate_runtime_joint_limits,
     validate_args,
     validate_target,
+    grasp_yaw_timing_value,
     YoloCatchPlan,
 )
 from robot_control.linux.arm.safety import SafetyError
@@ -62,6 +65,35 @@ def _target(yaw_deg: float = 20.0) -> YoloCatchTarget:
 
 
 class CartesianCatchServer11Test(unittest.TestCase):
+    def test_grasp_close_has_no_default_wait_before_lift(self) -> None:
+        args = _args()
+        controller = mock.Mock()
+
+        with mock.patch(
+            "robot_control.linux.catch.catch_server_1_1.time.sleep"
+        ) as sleep:
+            result = send_gripper(controller, args, "close")
+
+        controller.set_gripper.assert_called_once_with(
+            args.grasp_command_mm,
+            args.effort_nm,
+            enable=True,
+        )
+        sleep.assert_not_called()
+        assert result is not None
+        self.assertEqual(result.action, "close")
+
+    def test_grasp_close_wait_can_be_configured_independently(self) -> None:
+        args = _args(grasp_settle_s=0.15, gripper_settle_s=0.6)
+        controller = mock.Mock()
+
+        with mock.patch(
+            "robot_control.linux.catch.catch_server_1_1.time.sleep"
+        ) as sleep:
+            send_gripper(controller, args, "close")
+
+        sleep.assert_called_once_with(0.15)
+
     def test_j6_speed_falls_back_to_speed_and_can_be_overridden(self) -> None:
         args = _args(speed=47, j6_speed=None, grasp_yaw_speed=None)
         self.assertEqual(j6_speed(args), 47)
@@ -286,6 +318,63 @@ class CartesianCatchServer11Test(unittest.TestCase):
         self.assertEqual(calls[2][1].rz_deg, post_yaw.rz_deg)
         self.assertEqual(calls[3][1].rz_deg, args.rz_deg)  # outbound lift restores prepared
         self.assertEqual(result.grasp_yaw_adjustments, ())
+
+    def test_execute_plan_can_rotate_after_pick_grasp_before_close(self) -> None:
+        args = _args(
+            grasp_yaw_by_object_short_edge=True,
+            grasp_yaw_timing="pick_grasp",
+            print_feedback=False,
+        )
+        target = _target()
+        plan = YoloCatchPlan("out", target, build_out_steps(args, target))
+        post_yaw = EndPose(345.0, -25.0, 160.0, -170.0, 2.0, -30.0)
+        calls: list[tuple[str, EndPose, object]] = []
+        gripper_calls: list[object] = []
+
+        def fake_execute_step(controller, args, step, **kwargs):
+            calls.append((step.label, step.pose, step.gripper_after))
+            return 1, None
+
+        def fake_send_gripper(controller, args, action):
+            gripper_calls.append(action)
+            return None
+
+        controller = object()
+        with (
+            mock.patch(
+                "robot_control.linux.catch.catch_server_1_1.execute_step",
+                side_effect=fake_execute_step,
+            ),
+            mock.patch(
+                "robot_control.linux.catch.catch_server_1_1.apply_grasp_yaw_and_get_orientation",
+                return_value=post_yaw,
+            ) as apply_yaw,
+            mock.patch(
+                "robot_control.linux.catch.catch_server_1_1.send_gripper",
+                side_effect=fake_send_gripper,
+            ),
+            mock.patch("builtins.print"),
+        ):
+            execute_plan(controller, args, plan)
+
+        self.assertEqual(apply_yaw.call_count, 1)
+        self.assertEqual(apply_yaw.call_args.kwargs["phase"], "after pick_grasp")
+        self.assertEqual(calls[1][1].rz_deg, args.rz_deg)
+        self.assertEqual(calls[2][1].rz_deg, args.rz_deg)
+        self.assertIsNone(calls[2][2])
+        # Outbound lift keeps the prepared orientation, matching the existing
+        # pick_above timing behavior; only the low grasp phase is rotated.
+        self.assertEqual(calls[3][1].rz_deg, args.rz_deg)
+        self.assertIn("close", gripper_calls)
+
+    def test_grasp_yaw_timing_parser_defaults_to_pick_above_and_accepts_pick_grasp(self) -> None:
+        self.assertEqual(grasp_yaw_timing_value(_args()), "pick_above")
+        self.assertEqual(
+            grasp_yaw_timing_value(
+                build_parser().parse_args(["--grasp-yaw-timing", "pick_grasp"])
+            ),
+            "pick_grasp",
+        )
 
     def test_only_j6_uses_a_software_angle_limit(self) -> None:
         config = cartesian_only_robot_config("can0")
@@ -559,17 +648,72 @@ class CartesianCatchServer11Test(unittest.TestCase):
     def test_dynamic_y_is_not_forced_by_default(self) -> None:
         self.assertIsNone(build_parser().parse_args([]).force_pick_y_mm)
 
-    def test_cartesian_pick_x_offset_is_applied_without_planar_ik(self) -> None:
-        args = _args(pick_x_offset_mm=-45.0)
-        command = CameraPointCommand(0.0, 0.0, 0.0)
+    def test_pick_x_perspective_compensation_contracts_toward_reference(self) -> None:
+        corrected, compensation, scale = compensate_pick_x_perspective_mm(
+            400.0,
+            reference_x_mm=300.0,
+            camera_z_mm=500.0,
+            source_z_mm=100.0,
+            target_z_mm=180.0,
+        )
+
+        self.assertAlmostEqual(corrected, 380.0)
+        self.assertAlmostEqual(compensation, -20.0)
+        self.assertAlmostEqual(scale, 0.8)
+
+        corrected, compensation, _ = compensate_pick_x_perspective_mm(
+            200.0,
+            reference_x_mm=300.0,
+            camera_z_mm=500.0,
+            source_z_mm=100.0,
+            target_z_mm=180.0,
+        )
+        self.assertAlmostEqual(corrected, 220.0)
+        self.assertAlmostEqual(compensation, 20.0)
+
+    def test_pick_x_perspective_reference_has_zero_compensation(self) -> None:
+        corrected, compensation, _ = compensate_pick_x_perspective_mm(
+            300.0,
+            reference_x_mm=300.0,
+            camera_z_mm=500.0,
+            source_z_mm=100.0,
+            target_z_mm=180.0,
+        )
+
+        self.assertAlmostEqual(corrected, 300.0)
+        self.assertAlmostEqual(compensation, 0.0)
+
+    def test_pick_x_perspective_compensation_uses_command_top_z(self) -> None:
+        args = _args(pick_x_perspective_reference_mm=300.0)
+        command = CameraPointCommand(
+            0.0,
+            0.0,
+            0.0,
+            detected_top_z_mm=100.0,
+        )
         transform = np.eye(4, dtype=float)
-        transform[:3, 3] = np.array([0.40, -0.10, 0.10])
+        transform[:3, 3] = np.array([0.40, -0.10, 0.50])
 
         target = target_from_command(command, transform, args)
 
         self.assertAlmostEqual(target.raw_pick_x_mm, 400.0)
-        self.assertAlmostEqual(target.pick_x_mm, 355.0)
-        self.assertEqual(target.pick_x_source, "mapped_command_x_cartesian_offset")
+        self.assertAlmostEqual(target.pick_x_mm, 391.687)
+        self.assertAlmostEqual(target.pick_x_perspective_compensation_mm, -8.313)
+        self.assertAlmostEqual(target.pick_x_perspective_scale, 0.91687)
+        self.assertEqual(
+            target.pick_x_source,
+            "mapped_command_x_perspective_compensated",
+        )
+
+    def test_pick_x_perspective_rejects_target_at_camera_height(self) -> None:
+        with self.assertRaisesRegex(ValueError, "source and target Z below camera Z"):
+            compensate_pick_x_perspective_mm(
+                400.0,
+                reference_x_mm=300.0,
+                camera_z_mm=500.0,
+                source_z_mm=100.0,
+                target_z_mm=500.0,
+            )
 
     def test_cartesian_guard_rejects_feedback_wrap_or_branch_jump(self) -> None:
         guard = CartesianJointMotionGuard.create(
