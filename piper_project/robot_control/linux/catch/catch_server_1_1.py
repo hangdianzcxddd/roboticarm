@@ -272,6 +272,9 @@ class GraspYawAdjustmentResult:
     reason: str | None = None
     source_yaw_deg: float | None = None
     target_yaw_deg: float | None = None
+    current_closing_axis_yaw_deg: float | None = None
+    axis_delta_deg: float | None = None
+    j6_axis_gain: float | None = None
     current_j6_deg: float | None = None
     delta_deg: float | None = None
     clamped: bool = False
@@ -1306,12 +1309,7 @@ def object_grasp_orientation(
     prepared = rotation_matrix_xyz_deg(args.rx_deg, args.ry_deg, args.rz_deg)
     # The physical closing direction is the tool-frame Y axis for the Piper
     # gripper.  Align that complete Cartesian axis to the object's short edge.
-    closing_axis_base = prepared[:, 1]
-    current_axis_yaw = normalize_degrees(
-        math.degrees(
-            math.atan2(float(closing_axis_base[1]), float(closing_axis_base[0]))
-        )
-    )
+    current_axis_yaw = closing_axis_yaw_from_rotation_matrix(prepared)
     yaw_plan = plan_grasp_yaw_delta(
         target_yaw,
         current_axis_yaw,
@@ -1337,6 +1335,31 @@ def grasp_oriented_pose(
 ) -> EndPose:
     rx_deg, ry_deg, rz_deg = object_grasp_orientation(args, target)
     return replace(pose, rx_deg=rx_deg, ry_deg=ry_deg, rz_deg=rz_deg)
+
+
+def closing_axis_yaw_from_rotation_matrix(rotation_matrix: np.ndarray) -> float:
+    """Return the Piper gripper closing-axis yaw in the base XY plane.
+
+    The parallel gripper closes along tool-frame Y.  This is a Cartesian
+    direction, not the J6 joint angle; the distinction matters because the
+    wrist/tool mounting contributes a fixed offset and reverses the local J6
+    sense for the prepared near-horizontal grasp pose.
+    """
+
+    matrix = np.asarray(rotation_matrix, dtype=float)
+    if matrix.shape != (3, 3) or not np.isfinite(matrix).all():
+        raise ValueError("rotation_matrix must be a finite 3x3 matrix")
+    axis = matrix[:, 1]
+    horizontal_norm = math.hypot(float(axis[0]), float(axis[1]))
+    if horizontal_norm <= 1e-9:
+        raise SafetyError("gripper closing axis has no valid base XY projection")
+    return normalize_degrees(math.degrees(math.atan2(float(axis[1]), float(axis[0]))))
+
+
+def closing_axis_yaw_from_pose(pose: EndPose) -> float:
+    return closing_axis_yaw_from_rotation_matrix(
+        rotation_matrix_xyz_deg(pose.rx_deg, pose.ry_deg, pose.rz_deg)
+    )
 
 
 def clamp(value: float, lower: float, upper: float) -> float:
@@ -3585,6 +3608,9 @@ def grasp_yaw_adjustment_to_dict(result: GraspYawAdjustmentResult) -> dict[str, 
         "reason": result.reason,
         "source_yaw_deg": result.source_yaw_deg,
         "target_yaw_deg": result.target_yaw_deg,
+        "current_closing_axis_yaw_deg": result.current_closing_axis_yaw_deg,
+        "axis_delta_deg": result.axis_delta_deg,
+        "j6_axis_gain": result.j6_axis_gain,
         "current_j6_deg": result.current_j6_deg,
         "delta_deg": result.delta_deg,
         "clamped": result.clamped,
@@ -4480,44 +4506,147 @@ def compute_grasp_yaw_adjustment_result(
     target_yaw_deg = normalize_degrees(
         float(source_yaw) + float(args.gripper_close_axis_offset_deg)
     )
+
+    # Vision reports an absolute base-frame direction.  Compare it with the
+    # actual Cartesian gripper closing axis, not with the raw J6 joint angle.
+    # The latter has a tool-mount zero offset and, for this wrist pose, its
+    # positive direction is opposite to the closing-axis yaw direction.
+    current_pose = feedback_to_pose(controller.get_end_pose())
+    if current_pose is None:
+        current_pose = forward_kinematics_pose(current_joints)
+    current_axis_yaw_deg = closing_axis_yaw_from_pose(current_pose)
+    axis_delta_deg = nearest_axis_equivalent_delta_deg(
+        target_yaw_deg,
+        current_axis_yaw_deg,
+    )
+
+    # Estimate the local Cartesian-axis/J6 relationship from the same FK model
+    # used by the Cartesian safety checks.  This keeps the correction valid if
+    # the wrist is mounted with a different sign or small non-unit coupling.
+    j6_probe_deg = 0.5
+    plus_joints = list(current_joints)
+    minus_joints = list(current_joints)
+    plus_joints[5] += math.radians(j6_probe_deg)
+    minus_joints[5] -= math.radians(j6_probe_deg)
+    plus_axis_yaw_deg = closing_axis_yaw_from_pose(
+        forward_kinematics_pose(plus_joints)
+    )
+    minus_axis_yaw_deg = closing_axis_yaw_from_pose(
+        forward_kinematics_pose(minus_joints)
+    )
+    j6_axis_gain = nearest_axis_equivalent_delta_deg(
+        plus_axis_yaw_deg,
+        minus_axis_yaw_deg,
+    ) / (2.0 * j6_probe_deg)
+    if not math.isfinite(j6_axis_gain) or abs(j6_axis_gain) < 1e-3:
+        raise SafetyError(
+            "grasp yaw cannot determine the Cartesian closing-axis/J6 relationship"
+        )
+
     joint6_limit = controller.config.joint_limits_rad[5]
     margin_rad = math.radians(0.1)
     min_j6_deg = math.degrees(joint6_limit.min_value + margin_rad)
     max_j6_deg = math.degrees(joint6_limit.max_value - margin_rad)
-    yaw_plan = plan_grasp_yaw_delta(
-        target_yaw_deg,
-        current_j6_deg,
-        max_delta_deg=float(args.grasp_yaw_max_delta_deg),
-        min_j6_deg=min_j6_deg,
-        max_j6_deg=max_j6_deg,
+    # Normally the unoriented-axis shortest delta is unique.  At exactly 90°
+    # both signs describe the same physical axis, so retain both candidates
+    # and choose the one that is most reachable under the J6 limits.
+    axis_delta_candidates = [axis_delta_deg]
+    if math.isclose(abs(axis_delta_deg), 90.0, abs_tol=1e-7):
+        axis_delta_candidates.append(-axis_delta_deg)
+    yaw_candidates: list[dict[str, Any]] = []
+    for candidate_axis_delta_deg in axis_delta_candidates:
+        candidate_raw_j6_delta_deg = candidate_axis_delta_deg / j6_axis_gain
+        candidate_delta_limited_deg = min(
+            float(args.grasp_yaw_max_delta_deg),
+            max(-float(args.grasp_yaw_max_delta_deg), candidate_raw_j6_delta_deg),
+        )
+        candidate_requested_j6_deg = current_j6_deg + candidate_delta_limited_deg
+        candidate_target_j6_deg = min(
+            max_j6_deg,
+            max(min_j6_deg, candidate_requested_j6_deg),
+        )
+        candidate_delta_deg = candidate_target_j6_deg - current_j6_deg
+        candidate_target_joints = list(current_joints)
+        candidate_target_joints[5] += math.radians(candidate_delta_deg)
+        candidate_limit_clamped = not math.isclose(
+            candidate_target_j6_deg,
+            candidate_requested_j6_deg,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        )
+        candidate_delta_clamped = not math.isclose(
+            candidate_delta_limited_deg,
+            candidate_raw_j6_delta_deg,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        )
+        candidate_achieved_axis_yaw_deg = closing_axis_yaw_from_pose(
+            forward_kinematics_pose(candidate_target_joints)
+        )
+        candidate_axis_error_deg = abs(
+            nearest_axis_equivalent_delta_deg(
+                target_yaw_deg,
+                candidate_achieved_axis_yaw_deg,
+            )
+        )
+        yaw_candidates.append(
+            {
+                "axis_delta_deg": candidate_axis_delta_deg,
+                "raw_j6_delta_deg": candidate_raw_j6_delta_deg,
+                "delta_limited_deg": candidate_delta_limited_deg,
+                "target_j6_deg": candidate_target_j6_deg,
+                "delta_deg": candidate_delta_deg,
+                "target_joints": candidate_target_joints,
+                "limit_clamped": candidate_limit_clamped,
+                "delta_clamped": candidate_delta_clamped,
+                "achieved_axis_yaw_deg": candidate_achieved_axis_yaw_deg,
+                "axis_error_deg": candidate_axis_error_deg,
+            }
+        )
+    selected_yaw = min(
+        yaw_candidates,
+        key=lambda candidate: (
+            candidate["axis_error_deg"],
+            candidate["limit_clamped"],
+            abs(candidate["delta_deg"]),
+            # Deterministic tie-break: prefer clockwise J6 motion.
+            candidate["delta_deg"] >= 0.0,
+        ),
     )
-    raw_delta_deg = yaw_plan.raw_delta_deg
-    if abs(yaw_plan.delta_deg) <= float(args.grasp_yaw_deadband_deg):
+    axis_delta_deg = float(selected_yaw["axis_delta_deg"])
+    raw_j6_delta_deg = float(selected_yaw["raw_j6_delta_deg"])
+    delta_deg = float(selected_yaw["delta_deg"])
+    target_joints = selected_yaw["target_joints"]
+    limit_clamped = bool(selected_yaw["limit_clamped"])
+    delta_clamped = bool(selected_yaw["delta_clamped"])
+    achieved_axis_yaw_deg = float(selected_yaw["achieved_axis_yaw_deg"])
+    achieved_axis_error_deg = float(selected_yaw["axis_error_deg"])
+    if abs(axis_delta_deg) <= float(args.grasp_yaw_deadband_deg):
         return (
             GraspYawAdjustmentResult(
                 enabled=True,
                 applied=False,
                 reason=(
                     "within_joint6_limit_deadband"
-                    if yaw_plan.limit_clamped
+                    if limit_clamped
                     else "within_deadband"
                 ),
                 source_yaw_deg=float(source_yaw),
                 target_yaw_deg=target_yaw_deg,
+                current_closing_axis_yaw_deg=current_axis_yaw_deg,
+                axis_delta_deg=axis_delta_deg,
+                j6_axis_gain=j6_axis_gain,
                 current_j6_deg=current_j6_deg,
                 delta_deg=0.0,
-                clamped=yaw_plan.delta_clamped or yaw_plan.limit_clamped,
-                limit_clamped=yaw_plan.limit_clamped,
+                clamped=delta_clamped or limit_clamped,
+                limit_clamped=limit_clamped,
                 start_joints_deg=start_joints_deg,  # type: ignore[arg-type]
                 target_joints_deg=start_joints_deg,  # type: ignore[arg-type]
             ),
             current_joints,
         )
 
-    delta_deg = yaw_plan.delta_deg
-    clamped = yaw_plan.delta_clamped or yaw_plan.limit_clamped
-    target_joints = list(current_joints)
-    target_joints[5] += math.radians(delta_deg)
+    clamped = delta_clamped or limit_clamped
     controller.validate_joints(target_joints)
 
     print(
@@ -4529,12 +4658,15 @@ def compute_grasp_yaw_adjustment_result(
         + f"source_yaw={float(source_yaw):.3f}deg "
         f"offset={float(args.gripper_close_axis_offset_deg):.3f}deg "
         f"target_yaw={target_yaw_deg:.3f}deg "
+        f"current_axis_yaw={current_axis_yaw_deg:.3f}deg "
+        f"axis_delta={axis_delta_deg:.3f}deg "
+        f"j6_axis_gain={j6_axis_gain:.4f} "
         f"current_j6={current_j6_deg:.3f}deg "
         f"delta={delta_deg:.3f}deg "
-        f"raw_delta={raw_delta_deg:.3f}deg "
-        f"axis_err={yaw_plan.axis_error_deg:.3f}deg "
+        f"raw_delta={raw_j6_delta_deg:.3f}deg "
+        f"axis_err={achieved_axis_error_deg:.3f}deg "
         f"clamped={clamped} "
-        f"limit_clamped={yaw_plan.limit_clamped}",
+        f"limit_clamped={limit_clamped}",
         flush=True,
     )
     send_count = 0
@@ -4561,10 +4693,13 @@ def compute_grasp_yaw_adjustment_result(
             applied=True,
             source_yaw_deg=float(source_yaw),
             target_yaw_deg=target_yaw_deg,
+            current_closing_axis_yaw_deg=current_axis_yaw_deg,
+            axis_delta_deg=axis_delta_deg,
+            j6_axis_gain=j6_axis_gain,
             current_j6_deg=current_j6_deg,
             delta_deg=delta_deg,
             clamped=clamped,
-            limit_clamped=yaw_plan.limit_clamped,
+            limit_clamped=limit_clamped,
             start_joints_deg=start_joints_deg,  # type: ignore[arg-type]
             target_joints_deg=joints_rad_to_deg(target_joints),
             send_count=send_count,
@@ -4621,10 +4756,22 @@ def post_grasp_yaw_orientation(
             < min(1.0, max(0.1, abs(float(result.delta_deg)) * 0.25))
         )
     ):
-        current_pose = replace(
-            before_pose,
-            rz_deg=normalize_degrees(before_pose.rz_deg + float(result.delta_deg)),
-        )
+        # Feedback can briefly remain stale after the direct J6 command.  Do
+        # not synthesize RZ by adding the J6 delta: J6 and Cartesian RZ are not
+        # the same angle (and their local signs can differ).  The commanded
+        # target-joint FK gives the correct coupled RX/RY/RZ fallback.
+        if result.target_joints_deg is not None:
+            target_pose = forward_kinematics_pose(
+                tuple(math.radians(value) for value in result.target_joints_deg)
+            )
+            current_pose = replace(
+                before_pose,
+                rx_deg=target_pose.rx_deg,
+                ry_deg=target_pose.ry_deg,
+                rz_deg=target_pose.rz_deg,
+            )
+        else:
+            current_pose = before_pose
     return current_pose
 
 
@@ -4663,7 +4810,7 @@ def plan_grasp_yaw_orientation_for_planar_ik(
     phase: str,
 ) -> EndPose | None:
     before_pose = feedback_to_pose(controller.get_end_pose())
-    result, _target_joints = compute_grasp_yaw_adjustment_result(
+    result, target_joints = compute_grasp_yaw_adjustment_result(
         controller,
         args,
         target,
@@ -4677,10 +4824,16 @@ def plan_grasp_yaw_orientation_for_planar_ik(
             f"grasp yaw {phase} requires valid end-pose feedback "
             "to plan the integrated planar-IK yaw orientation"
         )
-    if result.applied and result.delta_deg is not None:
+    if result.applied and target_joints is not None:
+        # J6 is not identical to Cartesian RZ.  Use the same FK target used
+        # for the yaw correction so the integrated planar-IK orientation keeps
+        # the coupled RX/RY/RZ result instead of adding a raw joint angle.
+        target_pose = forward_kinematics_pose(target_joints)
         return replace(
             before_pose,
-            rz_deg=normalize_degrees(before_pose.rz_deg + float(result.delta_deg)),
+            rx_deg=target_pose.rx_deg,
+            ry_deg=target_pose.ry_deg,
+            rz_deg=target_pose.rz_deg,
         )
     return before_pose
 

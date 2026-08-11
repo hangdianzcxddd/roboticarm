@@ -13,20 +13,25 @@ from robot_control.linux.config.robot_config import ROBOT_CONFIG
 from robot_control.linux.catch.catch_server_1_1 import (
     CartesianJointMotionGuard,
     DEFAULT_CARTESIAN_IK_FK_TOOL_Z_OFFSET_MM,
+    GraspYawAdjustmentResult,
     SOFTWARE_JOINT_LIMITS_DEG,
     YoloCatchTarget,
     apply_tool_z_offset_to_fk_pose,
     build_out_steps,
     build_parser,
     cartesian_only_robot_config,
+    closing_axis_yaw_from_pose,
     compensate_pick_x_perspective_mm,
+    compute_grasp_yaw_adjustment_result,
     dynamic_preposition_pose,
     dynamic_timing_from_command,
     execute_plan,
     execute_step,
+    grasp_yaw_adjustment_to_dict,
     j6_speed,
     object_grasp_orientation,
     pick_above_lift_z_mm,
+    post_grasp_yaw_orientation,
     ready_pose_ik_seed,
     send_gripper,
     target_from_command,
@@ -111,6 +116,195 @@ class CartesianCatchServer11Test(unittest.TestCase):
             max_j6_deg=360.0,
         )
         self.assertAlmostEqual(plan.delta_deg, -90.0)
+
+    def test_grasp_yaw_uses_actual_closing_axis_not_raw_j6_angle(self) -> None:
+        joints = tuple(
+            math.radians(value)
+            for value in (-0.141, 93.863, -57.474, 0.551, 54.373, -77.818)
+        )
+        pose = forward_kinematics_pose(joints)
+        closing_axis_yaw = closing_axis_yaw_from_pose(pose)
+        args = _args(
+            grasp_yaw_by_object_short_edge=True,
+            grasp_yaw_deadband_deg=5.0,
+            grasp_yaw_max_delta_deg=180.0,
+            gripper_close_axis_offset_deg=0.0,
+        )
+        controller = mock.Mock()
+        controller.config = cartesian_only_robot_config("can0")
+
+        with (
+            mock.patch(
+                "robot_control.linux.catch.catch_server_1_1.joint_feedback_to_rad",
+                return_value=joints,
+            ),
+            mock.patch(
+                "robot_control.linux.catch.catch_server_1_1.feedback_to_pose",
+                return_value=pose,
+            ),
+        ):
+            result, target_joints = compute_grasp_yaw_adjustment_result(
+                controller,
+                args,
+                _target(closing_axis_yaw),
+                execute=False,
+            )
+
+        # This is the regression case: the Cartesian closing axis is already
+        # aligned even though its absolute yaw is very different from J6.
+        self.assertGreater(abs(closing_axis_yaw - math.degrees(joints[5])), 5.0)
+        self.assertFalse(result.applied)
+        self.assertEqual(result.reason, "within_deadband")
+        self.assertAlmostEqual(result.delta_deg, 0.0)
+        self.assertAlmostEqual(result.axis_delta_deg, 0.0)
+        self.assertAlmostEqual(result.current_closing_axis_yaw_deg, closing_axis_yaw)
+        self.assertEqual(target_joints, joints)
+        controller.validate_joints.assert_not_called()
+
+    def test_grasp_yaw_converts_axis_error_to_correct_j6_direction(self) -> None:
+        joints = tuple(
+            math.radians(value)
+            for value in (-0.141, 93.863, -57.474, 0.551, 54.373, -77.818)
+        )
+        pose = forward_kinematics_pose(joints)
+        closing_axis_yaw = closing_axis_yaw_from_pose(pose)
+        args = _args(
+            grasp_yaw_by_object_short_edge=True,
+            grasp_yaw_deadband_deg=0.0,
+            grasp_yaw_max_delta_deg=180.0,
+            gripper_close_axis_offset_deg=0.0,
+        )
+        controller = mock.Mock()
+        controller.config = cartesian_only_robot_config("can0")
+
+        with (
+            mock.patch(
+                "robot_control.linux.catch.catch_server_1_1.joint_feedback_to_rad",
+                return_value=joints,
+            ),
+            mock.patch(
+                "robot_control.linux.catch.catch_server_1_1.feedback_to_pose",
+                return_value=pose,
+            ),
+            mock.patch("builtins.print"),
+        ):
+            result, target_joints = compute_grasp_yaw_adjustment_result(
+                controller,
+                args,
+                _target(closing_axis_yaw + 90.0),
+                execute=False,
+            )
+
+        assert target_joints is not None
+        self.assertTrue(result.applied)
+        self.assertAlmostEqual(result.axis_delta_deg, 90.0, places=5)
+        self.assertLess(result.j6_axis_gain, 0.0)
+        self.assertLess(result.delta_deg, 0.0)
+        self.assertAlmostEqual(abs(result.delta_deg), 90.0, delta=0.3)
+        achieved_axis_yaw = closing_axis_yaw_from_pose(
+            forward_kinematics_pose(target_joints)
+        )
+        axis_error = (
+            (closing_axis_yaw + 90.0 - achieved_axis_yaw + 90.0) % 180.0
+        ) - 90.0
+        self.assertAlmostEqual(axis_error, 0.0, delta=0.3)
+        controller.validate_joints.assert_called_once()
+
+    def test_grasp_yaw_payload_includes_cartesian_axis_diagnostics(self) -> None:
+        payload = grasp_yaw_adjustment_to_dict(
+            GraspYawAdjustmentResult(
+                enabled=True,
+                current_closing_axis_yaw_deg=167.3,
+                axis_delta_deg=2.5,
+                j6_axis_gain=-1.0,
+            )
+        )
+
+        self.assertEqual(payload["current_closing_axis_yaw_deg"], 167.3)
+        self.assertEqual(payload["axis_delta_deg"], 2.5)
+        self.assertEqual(payload["j6_axis_gain"], -1.0)
+
+    def test_post_grasp_yaw_stale_feedback_uses_target_joint_fk(self) -> None:
+        start_joints_deg = (-0.141, 93.863, -57.474, 0.551, 54.373, -77.818)
+        target_joints_deg = (*start_joints_deg[:5], -107.818)
+        before_pose = forward_kinematics_pose(
+            tuple(math.radians(value) for value in start_joints_deg)
+        )
+        result = GraspYawAdjustmentResult(
+            enabled=True,
+            applied=True,
+            delta_deg=-30.0,
+            target_joints_deg=target_joints_deg,
+        )
+
+        orientation = post_grasp_yaw_orientation(before_pose, before_pose, result)
+        expected = forward_kinematics_pose(
+            tuple(math.radians(value) for value in target_joints_deg)
+        )
+
+        assert orientation is not None
+        self.assertAlmostEqual(orientation.x_mm, before_pose.x_mm)
+        self.assertAlmostEqual(orientation.y_mm, before_pose.y_mm)
+        self.assertAlmostEqual(orientation.z_mm, before_pose.z_mm)
+        self.assertAlmostEqual(orientation.rx_deg, expected.rx_deg)
+        self.assertAlmostEqual(orientation.ry_deg, expected.ry_deg)
+        self.assertAlmostEqual(orientation.rz_deg, expected.rz_deg)
+        self.assertNotAlmostEqual(
+            orientation.rz_deg,
+            before_pose.rz_deg + result.delta_deg,
+            places=3,
+        )
+
+    def test_integrated_yaw_planning_uses_target_joint_fk_orientation(self) -> None:
+        from robot_control.linux.catch.catch_server_1_1 import (
+            plan_grasp_yaw_orientation_for_planar_ik,
+        )
+
+        before_pose = EndPose(283.7, -0.6, 281.4, -175.957, 1.353, -102.580)
+        target_joints_deg = (-0.141, 93.863, -57.474, 0.551, 54.373, -107.818)
+        result = GraspYawAdjustmentResult(
+            enabled=True,
+            applied=True,
+            delta_deg=-30.0,
+            target_joints_deg=target_joints_deg,
+        )
+        controller = mock.Mock()
+        args = _args(grasp_yaw_by_object_short_edge=True)
+        adjustments: list[GraspYawAdjustmentResult] = []
+
+        with (
+            mock.patch(
+                "robot_control.linux.catch.catch_server_1_1.feedback_to_pose",
+                return_value=before_pose,
+            ),
+            mock.patch(
+                "robot_control.linux.catch.catch_server_1_1.compute_grasp_yaw_adjustment_result",
+                return_value=(result, tuple(math.radians(v) for v in target_joints_deg)),
+            ),
+        ):
+            orientation = plan_grasp_yaw_orientation_for_planar_ik(
+                controller,
+                args,
+                _target(),
+                adjustments,
+                phase="test",
+            )
+
+        expected = forward_kinematics_pose(
+            tuple(math.radians(value) for value in target_joints_deg)
+        )
+        assert orientation is not None
+        self.assertAlmostEqual(orientation.x_mm, before_pose.x_mm)
+        self.assertAlmostEqual(orientation.y_mm, before_pose.y_mm)
+        self.assertAlmostEqual(orientation.z_mm, before_pose.z_mm)
+        self.assertAlmostEqual(orientation.rx_deg, expected.rx_deg)
+        self.assertAlmostEqual(orientation.ry_deg, expected.ry_deg)
+        self.assertAlmostEqual(orientation.rz_deg, expected.rz_deg)
+        self.assertNotAlmostEqual(
+            orientation.rz_deg,
+            before_pose.rz_deg + result.delta_deg,
+            places=3,
+        )
 
     def test_wait_preposition_ignores_x_dependent_robot_timing(self) -> None:
         args = _args(
