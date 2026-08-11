@@ -278,6 +278,22 @@
                   <span>RZ deg</span>
                   <input data-path="linux.rz_deg" type="number" step="0.000001" />
                 </label>
+                <label>
+                  <span>到位超时 s</span>
+                  <input data-path="linux.motion_timeout_s" type="number" step="0.1" />
+                </label>
+                <label>
+                  <span>位置容差 mm</span>
+                  <input data-path="linux.position_tolerance_mm" type="number" step="0.1" />
+                </label>
+                <label>
+                  <span>姿态容差 deg</span>
+                  <input data-path="linux.orientation_tolerance_deg" type="number" step="0.1" />
+                </label>
+                <label class="check-row wide">
+                  <input data-path="linux.debug_plan" type="checkbox" />
+                  <span>输出抓取计划调试信息</span>
+                </label>
               </div>
             </section>
 
@@ -293,6 +309,14 @@
                 <label>
                   <span>目标 X 最大</span>
                   <input data-path="linux.max_target_x_mm" type="number" step="1" />
+                </label>
+                <label>
+                  <span>目标 Y 最小</span>
+                  <input data-path="linux.min_target_y_mm" type="number" step="1" />
+                </label>
+                <label>
+                  <span>目标 Y 最大</span>
+                  <input data-path="linux.max_target_y_mm" type="number" step="1" />
                 </label>
                 <label>
                   <span>抓取 Z</span>
@@ -311,8 +335,8 @@
                   <input data-path="linux.detected_z_offset_mm" type="number" step="1" />
                 </label>
                 <label>
-                  <span>Pick X 偏移</span>
-                  <input data-path="linux.pick_x_offset_mm" type="number" step="1" />
+                  <span>Pick X 透视参考</span>
+                  <input data-path="linux.pick_x_perspective_reference_mm" type="number" step="1" />
                 </label>
                 <label>
                   <span>抓取 Z 最小</span>
@@ -362,6 +386,10 @@
                   <span>夹爪等待 s</span>
                   <input data-path="linux.gripper_settle_s" type="number" step="0.01" />
                 </label>
+                <label>
+                  <span>J6 旋转速度</span>
+                  <input data-path="linux.j6_speed" type="number" step="1" />
+                </label>
               </div>
             </section>
 
@@ -373,7 +401,7 @@
                   <span>动态预定位</span>
                 </label>
                 <label>
-                  <span>预定位余量</span>
+                  <span>预定位余量 mm</span>
                   <input data-path="linux.dynamic_preposition_clearance_mm" type="number" step="1" />
                 </label>
                 <label>
@@ -400,7 +428,7 @@
                   <input data-path="linux.dynamic_t_robot_planar_far_s_per_mm" type="number" step="0.001" />
                 </label>
                 <label class="check-row wide">
-                  <input data-path="linux.adaptive_joint_pitch_by_x" type="checkbox" />
+                  <input data-path="linux.dynamic_pitch_by_x" type="checkbox" />
                   <span>自适应夹爪姿态变化</span>
                 </label>
                 <label>
@@ -431,6 +459,13 @@
                   <span>根据物体姿态旋转夹爪</span>
                 </label>
                 <label>
+                  <span>抓取旋转时机</span>
+                  <select data-path="linux.grasp_yaw_timing">
+                    <option value="pick_above">pick_above</option>
+                    <option value="pick_grasp">pick_grasp</option>
+                  </select>
+                </label>
+                <label>
                   <span>夹爪角度最大变化</span>
                   <input data-path="linux.grasp_yaw_max_delta_deg" type="number" step="1" />
                 </label>
@@ -439,8 +474,16 @@
                   <input data-path="linux.grasp_yaw_deadband_deg" type="number" step="1" />
                 </label>
                 <label>
-                  <span>旋转速度</span>
-                  <input data-path="linux.grasp_yaw_speed" type="number" step="1" />
+                  <span>Cartesian IK 工具偏移 mm</span>
+                  <input data-path="linux.cartesian_ik_fk_tool_z_offset_mm" type="number" step="1" />
+                </label>
+                <label>
+                  <span>Pick above Z 梯度</span>
+                  <input data-path="linux.pick_above_lift_z_gradient" type="number" step="0.1" />
+                </label>
+                <label>
+                  <span>Cartesian IK 种子数</span>
+                  <input data-path="linux.multi_start_cartesian_ik_seed_count" type="number" min="1" max="8" step="1" />
                 </label>
               </div>
             </details>

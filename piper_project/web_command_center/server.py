@@ -40,11 +40,14 @@ DEFAULT_PROFILE: dict[str, Any] = {
     "name": "动态抓取默认配置",
     "windows": {
         "python": "python",
-        "conda_env": "piper",
+        # The reference command is run after activating the piper environment.
+        # Keep this empty so the Web command matches that command exactly; the
+        # Web service should itself be launched from the piper environment.
+        "conda_env": "",
         "mode": "dynamic",
         "host": "192.168.146.128",
         "port": 5005,
-        "conveyor_speed_mm_s": 140,
+        "conveyor_speed_mm_s": 155,
         "dynamic_min_x_mm": 220,
         "dynamic_max_x_mm": 480,
         "dynamic_min_y_mm": -550,
@@ -91,6 +94,7 @@ DEFAULT_PROFILE: dict[str, Any] = {
         "python": "python3",
     },
     "linux": {
+        "module": "robot_control.linux.catch.catch_server_1_1",
         "host": "0.0.0.0",
         "port": 5005,
         "can": "can0",
@@ -103,47 +107,47 @@ DEFAULT_PROFILE: dict[str, Any] = {
         "command_duration_s": 0.3,
         "gripper_settle_s": 0.1,
         "dynamic_preposition": True,
-        "dynamic_preposition_clearance_mm": 40,
+        "dynamic_preposition_clearance_mm": 205,
         "final_action_time_s": 0.5,
         "command_period_s": 0.05,
+        "motion_timeout_s": 8,
+        "position_tolerance_mm": 8,
+        "orientation_tolerance_deg": 8,
         "print_feedback": True,
+        "debug_plan": True,
         "open_command_mm": 0,
         "grasp_command_mm": -90,
         "effort_nm": 0.9,
         "min_target_x_mm": 220,
         "max_target_x_mm": 480,
-        "force_pick_y_mm": 0,
-        "adaptive_joint_pitch_by_x": True,
-        "dynamic_pitch_mode": "planar-ik",
-        "planar_ik_fk_tool_z_offset_mm": 82,
-        "planar_ik_joint_tolerance_deg": 12,
-        "keep_pitch_min_x_mm": 220,
-        "keep_pitch_max_x_mm": 355,
-        "pitch_deg_per_mm_far": 0.013,
-        "pitch_deg_per_mm_near": 0.01,
-        "min_dynamic_pitch_deg": -5,
-        "max_dynamic_pitch_deg": 5,
+        "min_target_y_mm": -550,
+        "max_target_y_mm": 300,
+        "force_pick_y_mm": None,
+        "dynamic_pitch_by_x": False,
+        "dynamic_pitch_mode": None,
         "grasp_z": 120,
         "use_detected_z": "top",
         "detected_z_offset_mm": 115,
         "min_grasp_z_mm": 120,
         "max_grasp_z_mm": 310,
         "execute": True,
-        "planar_ik_grasp_z_comp_mm_per_deg": 20.0,
-        "planar_ik_speed": 20,
-        "dynamic_wait_placement": "nowait",
-        "pick_x_offset_mm": -45,
-        "t_robot_s": 2.8,
+        "dynamic_wait_placement": "wait",
+        "pick_x_perspective_reference_mm": 300,
+        "t_robot_s": 3.8,
         "dynamic_t_robot_by_x": True,
         "dynamic_t_robot_reference_x_mm": 340,
         "dynamic_t_robot_s_per_mm": 0,
-        "dynamic_t_robot_planar_near_s_per_mm": 0.017,
-        "dynamic_t_robot_planar_far_s_per_mm": 0.010,
+        "dynamic_t_robot_planar_near_s_per_mm": None,
+        "dynamic_t_robot_planar_far_s_per_mm": None,
         "grasp_yaw_by_object_short_edge": True,
         "gripper_close_axis_offset_deg": 0,
-        "grasp_yaw_max_delta_deg": 70,
-        "grasp_yaw_deadband_deg": 5,
-        "grasp_yaw_speed": 60,
+        "grasp_yaw_max_delta_deg": None,
+        "grasp_yaw_deadband_deg": None,
+        "j6_speed": 90,
+        "grasp_yaw_timing": "pick_above",
+        "cartesian_ik_fk_tool_z_offset_mm": 82,
+        "pick_above_lift_z_gradient": 1.0,
+        "multi_start_cartesian_ik_seed_count": 4,
     },
 }
 
@@ -520,6 +524,18 @@ def add_flag(parts: list[Any], enabled: Any, flag: str) -> None:
         parts.append(flag)
 
 
+def add_optional_boolean_flag(
+    parts: list[Any],
+    value: Any,
+    flag: str,
+) -> None:
+    """Emit argparse BooleanOptionalAction flags for explicit True/False."""
+    if value is True:
+        parts.append(flag)
+    elif value is False:
+        parts.append(f"--no-{flag.removeprefix('--')}")
+
+
 def format_number(value: Any) -> str:
     if isinstance(value, bool):
         return "1" if value else "0"
@@ -590,10 +606,19 @@ def build_windows_command(profile: dict[str, Any]) -> str:
 def build_linux_python_parts(profile: dict[str, Any]) -> list[Any]:
     linux = profile["linux"]
     shell = profile["linux_shell"]
+    module = str(
+        linux.get("module") or "robot_control.linux.catch.catch_server_1_1"
+    ).strip()
+    allowed_modules = {
+        "robot_control.linux.catch.catch_server_1",
+        "robot_control.linux.catch.catch_server_1_1",
+    }
+    if module not in allowed_modules:
+        raise ValueError(f"unsupported Linux catch module: {module}")
     parts: list[Any] = [
         shell.get("python", "python3"),
         "-m",
-        "robot_control.linux.catch.catch_server_1",
+        module,
     ]
     add_option(parts, "--host", linux.get("host"))
     add_number_option(parts, "--port", linux.get("port"))
@@ -605,28 +630,31 @@ def build_linux_python_parts(profile: dict[str, Any]) -> list[Any]:
     add_number_option(parts, "--ry-deg", linux.get("ry_deg"))
     add_number_option(parts, "--rz-deg", linux.get("rz_deg"))
     add_number_option(parts, "--command-duration-s", linux.get("command_duration_s"))
+    add_number_option(parts, "--motion-timeout-s", linux.get("motion_timeout_s"))
+    add_number_option(parts, "--position-tolerance-mm", linux.get("position_tolerance_mm"))
+    add_number_option(parts, "--orientation-tolerance-deg", linux.get("orientation_tolerance_deg"))
     add_number_option(parts, "--gripper-settle-s", linux.get("gripper_settle_s"))
     add_flag(parts, linux.get("dynamic_preposition"), "--dynamic-preposition")
     add_number_option(parts, "--dynamic-preposition-clearance-mm", linux.get("dynamic_preposition_clearance_mm"))
     add_number_option(parts, "--final-action-time-s", linux.get("final_action_time_s"))
     add_number_option(parts, "--command-period-s", linux.get("command_period_s"))
     add_flag(parts, linux.get("print_feedback"), "--print-feedback")
+    add_flag(parts, linux.get("debug_plan"), "--debug-plan")
     add_number_option(parts, "--open-command-mm", linux.get("open_command_mm"))
     add_number_option(parts, "--grasp-command-mm", linux.get("grasp_command_mm"))
     add_number_option(parts, "--effort-nm", linux.get("effort_nm"))
     add_number_option(parts, "--min-target-x-mm", linux.get("min_target_x_mm"))
     add_number_option(parts, "--max-target-x-mm", linux.get("max_target_x_mm"))
+    add_number_option(parts, "--min-target-y-mm", linux.get("min_target_y_mm"))
+    add_number_option(parts, "--max-target-y-mm", linux.get("max_target_y_mm"))
     add_number_option(parts, "--force-pick-y-mm", linux.get("force_pick_y_mm"))
-    add_flag(parts, linux.get("adaptive_joint_pitch_by_x"), "--adaptive-joint-pitch-by-x")
+    # catch_server_1_1 exposes this as a store_true flag; False means omit it.
+    add_flag(
+        parts,
+        linux.get("dynamic_pitch_by_x", linux.get("adaptive_joint_pitch_by_x")),
+        "--dynamic-pitch-by-x",
+    )
     add_option(parts, "--dynamic-pitch-mode", linux.get("dynamic_pitch_mode"))
-    add_number_option(parts, "--planar-ik-fk-tool-z-offset-mm", linux.get("planar_ik_fk_tool_z_offset_mm"))
-    add_number_option(parts, "--planar-ik-joint-tolerance-deg", linux.get("planar_ik_joint_tolerance_deg"))
-    add_number_option(parts, "--keep-pitch-min-x-mm", linux.get("keep_pitch_min_x_mm"))
-    add_number_option(parts, "--keep-pitch-max-x-mm", linux.get("keep_pitch_max_x_mm"))
-    add_number_option(parts, "--pitch-deg-per-mm-far", linux.get("pitch_deg_per_mm_far"))
-    add_number_option(parts, "--pitch-deg-per-mm-near", linux.get("pitch_deg_per_mm_near"))
-    add_number_option(parts, "--min-dynamic-pitch-deg", linux.get("min_dynamic_pitch_deg"))
-    add_number_option(parts, "--max-dynamic-pitch-deg", linux.get("max_dynamic_pitch_deg"))
     add_number_option(parts, "--grasp-z", linux.get("grasp_z"))
     use_detected_z = linux.get("use_detected_z")
     if use_detected_z and use_detected_z != "off":
@@ -635,25 +663,27 @@ def build_linux_python_parts(profile: dict[str, Any]) -> list[Any]:
     add_number_option(parts, "--min-grasp-z-mm", linux.get("min_grasp_z_mm"))
     add_number_option(parts, "--max-grasp-z-mm", linux.get("max_grasp_z_mm"))
     add_flag(parts, linux.get("execute"), "--execute")
-    add_number_option(parts, "--planar-ik-grasp-z-comp-mm-per-deg", linux.get("planar_ik_grasp_z_comp_mm_per_deg"))
-    add_number_option(parts, "--planar-ik-speed", linux.get("planar_ik_speed"))
     add_option(parts, "--dynamic-wait-placement", linux.get("dynamic_wait_placement"))
-    add_number_option(parts, "--pick-x-offset-mm", linux.get("pick_x_offset_mm"))
+    add_number_option(
+        parts,
+        "--pick-x-perspective-reference-mm",
+        linux.get("pick_x_perspective_reference_mm"),
+    )
     add_number_option(parts, "--t-robot-s", linux.get("t_robot_s"))
-    # A preposition+wait catch is already at the target-side waiting pose and
-    # schedules only the final descent/close from --final-action-time-s. Raw-X
-    # timing slopes are needed only when nowait schedules departure from ready.
-    if linux.get("dynamic_wait_placement") == "nowait":
-        add_flag(parts, linux.get("dynamic_t_robot_by_x"), "--dynamic-t-robot-by-x")
-        add_number_option(parts, "--dynamic-t-robot-reference-x-mm", linux.get("dynamic_t_robot_reference_x_mm"))
-        add_number_option(parts, "--dynamic-t-robot-s-per-mm", linux.get("dynamic_t_robot_s_per_mm"))
-        add_number_option(parts, "--dynamic-t-robot-planar-near-s-per-mm", linux.get("dynamic_t_robot_planar_near_s_per_mm"))
-        add_number_option(parts, "--dynamic-t-robot-planar-far-s-per-mm", linux.get("dynamic_t_robot_planar_far_s_per_mm"))
-    add_flag(parts, linux.get("grasp_yaw_by_object_short_edge"), "--grasp-yaw-by-object-short-edge")
+    add_flag(parts, linux.get("dynamic_t_robot_by_x"), "--dynamic-t-robot-by-x")
+    add_number_option(parts, "--dynamic-t-robot-reference-x-mm", linux.get("dynamic_t_robot_reference_x_mm"))
+    add_number_option(parts, "--dynamic-t-robot-s-per-mm", linux.get("dynamic_t_robot_s_per_mm"))
+    add_number_option(parts, "--dynamic-t-robot-planar-near-s-per-mm", linux.get("dynamic_t_robot_planar_near_s_per_mm"))
+    add_number_option(parts, "--dynamic-t-robot-planar-far-s-per-mm", linux.get("dynamic_t_robot_planar_far_s_per_mm"))
+    add_optional_boolean_flag(parts, linux.get("grasp_yaw_by_object_short_edge"), "--grasp-yaw-by-object-short-edge")
     add_number_option(parts, "--gripper-close-axis-offset-deg", linux.get("gripper_close_axis_offset_deg"))
     add_number_option(parts, "--grasp-yaw-max-delta-deg", linux.get("grasp_yaw_max_delta_deg"))
     add_number_option(parts, "--grasp-yaw-deadband-deg", linux.get("grasp_yaw_deadband_deg"))
-    add_number_option(parts, "--grasp-yaw-speed", linux.get("grasp_yaw_speed"))
+    add_number_option(parts, "--j6-speed", linux.get("j6_speed"))
+    add_option(parts, "--grasp-yaw-timing", linux.get("grasp_yaw_timing"))
+    add_number_option(parts, "--cartesian-ik-fk-tool-z-offset-mm", linux.get("cartesian_ik_fk_tool_z_offset_mm"))
+    add_number_option(parts, "--pick-above-lift-z-gradient", linux.get("pick_above_lift_z_gradient"))
+    add_number_option(parts, "--multi-start-cartesian-ik-seed-count", linux.get("multi_start_cartesian_ik_seed_count"))
     return parts
 
 
@@ -939,6 +969,25 @@ def validate_profile(profile: dict[str, Any]) -> dict[str, Any]:
     windows = profile["windows"]
     linux = profile["linux"]
     shell = profile["linux_shell"]
+
+    # Validate the parameter contract used by catch_server_1_1.
+    if float(linux.get("min_target_y_mm", -300)) >= float(linux.get("max_target_y_mm", 300)):
+        errors.append("Linux target Y range must satisfy min < max")
+    if float(linux.get("dynamic_preposition_clearance_mm", 0)) < 0:
+        errors.append("dynamic-preposition-clearance-mm must be non-negative")
+    if float(linux.get("motion_timeout_s", 0)) <= 0:
+        errors.append("motion-timeout-s must be > 0")
+    if float(linux.get("position_tolerance_mm", 0)) <= 0:
+        errors.append("position-tolerance-mm must be > 0")
+    if float(linux.get("orientation_tolerance_deg", 0)) <= 0:
+        errors.append("orientation-tolerance-deg must be > 0")
+    seed_count = int(linux.get("multi_start_cartesian_ik_seed_count", 4))
+    if seed_count < 1 or seed_count > 8:
+        errors.append("multi-start-cartesian-ik-seed-count must be between 1 and 8")
+    if linux.get("pick_x_perspective_reference_mm") in (None, ""):
+        warnings.append("pick-x-perspective-reference-mm is not set")
+    if "pick_x_offset_mm" in linux:
+        warnings.append("legacy pick_x_offset_mm is ignored; use pick_x_perspective_reference_mm")
 
     if float(windows["dynamic_min_x_mm"]) >= float(windows["dynamic_max_x_mm"]):
         errors.append("Windows 动态 X 范围需要满足 min < max")
