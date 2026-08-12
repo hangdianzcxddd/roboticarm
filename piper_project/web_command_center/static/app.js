@@ -1,6 +1,6 @@
 const state = {
   profile: null,
-  commands: { windows: "", linux: "" },
+  commands: { vision: "", robot: "" },
   activePreview: "rgb",
   previewReady: false,
   streamConnected: false,
@@ -147,11 +147,11 @@ async function stopProcess(name) {
 }
 
 async function stopAll() {
-  await Promise.all([stopProcess("windows"), stopProcess("linux")]);
+  await Promise.all([stopProcess("vision"), stopProcess("robot")]);
 }
 
 async function toggleProcess(name) {
-  const button = name === "windows" ? el.startWindows : el.startLinux;
+  const button = name === "vision" ? el.startWindows : el.startLinux;
   if (button.dataset.running === "true") {
     await stopProcess(name);
   } else {
@@ -161,7 +161,7 @@ async function toggleProcess(name) {
 
 async function checkLinuxPort() {
   updateProfileFromForm();
-  const status = await api("/api/linux/port-status", {
+  const status = await api("/api/robot/port-status", {
     method: "POST",
     body: JSON.stringify({ profile: state.profile }),
   });
@@ -173,16 +173,16 @@ async function stopRemoteLinuxPortOwner() {
   updateProfileFromForm();
   const status = await checkLinuxPort();
   if (!status.ok) {
-    throw new Error(status.message || "远端端口检查失败");
+    throw new Error(status.message || "本机端口检查失败");
   }
   if (!status.occupied) {
     alert(status.message);
     return status;
   }
   const detail = status.pids && status.pids.length ? ` PID ${status.pids.join(", ")}` : "";
-  const ok = window.confirm(`远端 Linux 端口 ${status.port} 已被旧服务占用${detail}。\n确定要停止它吗？`);
+  const ok = window.confirm(`本机端口 ${status.port} 已被旧服务占用${detail}。\n确定要停止它吗？`);
   if (!ok) return status;
-  const result = await api("/api/linux/stop-port-owner", {
+  const result = await api("/api/robot/stop-port-owner", {
     method: "POST",
     body: JSON.stringify({ profile: state.profile }),
   });
@@ -197,7 +197,7 @@ async function setupCan() {
   if (!password) {
     throw new Error("请输入 Linux sudo 密码");
   }
-  const result = await api("/api/linux/setup-can", {
+  const result = await api("/api/robot/setup-can", {
     method: "POST",
     body: JSON.stringify({ profile: state.profile, password }),
   });
@@ -209,8 +209,8 @@ async function setupCan() {
 }
 
 function renderCommands() {
-  el.windowsCommand.textContent = state.commands.windows || "";
-  el.linuxCommand.textContent = state.commands.linux || "";
+  el.windowsCommand.textContent = state.commands.vision || state.commands.windows || "";
+  el.linuxCommand.textContent = state.commands.robot || state.commands.linux || "";
 }
 
 function renderValidation(validation) {
@@ -236,36 +236,36 @@ function renderValidation(validation) {
 function renderLinuxPortStatus(status) {
   el.linuxPortStatus.classList.remove("running", "error", "warn");
   if (!status) {
-    el.linuxPortStatus.textContent = "远端服务未检查";
+    el.linuxPortStatus.textContent = "5005 未检查";
     return;
   }
   if (!status.ok) {
     el.linuxPortStatus.classList.add("error");
-    el.linuxPortStatus.textContent = status.message || "远端端口检查失败";
+    el.linuxPortStatus.textContent = status.message || "本机端口检查失败";
     return;
   }
   if (status.occupied) {
     el.linuxPortStatus.classList.add("warn");
     const pidText = status.pids && status.pids.length ? ` PID ${status.pids.join(",")}` : "";
-    el.linuxPortStatus.textContent = `远端 ${status.port} 已占用${pidText}`;
+    el.linuxPortStatus.textContent = `本机 ${status.port} 已占用${pidText}`;
     return;
   }
   el.linuxPortStatus.classList.add("running");
-  el.linuxPortStatus.textContent = `远端 ${status.port} 空闲`;
+  el.linuxPortStatus.textContent = `本机 ${status.port} 空闲`;
 }
 
 function renderStatus(name, status) {
-  const target = name === "windows" ? el.windowsStatus : el.linuxStatus;
-  const button = name === "windows" ? el.startWindows : el.startLinux;
+  const target = name === "vision" ? el.windowsStatus : el.linuxStatus;
+  const button = name === "vision" ? el.startWindows : el.startLinux;
   target.classList.toggle("running", Boolean(status.running));
   target.classList.toggle("error", !status.running && status.exit_code && status.exit_code !== 0);
   button.dataset.running = status.running ? "true" : "false";
   button.classList.toggle("primary", !status.running);
   button.classList.toggle("danger", Boolean(status.running));
   button.textContent = status.running
-    ? `停止 ${name === "windows" ? "Windows" : "Linux"}`
-    : `启动 ${name === "windows" ? "Windows" : "Linux"}`;
-  const prefix = name === "windows" ? "Windows" : "Linux";
+    ? `停止 ${name === "vision" ? "视觉" : "抓取服务"}`
+    : `启动 ${name === "vision" ? "视觉" : "抓取服务"}`;
+  const prefix = name === "vision" ? "视觉" : "抓取服务";
   if (status.running) {
     const uptime = status.uptime_s == null ? "" : ` ${Math.round(status.uptime_s)}s`;
     target.textContent = `${prefix} running${uptime}`;
@@ -277,7 +277,7 @@ function renderStatus(name, status) {
 }
 
 function renderLastLinuxEvent(status) {
-  const item = status.linux.last_important;
+  const item = status.robot.last_important;
   if (!item) {
     el.lastLinuxEvent.textContent = "无关键事件";
     return;
@@ -412,8 +412,8 @@ function renderArmActivityHistoryFromLogs(lines) {
 
 async function refreshStatus() {
   const status = await api("/api/status");
-  renderStatus("windows", status.windows);
-  renderStatus("linux", status.linux);
+  renderStatus("vision", status.vision);
+  renderStatus("robot", status.robot);
   renderLastLinuxEvent(status);
   renderArmActivity(status.arm_activity);
   renderArmActivityHistory(status.arm_activity_history);
@@ -422,9 +422,9 @@ async function refreshStatus() {
 async function refreshLogs() {
   if (el.pauseLogs.checked) return;
   const [windows, linux, linuxImportant] = await Promise.all([
-    api("/api/logs/windows?limit=500"),
-    api("/api/logs/linux?limit=500"),
-    api("/api/logs/linux?important=1&limit=160"),
+    api("/api/logs/vision?limit=500"),
+    api("/api/logs/robot?limit=500"),
+    api("/api/logs/robot?important=1&limit=160"),
   ]);
   renderPlainLog(el.windowsLog, windows);
   renderPlainLog(el.linuxLog, linux);
@@ -435,8 +435,8 @@ async function refreshLogs() {
 
 function renderAllLog(windows, linux) {
   const merged = [
-    ...windows.map((line) => ({ ...line, source: "WIN" })),
-    ...linux.map((line) => ({ ...line, source: "LIN" })),
+    ...windows.map((line) => ({ ...line, source: "VISION" })),
+    ...linux.map((line) => ({ ...line, source: "ROBOT" })),
   ].slice(-1000);
   const text = merged.map((line) => `[${line.time}] ${line.source} ${line.text}`).join("\n");
   renderTextLog(el.allLog, text);
@@ -457,7 +457,7 @@ function renderTextLog(target, text) {
 
 function renderImportantLog(lines) {
   if (!lines.length) {
-    el.linuxImportantLog.innerHTML = '<div class="empty">等待 Linux 关键事件</div>';
+    el.linuxImportantLog.innerHTML = '<div class="empty">等待抓取服务关键事件</div>';
     return;
   }
   el.linuxImportantLog.innerHTML = lines
@@ -599,8 +599,8 @@ document.getElementById("setupCan").addEventListener("click", () =>
 document.getElementById("stopRemoteLinux").addEventListener("click", () =>
   stopRemoteLinuxPortOwner().catch(alertError),
 );
-el.startWindows.addEventListener("click", () => toggleProcess("windows").catch(alertError));
-el.startLinux.addEventListener("click", () => toggleProcess("linux").catch(alertError));
+el.startWindows.addEventListener("click", () => toggleProcess("vision").catch(alertError));
+el.startLinux.addEventListener("click", () => toggleProcess("robot").catch(alertError));
 document.getElementById("stopAll").addEventListener("click", () => stopAll().catch(alertError));
 
 async function tick() {

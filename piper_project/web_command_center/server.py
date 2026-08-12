@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import shlex
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -38,14 +39,14 @@ PREVIEW_FILES = {
 
 DEFAULT_PROFILE: dict[str, Any] = {
     "name": "动态抓取默认配置",
-    "windows": {
-        "python": "python",
+    "vision": {
+        "python": sys.executable,
         # The reference command is run after activating the piper environment.
         # Keep this empty so the Web command matches that command exactly; the
         # Web service should itself be launched from the piper environment.
         "conda_env": "",
         "mode": "dynamic",
-        "host": "192.168.146.128",
+        "host": "127.0.0.1",
         "port": 5005,
         "conveyor_speed_mm_s": 155,
         "dynamic_min_x_mm": 220,
@@ -73,7 +74,7 @@ DEFAULT_PROFILE: dict[str, Any] = {
         "entry_edge": "right",
         "entry_clear_margin_px": 15,
         "entry_clear_frames": 3,
-        "hand_eye_result": r"robot_control\linux\hand_eye\eye_to_hand_result_auto.json",
+        "hand_eye_result": "robot_control/linux/hand_eye/eye_to_hand_result_auto.json",
         "dynamic_debug_candidates": True,
         "dynamic_skip_memory_s": 0,
         "dynamic_probe_interval_s": 0,
@@ -82,20 +83,9 @@ DEFAULT_PROFILE: dict[str, Any] = {
         "morphology_open_kernel_size": 3,
         "contour_mask_mode": "convex-hull",
     },
-    "linux_shell": {
-        "ssh_user": "zcxddd",
-        "ssh_host": "192.168.146.128",
-        "batch_mode": True,
-        "strict_host_key_checking": "accept-new",
-        "server_alive_interval": 5,
-        "remote_project": "/home/zcxddd/projects/roboticarm/piper_project",
-        "conda_init": "~/miniconda3/etc/profile.d/conda.sh",
-        "conda_env": "piper",
-        "python": "python3",
-    },
-    "linux": {
+    "robot": {
         "module": "robot_control.linux.catch.catch_server_1_1",
-        "host": "0.0.0.0",
+        "host": "127.0.0.1",
         "port": 5005,
         "can": "can0",
         "hand_eye_result": "robot_control/linux/hand_eye/eye_to_hand_result_auto.json",
@@ -398,7 +388,7 @@ class ManagedProcess:
             return {
                 "phase": "空闲",
                 "step": "idle",
-                "label": "等待启动 Linux 服务",
+                    "label": "等待启动抓取服务",
                 "time": None,
                 "running": False,
                 "exit_code": None,
@@ -467,16 +457,40 @@ def deep_merge(defaults: Any, loaded: Any) -> Any:
 
 def load_profile() -> dict[str, Any]:
     if not PROFILE_PATH.exists():
-        return deepcopy(DEFAULT_PROFILE)
+        return normalize_profile(deepcopy(DEFAULT_PROFILE))
     try:
         loaded = json.loads(PROFILE_PATH.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return deepcopy(DEFAULT_PROFILE)
-    return deep_merge(DEFAULT_PROFILE, loaded)
+        return normalize_profile(deepcopy(DEFAULT_PROFILE))
+    return normalize_profile(deep_merge(DEFAULT_PROFILE, loaded))
+
+
+def normalize_profile(profile: dict[str, Any]) -> dict[str, Any]:
+    """Migrate profiles from the former split Windows/VM layout to local Linux."""
+    profile = deepcopy(profile)
+    # Accept clearer names from new clients while retaining old saved profiles.
+    if isinstance(profile.get("windows"), dict):
+        profile["vision"] = deep_merge(profile.get("vision", {}), profile.pop("windows"))
+    if isinstance(profile.get("linux"), dict):
+        profile["robot"] = deep_merge(profile.get("robot", {}), profile.pop("linux"))
+    profile.pop("linux_shell", None)
+    vision = profile.setdefault("vision", {})
+    robot = profile.setdefault("robot", {})
+    vision["host"] = "127.0.0.1"
+    robot["host"] = "127.0.0.1"
+    # Always use the interpreter that launched this Web service. This prevents
+    # a stale /usr/bin/python3 or former Conda path from losing pyrealsense2 or
+    # the Piper SDK after migration.
+    vision["python"] = sys.executable
+    robot["python"] = sys.executable
+    for section in (vision, robot):
+        if isinstance(section.get("hand_eye_result"), str):
+            section["hand_eye_result"] = section["hand_eye_result"].replace("\\", "/")
+    return profile
 
 
 def save_profile(payload: dict[str, Any]) -> dict[str, Any]:
-    profile = deep_merge(DEFAULT_PROFILE, payload)
+    profile = normalize_profile(deep_merge(DEFAULT_PROFILE, payload))
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     PROFILE_PATH.write_text(
         json.dumps(profile, ensure_ascii=False, indent=2) + "\n",
@@ -486,11 +500,10 @@ def save_profile(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def build_generated_commands(profile: dict[str, Any] | None = None) -> dict[str, str]:
-    profile = load_profile() if profile is None else deep_merge(DEFAULT_PROFILE, profile)
-    return {
-        "windows": build_windows_command(profile),
-        "linux": build_linux_command(profile),
-    }
+    profile = load_profile() if profile is None else normalize_profile(deep_merge(DEFAULT_PROFILE, profile))
+    vision = build_vision_command(profile)
+    robot = build_robot_command(profile)
+    return {"vision": vision, "robot": robot, "windows": vision, "linux": robot}
 
 
 def local_join(parts: list[Any]) -> str:
@@ -546,13 +559,9 @@ def format_number(value: Any) -> str:
     return str(value)
 
 
-def build_windows_command(profile: dict[str, Any]) -> str:
-    windows = profile["windows"]
-    conda_env = str(windows.get("conda_env", "")).strip()
-    if conda_env:
-        parts: list[Any] = ["conda", "run", "-n", conda_env, windows.get("python", "python")]
-    else:
-        parts = [windows.get("python", "python")]
+def build_vision_command(profile: dict[str, Any]) -> str:
+    windows = profile["vision"]
+    parts: list[Any] = [windows.get("python") or sys.executable]
     parts.extend(
         [
             "-m",
@@ -562,8 +571,7 @@ def build_windows_command(profile: dict[str, Any]) -> str:
     )
     add_option(parts, "--host", windows.get("host"))
     port = int(windows.get("port", 5005))
-    if port != 5005:
-        add_number_option(parts, "--port", port)
+    add_number_option(parts, "--port", port)
     add_number_option(parts, "--conveyor-speed-mm-s", windows.get("conveyor_speed_mm_s"))
     add_number_option(parts, "--dynamic-min-x-mm", windows.get("dynamic_min_x_mm"))
     add_number_option(parts, "--dynamic-max-x-mm", windows.get("dynamic_max_x_mm"))
@@ -603,9 +611,12 @@ def build_windows_command(profile: dict[str, Any]) -> str:
     return local_join(parts)
 
 
+# Compatibility name for scripts importing the old helper.
+build_windows_command = build_vision_command
+
+
 def build_linux_python_parts(profile: dict[str, Any]) -> list[Any]:
-    linux = profile["linux"]
-    shell = profile["linux_shell"]
+    linux = profile["robot"]
     module = str(
         linux.get("module") or "robot_control.linux.catch.catch_server_1_1"
     ).strip()
@@ -616,7 +627,7 @@ def build_linux_python_parts(profile: dict[str, Any]) -> list[Any]:
     if module not in allowed_modules:
         raise ValueError(f"unsupported Linux catch module: {module}")
     parts: list[Any] = [
-        shell.get("python", "python3"),
+        linux.get("python") or sys.executable,
         "-m",
         module,
     ]
@@ -687,75 +698,35 @@ def build_linux_python_parts(profile: dict[str, Any]) -> list[Any]:
     return parts
 
 
-def build_linux_command(profile: dict[str, Any]) -> str:
-    shell = profile["linux_shell"]
-    python_parts = build_linux_python_parts(profile)
-    remote_steps = [
-        f"cd {shlex.quote(str(shell.get('remote_project', '')))}",
-    ]
-    conda_env = str(shell.get("conda_env", "")).strip()
-    conda_init = str(shell.get("conda_init", "")).strip()
-    if conda_env:
-        if conda_init:
-            remote_steps.append(f"source {conda_init}")
-        remote_steps.append(f"conda activate {shlex.quote(conda_env)}")
-    remote_steps.append(shlex.join(str(part) for part in python_parts))
-    remote_command = " && ".join(remote_steps)
-
-    return local_join(build_ssh_argv(shell, remote_command))
+def build_robot_command(profile: dict[str, Any]) -> str:
+    return local_join(build_linux_python_parts(profile))
 
 
-def build_ssh_argv(shell: dict[str, Any], remote_command: str) -> list[str]:
-    ssh_parts: list[Any] = ["ssh"]
-    if shell.get("batch_mode", True):
-        ssh_parts.extend(["-o", "BatchMode=yes"])
-    strict_host_key_checking = shell.get("strict_host_key_checking")
-    if strict_host_key_checking:
-        ssh_parts.extend(["-o", f"StrictHostKeyChecking={strict_host_key_checking}"])
-    server_alive_interval = shell.get("server_alive_interval")
-    if server_alive_interval not in (None, ""):
-        ssh_parts.extend(["-o", f"ServerAliveInterval={format_number(server_alive_interval)}"])
-    ssh_parts.append(f"{shell.get('ssh_user')}@{shell.get('ssh_host')}")
-    ssh_parts.append(remote_command)
-    return [str(part) for part in ssh_parts]
+# Compatibility name for scripts importing the old helper.
+build_linux_command = build_robot_command
 
 
-def remote_setup_can(profile: dict[str, Any], sudo_password: str) -> dict[str, Any]:
-    profile = deep_merge(DEFAULT_PROFILE, profile)
+def setup_local_can(profile: dict[str, Any], sudo_password: str) -> dict[str, Any]:
+    profile = normalize_profile(deep_merge(DEFAULT_PROFILE, profile))
     password = str(sudo_password or "")
     if not password:
         return {
             "ok": False,
             "running": False,
-            "message": "请输入 Linux sudo 密码。",
+            "message": "请输入本机 sudo 密码。",
         }
 
-    shell = profile["linux_shell"]
-    linux = profile["linux"]
-    remote_project = str(shell.get("remote_project", "")).strip()
-    if not remote_project:
-        return {
-            "ok": False,
-            "running": False,
-            "message": "远端项目路径为空，无法执行 setup_can.sh。",
-        }
-
+    linux = profile["robot"]
     can_iface = str(linux.get("can") or "can0").strip() or "can0"
     bitrate = str(linux.get("can_bitrate") or "1000000").strip() or "1000000"
-    remote_steps = [
-        f"cd {shlex.quote(remote_project)}",
-        "test -f ./setup_can.sh || { echo 'setup_can.sh not found in remote project'; exit 66; }",
-        "IFS= read -r SUDO_PASS",
-        (
-            "printf '%s\\n' \"$SUDO_PASS\" | "
-            f"sudo -S -p '' bash ./setup_can.sh {shlex.quote(can_iface)} {shlex.quote(bitrate)}"
-        ),
-    ]
-    remote_command = " && ".join(remote_steps)
+    script = PROJECT_ROOT / "setup_can.sh"
+    if not script.is_file():
+        return {"ok": False, "running": False, "can": can_iface, "bitrate": bitrate,
+                "message": f"本机项目目录中没有找到 {script}。"}
 
     try:
         result = subprocess.run(
-            build_ssh_argv(shell, remote_command),
+            ["sudo", "-S", "-p", "", "bash", str(script), can_iface, bitrate],
             input=password + "\n",
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -771,7 +742,7 @@ def remote_setup_can(profile: dict[str, Any], sudo_password: str) -> dict[str, A
             "running": False,
             "can": can_iface,
             "bitrate": bitrate,
-            "message": "连接机械臂超时：远端 setup_can.sh 未在 20 秒内完成。",
+            "message": "连接机械臂超时：本机 setup_can.sh 未在 20 秒内完成。",
         }
     except OSError as exc:
         return {
@@ -787,7 +758,7 @@ def remote_setup_can(profile: dict[str, Any], sudo_password: str) -> dict[str, A
     if ok:
         message = f"机械臂 CAN 已连接：{can_iface}，bitrate={bitrate}。"
     elif result.returncode == 66:
-        message = "远端项目目录中没有找到 setup_can.sh，请先同步该文件到 Linux 项目目录。"
+        message = "本机 setup_can.sh 执行文件不存在或无法执行。"
     else:
         message = raw or f"连接机械臂失败，setup_can.sh 返回 {result.returncode}。"
 
@@ -804,7 +775,7 @@ def remote_setup_can(profile: dict[str, Any], sudo_password: str) -> dict[str, A
 
 def linux_service_port(profile: dict[str, Any]) -> int:
     try:
-        port = int(profile["linux"].get("port", 5005))
+        port = int(profile["robot"].get("port", 5005))
     except (TypeError, ValueError) as exc:
         raise ValueError("Linux 服务端口必须是数字") from exc
     if port < 1 or port > 65535:
@@ -812,16 +783,14 @@ def linux_service_port(profile: dict[str, Any]) -> int:
     return port
 
 
-def remote_linux_port_status(profile: dict[str, Any]) -> dict[str, Any]:
-    profile = deep_merge(DEFAULT_PROFILE, profile)
-    shell = profile["linux_shell"]
+def local_robot_port_status(profile: dict[str, Any]) -> dict[str, Any]:
+    profile = normalize_profile(deep_merge(DEFAULT_PROFILE, profile))
     port = linux_service_port(profile)
-    remote_command = f"ss -H -ltnp 'sport = :{port}'"
     try:
         result = subprocess.run(
-            build_ssh_argv(shell, remote_command),
+            ["ss", "-H", "-ltnp", "sport", "=", f":{port}"],
             stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+            stderr=subprocess.PIPE,
             stdin=subprocess.DEVNULL,
             text=True,
             encoding="utf-8",
@@ -837,8 +806,8 @@ def remote_linux_port_status(profile: dict[str, Any]) -> dict[str, Any]:
             "pids": [],
             "processes": [],
             "raw": "",
-            "error": "SSH 检查远端端口超时",
-            "message": f"无法确认 Linux 端口 {port} 状态：SSH 检查超时。",
+            "error": "本机端口检查超时",
+            "message": f"无法确认本机端口 {port} 状态：检查超时。",
         }
     except OSError as exc:
         return {
@@ -849,12 +818,13 @@ def remote_linux_port_status(profile: dict[str, Any]) -> dict[str, Any]:
             "processes": [],
             "raw": "",
             "error": str(exc),
-            "message": f"无法确认 Linux 端口 {port} 状态：{exc}",
+            "message": f"无法确认本机端口 {port} 状态：{exc}",
         }
 
     raw = result.stdout.strip()
+    stderr = result.stderr.strip()
     if result.returncode != 0:
-        error = raw or f"ssh exited with code {result.returncode}"
+        error = stderr or raw or f"ss exited with code {result.returncode}"
         return {
             "ok": False,
             "occupied": None,
@@ -864,13 +834,18 @@ def remote_linux_port_status(profile: dict[str, Any]) -> dict[str, Any]:
             "raw": raw,
             "exit_code": result.returncode,
             "error": error,
-            "message": f"无法确认 Linux 端口 {port} 状态：{error}",
+            "message": f"无法确认本机端口 {port} 状态：{error}",
         }
 
     lines = [line.strip() for line in raw.splitlines() if line.strip()]
     pids = sorted({int(match) for match in re.findall(r"pid=(\d+)", raw)})
     processes = sorted({match for match in re.findall(r'\("([^"]+)",pid=\d+', raw)})
-    occupied = bool(lines)
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.25):
+            tcp_reachable = True
+    except OSError:
+        tcp_reachable = False
+    occupied = bool(lines) or tcp_reachable
     if occupied:
         owner = ", ".join(
             f"{name or 'process'}:{pid}"
@@ -878,12 +853,12 @@ def remote_linux_port_status(profile: dict[str, Any]) -> dict[str, Any]:
         )
         if not owner and pids:
             owner = ", ".join(str(pid) for pid in pids)
-        message = f"Linux 端口 {port} 已被占用"
+        message = f"本机端口 {port} 已被占用"
         if owner:
             message += f"（{owner}）"
-        message += "。请先停止旧服务，再重新启动 Linux。"
+        message += "。请先停止占用它的旧服务，再启动抓取服务。"
     else:
-        message = f"Linux 端口 {port} 空闲，可以启动服务。"
+        message = f"本机端口 {port} 空闲，可以启动抓取服务。"
 
     return {
         "ok": True,
@@ -896,9 +871,9 @@ def remote_linux_port_status(profile: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def stop_remote_linux_port_owner(profile: dict[str, Any], *, force: bool = False) -> dict[str, Any]:
-    profile = deep_merge(DEFAULT_PROFILE, profile)
-    status = remote_linux_port_status(profile)
+def stop_local_robot_port_owner(profile: dict[str, Any], *, force: bool = False) -> dict[str, Any]:
+    profile = normalize_profile(deep_merge(DEFAULT_PROFILE, profile))
+    status = local_robot_port_status(profile)
     if not status.get("ok"):
         return {**status, "stopped": False}
     if not status.get("occupied"):
@@ -913,34 +888,24 @@ def stop_remote_linux_port_owner(profile: dict[str, Any], *, force: bool = False
             "message": f"Linux 端口 {status['port']} 被占用，但没有拿到 PID，无法自动停止。",
         }
 
-    signal_name = "-KILL" if force else "-TERM"
-    remote_command = "kill " + signal_name + " " + " ".join(str(pid) for pid in pids)
-    result = subprocess.run(
-        build_ssh_argv(profile["linux_shell"], remote_command),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        stdin=subprocess.DEVNULL,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=8,
-        check=False,
-    )
-    raw = result.stdout.strip()
-    if result.returncode != 0:
-        return {
-            "ok": False,
-            "stopped": False,
-            "status": status,
-            "raw": raw,
-            "message": raw or f"停止远端旧服务失败，ssh/kill 返回 {result.returncode}",
-        }
+    stop_signal = signal.SIGKILL if force else signal.SIGTERM
+    failures = []
+    for pid in pids:
+        try:
+            os.kill(pid, stop_signal)
+        except ProcessLookupError:
+            continue
+        except PermissionError as exc:
+            failures.append(f"PID {pid}: {exc}")
+    if failures:
+        return {"ok": False, "stopped": False, "status": status,
+                "message": "；".join(failures)}
 
     latest = status
     deadline = time.monotonic() + 3.0
     while time.monotonic() < deadline:
         time.sleep(0.25)
-        latest = remote_linux_port_status(profile)
+        latest = local_robot_port_status(profile)
         if latest.get("ok") and not latest.get("occupied"):
             break
 
@@ -958,17 +923,22 @@ def stop_remote_linux_port_owner(profile: dict[str, Any], *, force: bool = False
         "stopped": True,
         "stopped_pids": pids,
         "status": latest,
-        "message": f"已停止远端旧 Linux 服务 PID {', '.join(str(pid) for pid in pids)}。",
+        "message": f"已停止本机旧服务 PID {', '.join(str(pid) for pid in pids)}。",
     }
 
 
+# Compatibility aliases for callers using the former VM-oriented helper names.
+remote_setup_can = setup_local_can
+remote_linux_port_status = local_robot_port_status
+stop_remote_linux_port_owner = stop_local_robot_port_owner
+
+
 def validate_profile(profile: dict[str, Any]) -> dict[str, Any]:
-    profile = deep_merge(DEFAULT_PROFILE, profile)
+    profile = normalize_profile(deep_merge(DEFAULT_PROFILE, profile))
     errors: list[str] = []
     warnings: list[str] = []
-    windows = profile["windows"]
-    linux = profile["linux"]
-    shell = profile["linux_shell"]
+    windows = profile["vision"]
+    linux = profile["robot"]
 
     # Validate the parameter contract used by catch_server_1_1.
     if float(linux.get("min_target_y_mm", -300)) >= float(linux.get("max_target_y_mm", 300)):
@@ -990,19 +960,19 @@ def validate_profile(profile: dict[str, Any]) -> dict[str, Any]:
         warnings.append("legacy pick_x_offset_mm is ignored; use pick_x_perspective_reference_mm")
 
     if float(windows["dynamic_min_x_mm"]) >= float(windows["dynamic_max_x_mm"]):
-        errors.append("Windows 动态 X 范围需要满足 min < max")
+        errors.append("视觉动态 X 范围需要满足 min < max")
     if float(windows["dynamic_min_y_mm"]) >= float(windows["dynamic_max_y_mm"]):
-        errors.append("Windows 动态 Y 范围需要满足 min < max")
+        errors.append("视觉动态 Y 范围需要满足 min < max")
     if len(windows.get("roi", [])) != 4:
-        errors.append("Windows ROI 需要包含 x/y/w/h 四个值")
+        errors.append("视觉 ROI 需要包含 x/y/w/h 四个值")
     if float(linux["min_target_x_mm"]) >= float(linux["max_target_x_mm"]):
         errors.append("Linux 目标 X 范围需要满足 min < max")
     if float(linux["min_grasp_z_mm"]) >= float(linux["max_grasp_z_mm"]):
         errors.append("Linux 抓取 Z 范围需要满足 min < max")
-    if not shell.get("ssh_user") or not shell.get("ssh_host"):
-        errors.append("Linux SSH 用户和主机不能为空")
+    if not linux.get("can"):
+        errors.append("CAN 接口不能为空")
     if linux.get("execute"):
-        warnings.append("Linux 已开启真实执行")
+        warnings.append("机械臂服务已开启真实执行")
     if float(linux.get("command_duration_s", 0)) <= 0:
         errors.append("command-duration-s 必须大于 0")
     if float(linux.get("gripper_settle_s", 0)) < 0:
@@ -1022,8 +992,8 @@ def load_saved_commands() -> dict[str, str]:
 
 def save_commands(payload: dict[str, Any]) -> dict[str, str]:
     commands = {
-        "windows": str(payload.get("windows", "")).strip(),
-        "linux": str(payload.get("linux", "")).strip(),
+        "vision": str(payload.get("vision", payload.get("windows", ""))).strip(),
+        "robot": str(payload.get("robot", payload.get("linux", ""))).strip(),
     }
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     COMMANDS_PATH.write_text(
@@ -1035,23 +1005,26 @@ def save_commands(payload: dict[str, Any]) -> dict[str, str]:
 
 class PiperCommandCenter:
     def __init__(self) -> None:
-        self.windows = ManagedProcess("windows", preview_enabled=True)
-        self.linux = ManagedProcess("linux")
+        self.vision = ManagedProcess("vision", preview_enabled=True)
+        self.robot = ManagedProcess("robot")
 
     def process(self, name: str) -> ManagedProcess:
-        if name == "windows":
-            return self.windows
-        if name == "linux":
-            return self.linux
+        if name in ("vision", "windows"):
+            return self.vision
+        if name in ("robot", "linux"):
+            return self.robot
         raise KeyError(name)
 
     def status(self) -> dict[str, Any]:
         return {
-            "windows": self.windows.status(),
-            "linux": self.linux.status(),
+            "vision": self.vision.status(),
+            "robot": self.robot.status(),
+            # Old keys remain for clients that have not refreshed yet.
+            "windows": self.vision.status(),
+            "linux": self.robot.status(),
             "preview": preview_status(),
-            "arm_activity": self.linux.activity_status(),
-            "arm_activity_history": self.linux.activity_history(),
+            "arm_activity": self.robot.activity_status(),
+            "arm_activity_history": self.robot.activity_history(),
         }
 
 
@@ -1105,8 +1078,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                 }
             )
             return
-        if path == "/api/linux/port-status":
-            self.send_json(remote_linux_port_status(load_profile()))
+        if path in ("/api/robot/port-status", "/api/linux/port-status"):
+            self.send_json(local_robot_port_status(load_profile()))
             return
         if path == "/api/commands":
             self.send_json(load_saved_commands())
@@ -1171,31 +1144,32 @@ class RequestHandler(BaseHTTPRequestHandler):
             payload = self.read_json()
             self.send_json(save_commands(payload))
             return
-        if path == "/api/linux/port-status":
+        if path in ("/api/robot/port-status", "/api/linux/port-status"):
             payload = self.read_json()
             profile = payload.get("profile") or load_profile()
-            self.send_json(remote_linux_port_status(profile))
+            self.send_json(local_robot_port_status(profile))
             return
-        if path == "/api/linux/stop-port-owner":
+        if path in ("/api/robot/stop-port-owner", "/api/linux/stop-port-owner"):
             payload = self.read_json()
             profile = payload.get("profile") or load_profile()
-            result = stop_remote_linux_port_owner(profile, force=bool(payload.get("force")))
-            self.app.linux.append_event("warn" if result.get("ok") else "error", result.get("message", ""))
+            result = stop_local_robot_port_owner(profile, force=bool(payload.get("force")))
+            self.app.robot.append_event("warn" if result.get("ok") else "error", result.get("message", ""))
             self.send_json(result, status=200 if result.get("ok") else 400)
             return
-        if path == "/api/linux/setup-can":
+        if path in ("/api/robot/setup-can", "/api/linux/setup-can"):
             payload = self.read_json()
             profile = payload.get("profile") or load_profile()
-            result = remote_setup_can(profile, str(payload.get("password") or ""))
-            self.app.linux.append_event("success" if result.get("ok") else "error", result.get("message", ""))
+            result = setup_local_can(profile, str(payload.get("password") or ""))
+            self.app.robot.append_event("success" if result.get("ok") else "error", result.get("message", ""))
             self.send_json(result, status=200 if result.get("ok") else 400)
             return
 
-        match = re.fullmatch(r"/api/process/(windows|linux)/(start|stop)", path)
+        match = re.fullmatch(r"/api/process/(vision|robot|windows|linux)/(start|stop)", path)
         if not match:
             self.send_error(404, "not found")
             return
         name, action = match.groups()
+        name = {"windows": "vision", "linux": "robot"}.get(name, name)
         process = self.app.process(name)
         try:
             if action == "start":
@@ -1204,15 +1178,15 @@ class RequestHandler(BaseHTTPRequestHandler):
                 if not command:
                     profile = payload.get("profile") or load_profile()
                     command = build_generated_commands(profile)[name]
-                if name == "linux":
+                if name == "robot":
                     profile = payload.get("profile") or load_profile()
-                    port_status = remote_linux_port_status(profile)
+                    port_status = local_robot_port_status(profile)
                     if not port_status.get("ok"):
-                        self.app.linux.append_event("error", port_status.get("message", "无法检查远端端口"))
+                        self.app.robot.append_event("error", port_status.get("message", "无法检查本机端口"))
                         self.send_json({"ok": False, "error": port_status.get("message"), "port_status": port_status}, status=400)
                         return
                     if port_status.get("occupied"):
-                        self.app.linux.append_event("warn", port_status.get("message", "Linux 端口已被占用"))
+                        self.app.robot.append_event("warn", port_status.get("message", "本机端口已被占用"))
                         self.send_json({"ok": False, "error": port_status.get("message"), "port_status": port_status}, status=400)
                         return
                 process.start(command)
@@ -1328,8 +1302,8 @@ def main() -> None:
     except KeyboardInterrupt:
         print("\nStopping web command center...")
     finally:
-        server.app.windows.stop()
-        server.app.linux.stop()
+        server.app.vision.stop()
+        server.app.robot.stop()
         server.server_close()
 
 

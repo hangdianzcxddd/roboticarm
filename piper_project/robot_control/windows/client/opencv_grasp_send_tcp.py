@@ -1,13 +1,17 @@
 """OpenCV belt-color grasp client: mask centroid -> median depth -> TCP.
 
-Run on Windows from ``piper_project`` after starting the Linux catch server:
+Run on Linux from ``piper_project`` after starting the local catch server:
 
-    python -m robot_control.windows.client.opencv_grasp_send_tcp --host <linux-vm-ip>
+    python -m robot_control.windows.client.opencv_grasp_send_tcp --host 127.0.0.1 --port 5005
 
 The detector thresholds the conveyor belt color in HSV, inverts that mask
 inside an optional ROI, converts each non-belt connected component into a mask
 target, samples median depth inside that mask, and sends selected targets to
-``catch_server_1`` with the same camera-point protocol used by the YOLO clients.
+``catch_server_1_1`` with the same camera-point protocol used by the YOLO clients.
+
+The historical ``robot_control.windows.client`` package path is retained for
+backward compatibility; the implementation uses portable Python/OpenCV and
+RealSense APIs and does not require Windows.
 """
 
 from __future__ import annotations

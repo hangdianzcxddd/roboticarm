@@ -12,6 +12,10 @@ torchvision>=0.16,<1
 open3d>=0.18,<0.20
 scipy==1.13.1
 trimesh==4.0.10
+# GraspNet baseline runtime/training utilities:
+Pillow>=10.0
+tqdm>=4.66
+tensorboard>=2.14
 # Optional GraspNet backend:
 # graspnetAPI==1.2.11 declares numpy==1.20.3, which conflicts with Python 3.12
 # and the project runtime. If needed, install it separately with:
