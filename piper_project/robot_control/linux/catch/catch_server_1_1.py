@@ -633,7 +633,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--grasp-yaw-max-delta-deg",
         type=float,
-        default=45.0,
+        default=90.0,
         help="maximum absolute J6 yaw correction applied per grasp",
     )
     parser.add_argument(
@@ -956,7 +956,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-grasp-z-mm", type=float)
 
     parser.add_argument("--open-command-mm", type=float, default=0.0)
-    parser.add_argument("--grasp-command-mm", type=float, default=-100.0)
+    parser.add_argument("--grasp-command-mm", type=float, default=-97.0)
     parser.add_argument("--effort-nm", type=float, default=1.0)
     parser.add_argument(
         "--grasp-effort-nm",

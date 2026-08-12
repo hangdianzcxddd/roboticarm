@@ -48,7 +48,7 @@ DEFAULT_PROFILE: dict[str, Any] = {
         "mode": "dynamic",
         "host": "127.0.0.1",
         "port": 5005,
-        "conveyor_speed_mm_s": 155,
+        "conveyor_speed_mm_s": 140,
         "dynamic_min_x_mm": 220,
         "dynamic_max_x_mm": 480,
         "dynamic_min_y_mm": -550,
@@ -79,6 +79,9 @@ DEFAULT_PROFILE: dict[str, Any] = {
         "dynamic_skip_memory_s": 0,
         "dynamic_probe_interval_s": 0,
         "print_interval": 1,
+        # The Web command writes RGB/mask/depth frames to the page. Avoid
+        # opening a second set of native OpenCV windows when launched here.
+        "no_display": True,
         "morphology_close_kernel_size": 11,
         "morphology_open_kernel_size": 3,
         "contour_mask_mode": "convex-hull",
@@ -106,7 +109,7 @@ DEFAULT_PROFILE: dict[str, Any] = {
         "print_feedback": True,
         "debug_plan": True,
         "open_command_mm": 0,
-        "grasp_command_mm": -90,
+        "grasp_command_mm": -97,
         "effort_nm": 0.9,
         "min_target_x_mm": 220,
         "max_target_x_mm": 480,
@@ -131,7 +134,7 @@ DEFAULT_PROFILE: dict[str, Any] = {
         "dynamic_t_robot_planar_far_s_per_mm": None,
         "grasp_yaw_by_object_short_edge": True,
         "gripper_close_axis_offset_deg": 0,
-        "grasp_yaw_max_delta_deg": None,
+        "grasp_yaw_max_delta_deg": 90,
         "grasp_yaw_deadband_deg": None,
         "j6_speed": 90,
         "grasp_yaw_timing": "pick_above",
@@ -605,6 +608,7 @@ def build_vision_command(profile: dict[str, Any]) -> str:
     add_number_option(parts, "--dynamic-skip-memory-s", windows.get("dynamic_skip_memory_s"))
     add_number_option(parts, "--dynamic-probe-interval-s", windows.get("dynamic_probe_interval_s"))
     add_number_option(parts, "--print-interval", windows.get("print_interval"))
+    add_flag(parts, windows.get("no_display", True), "--no-display")
     add_number_option(parts, "--morphology-close-kernel-size", windows.get("morphology_close_kernel_size"))
     add_number_option(parts, "--morphology-open-kernel-size", windows.get("morphology_open_kernel_size"))
     add_option(parts, "--contour-mask-mode", windows.get("contour_mask_mode"))
@@ -771,6 +775,34 @@ def setup_local_can(profile: dict[str, Any], sudo_password: str) -> dict[str, An
         "raw": raw,
         "message": message,
     }
+
+
+def move_local_arm_to_safe_position() -> dict[str, Any]:
+    commands = [
+        [sys.executable, "-m", "robot_control.linux.arm.arm_cli", "joints", "0", "0", "0", "0", "0", "0"],
+        [sys.executable, "-m", "robot_control.linux.arm.arm_cli", "joints", "0", "0", "0", "0", "0.5", "0"],
+    ]
+    steps = []
+    for command in commands:
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=str(PROJECT_ROOT),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return {"ok": False, "message": f"安全位动作失败：{exc}", "steps": steps}
+        output = (completed.stdout or "").strip()
+        step = {"command": shlex.join(command), "returncode": completed.returncode,
+                "output": output, "ok": completed.returncode == 0}
+        steps.append(step)
+        if completed.returncode != 0:
+            return {"ok": False, "message": "安全位第一步失败，后续动作未执行", "steps": steps}
+    return {"ok": True, "message": "机械臂已回到安全位", "steps": steps}
 
 
 def linux_service_port(profile: dict[str, Any]) -> int:
@@ -1160,6 +1192,11 @@ class RequestHandler(BaseHTTPRequestHandler):
             payload = self.read_json()
             profile = payload.get("profile") or load_profile()
             result = setup_local_can(profile, str(payload.get("password") or ""))
+            self.app.robot.append_event("success" if result.get("ok") else "error", result.get("message", ""))
+            self.send_json(result, status=200 if result.get("ok") else 400)
+            return
+        if path in ("/api/robot/safe-position", "/api/linux/safe-position"):
+            result = move_local_arm_to_safe_position()
             self.app.robot.append_event("success" if result.get("ok") else "error", result.get("message", ""))
             self.send_json(result, status=200 if result.get("ok") else 400)
             return

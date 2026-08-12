@@ -1062,7 +1062,7 @@ def build_parser() -> argparse.ArgumentParser:
             "sends one mask target when it enters the configured conveyor window"
         ),
     )
-    parser.add_argument("--host", help="Linux VM IP address running catch_server_1")
+    parser.add_argument("--host", default="127.0.0.1", help="local catch_server_1_1 address")
     parser.add_argument("--port", type=int, default=5005)
     parser.add_argument("--timeout-s", type=float, default=3.0)
     parser.add_argument("--dry-run", action="store_true", help="print target XYZ without sending")
@@ -1297,7 +1297,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--conveyor-speed-mm-s",
         type=float,
-        help="dynamic mode conveyor speed magnitude in mm/s; required for dynamic mode",
+        default=140.0,
+        help="dynamic mode conveyor speed magnitude in mm/s",
     )
     parser.add_argument(
         "--conveyor-direction",
@@ -1944,16 +1945,6 @@ def draw_opencv_targets(
             (detection.x, max(18, detection.y - 8)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.5,
-            (0, 0, 0),
-            3,
-            cv2.LINE_AA,
-        )
-        cv2.putText(
-            image,
-            text,
-            (detection.x, max(18, detection.y - 8)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
             color,
             1,
             cv2.LINE_AA,
@@ -1969,16 +1960,6 @@ def draw_opencv_targets(
         text = status
         text_color = (255, 255, 255)
 
-    cv2.putText(
-        image,
-        text,
-        (12, 28),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.55,
-        (0, 0, 0),
-        3,
-        cv2.LINE_AA,
-    )
     cv2.putText(
         image,
         text,

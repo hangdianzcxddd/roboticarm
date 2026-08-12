@@ -24,6 +24,7 @@ const el = {
   validationStatus: document.getElementById("validationStatus"),
   startWindows: document.getElementById("startWindows"),
   startLinux: document.getElementById("startLinux"),
+  safePosition: document.getElementById("safePosition"),
   armActivityBar: document.getElementById("armActivityBar"),
   armActivityStep: document.getElementById("armActivityStep"),
   armActivityPhase: document.getElementById("armActivityPhase"),
@@ -602,6 +603,14 @@ document.getElementById("stopRemoteLinux").addEventListener("click", () =>
 el.startWindows.addEventListener("click", () => toggleProcess("vision").catch(alertError));
 el.startLinux.addEventListener("click", () => toggleProcess("robot").catch(alertError));
 document.getElementById("stopAll").addEventListener("click", () => stopAll().catch(alertError));
+el.safePosition.addEventListener("click", () => {
+  if (!confirm("将按顺序执行两个安全位关节动作，继续吗？")) return;
+  el.safePosition.disabled = true;
+  api("/api/robot/safe-position", { method: "POST", body: "{}" })
+    .then((result) => { alert(result.message || "机械臂已回到安全位"); refreshStatus(); })
+    .catch(alertError)
+    .finally(() => { el.safePosition.disabled = false; });
+});
 
 async function tick() {
   try {
