@@ -1,0 +1,17 @@
+{
+  "phase": "multi-speed",
+  "joints": [
+    "j1",
+    "j2",
+    "j3",
+    "j4",
+    "j5",
+    "j6"
+  ],
+  "speed_percent": 10,
+  "completed": false,
+  "position_hold_sent": true,
+  "abort_reason": "arm status reported fault code EMERGENCY_STOP(0x1)",
+  "observed_speed_statistics_deg_s": {},
+  "finished_at_local": "2026-08-21T16:42:32+0800"
+}

@@ -1,0 +1,21 @@
+# Minimal runtime dependencies for the OpenCV + RealSense client and
+# catch_server_1_1 Linux server.
+#
+# Python 3.10 or newer is required by the project source (for ``X | Y``
+# type annotations and other modern typing syntax).
+
+# Shared numeric/vision processing (client and server)
+numpy>=1.24,<2
+opencv-python>=4.8,<5
+
+# Intel RealSense D435i camera (vision client)
+pyrealsense2>=2.55
+
+# Cartesian IK and rotation calculations (catch_server_1_1)
+scipy==1.13.1
+
+# Piper SDK CAN transport (Linux robot controller)
+python-can>=3.3.4
+
+# Install the local Piper SDK used by PiperController.
+-e ../sdk/piper_sdk

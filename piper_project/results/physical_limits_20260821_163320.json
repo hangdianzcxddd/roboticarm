@@ -1,0 +1,69 @@
+{
+  "phase": "range",
+  "joints": [
+    "j1",
+    "j2",
+    "j3",
+    "j4",
+    "j5",
+    "j6"
+  ],
+  "speed_percent": 10,
+  "completed": false,
+  "abort_reason": "KeyboardInterrupt",
+  "observed_speed_statistics_deg_s": {
+    "startup_zero_home": {
+      "j1": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j2": {
+        "peak_deg_s": 24.174087072496874,
+        "mean_abs_deg_s": 16.56644868183503
+      },
+      "j3": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j4": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j5": {
+        "peak_deg_s": 32.802377491654745,
+        "mean_abs_deg_s": 0.5159355048124861
+      },
+      "j6": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      }
+    },
+    "range_j1_min": {
+      "j1": {
+        "peak_deg_s": 22.208810868569685,
+        "mean_abs_deg_s": 10.378665293793837
+      },
+      "j2": {
+        "peak_deg_s": 18.544049003134198,
+        "mean_abs_deg_s": 11.801096616148246
+      },
+      "j3": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j4": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j5": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j6": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      }
+    }
+  },
+  "finished_at_local": "2026-08-21T16:33:26+0800"
+}

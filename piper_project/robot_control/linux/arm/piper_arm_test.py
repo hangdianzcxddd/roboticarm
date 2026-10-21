@@ -202,6 +202,16 @@ class TestMove(unittest.TestCase):
             ],
         )
 
+    def test_send_joint_target_does_not_reset_motion_mode(self):
+        controller, sdk = make_controller()
+
+        controller.send_joint_target([0.0, 1.0, -1.0, 0.5, -0.5, 0.25])
+
+        self.assertEqual(
+            sdk.calls,
+            [("JointCtrl", (0, 57296, -57296, 28648, -28648, 14324))],
+        )
+
     def test_move_joints_accepts_configured_full_joint_range(self):
         controller, sdk = make_controller()
 

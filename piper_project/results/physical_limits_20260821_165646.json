@@ -1,0 +1,175 @@
+{
+  "phase": "multi-speed",
+  "joints": [
+    "j1",
+    "j2",
+    "j3",
+    "j4",
+    "j5",
+    "j6"
+  ],
+  "speed_percent": 10,
+  "multi_scenarios": [
+    "selected_j1_j2_j3_j4_j5_j6_small"
+  ],
+  "completed": true,
+  "observed_speed_statistics_deg_s": {
+    "startup_zero_home": {
+      "j1": {
+        "peak_deg_s": 22.801652646638075,
+        "mean_abs_deg_s": 1.7819492761709252
+      },
+      "j2": {
+        "peak_deg_s": 19.915120202777526,
+        "mean_abs_deg_s": 14.938074414516473
+      },
+      "j3": {
+        "peak_deg_s": 24.241386159635272,
+        "mean_abs_deg_s": 16.853880301313165
+      },
+      "j4": {
+        "peak_deg_s": 23.410581792539656,
+        "mean_abs_deg_s": 2.085669141969665
+      },
+      "j5": {
+        "peak_deg_s": 25.946838907302617,
+        "mean_abs_deg_s": 1.4090937919234725
+      },
+      "j6": {
+        "peak_deg_s": 27.721738182600486,
+        "mean_abs_deg_s": 1.412779794712625
+      }
+    },
+    "multi_selected_j1_j2_j3_j4_j5_j6_small_start": {
+      "j1": {
+        "peak_deg_s": 20.126266738107997,
+        "mean_abs_deg_s": 2.7793830548071394
+      },
+      "j2": {
+        "peak_deg_s": 44.84790425557277,
+        "mean_abs_deg_s": 15.045779420101983
+      },
+      "j3": {
+        "peak_deg_s": 24.872389029426888,
+        "mean_abs_deg_s": 16.802659675463552
+      },
+      "j4": {
+        "peak_deg_s": 23.056068682629032,
+        "mean_abs_deg_s": 2.0880516625006402
+      },
+      "j5": {
+        "peak_deg_s": 27.649037561539657,
+        "mean_abs_deg_s": 1.5141617726687266
+      },
+      "j6": {
+        "peak_deg_s": 24.247311782748703,
+        "mean_abs_deg_s": 1.4279112780161805
+      }
+    },
+    "multi_selected_j1_j2_j3_j4_j5_j6_small_forward": {
+      "j1": {
+        "peak_deg_s": 22.743989536693196,
+        "mean_abs_deg_s": 16.440933419841965
+      },
+      "j2": {
+        "peak_deg_s": 24.044827270245772,
+        "mean_abs_deg_s": 10.396157850295268
+      },
+      "j3": {
+        "peak_deg_s": 21.25635515913223,
+        "mean_abs_deg_s": 9.907210575166552
+      },
+      "j4": {
+        "peak_deg_s": 24.05719254480628,
+        "mean_abs_deg_s": 13.030574044744833
+      },
+      "j5": {
+        "peak_deg_s": 26.883996753401785,
+        "mean_abs_deg_s": 9.498965587949098
+      },
+      "j6": {
+        "peak_deg_s": 24.801324533628353,
+        "mean_abs_deg_s": 8.630527395146746
+      }
+    },
+    "multi_selected_j1_j2_j3_j4_j5_j6_small_reverse": {
+      "j1": {
+        "peak_deg_s": 21.952772825566957,
+        "mean_abs_deg_s": 16.134397169564654
+      },
+      "j2": {
+        "peak_deg_s": 22.40680002374324,
+        "mean_abs_deg_s": 10.832447954279766
+      },
+      "j3": {
+        "peak_deg_s": 22.613198728663843,
+        "mean_abs_deg_s": 10.337504024622696
+      },
+      "j4": {
+        "peak_deg_s": 25.13126234255444,
+        "mean_abs_deg_s": 13.228141995966176
+      },
+      "j5": {
+        "peak_deg_s": 27.850026559855017,
+        "mean_abs_deg_s": 9.876014162102978
+      },
+      "j6": {
+        "peak_deg_s": 27.50120456739256,
+        "mean_abs_deg_s": 8.966880453583686
+      }
+    },
+    "multi_selected_j1_j2_j3_j4_j5_j6_small_return": {
+      "j1": {
+        "peak_deg_s": 22.84620891537545,
+        "mean_abs_deg_s": 2.6255299686393814
+      },
+      "j2": {
+        "peak_deg_s": 20.579902439024696,
+        "mean_abs_deg_s": 14.958266431431213
+      },
+      "j3": {
+        "peak_deg_s": 24.10689882929355,
+        "mean_abs_deg_s": 16.891134105842657
+      },
+      "j4": {
+        "peak_deg_s": 30.903447152529825,
+        "mean_abs_deg_s": 2.0539256344068226
+      },
+      "j5": {
+        "peak_deg_s": 29.030828311276057,
+        "mean_abs_deg_s": 1.3888138231957268
+      },
+      "j6": {
+        "peak_deg_s": 24.369519972377994,
+        "mean_abs_deg_s": 1.401873522223565
+      }
+    },
+    "final_zero_home": {
+      "j1": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j2": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j3": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j4": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j5": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j6": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      }
+    }
+  },
+  "finished_at_local": "2026-08-21T16:57:06+0800"
+}

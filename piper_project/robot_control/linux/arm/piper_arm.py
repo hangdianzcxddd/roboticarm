@@ -434,6 +434,20 @@ class PiperController:
     ) -> None:
         self.validate_joints(joints_rad)
         self.set_motion_mode("J", speed_percent)
+        self.send_joint_target(joints_rad)
+
+    def send_joint_target(
+        self,
+        joints_rad: tuple[float, float, float, float, float, float]
+        | list[float],
+    ) -> None:
+        """Send a joint target without resetting the active motion mode.
+
+        Call :meth:`set_motion_mode` once before streaming a series of targets.
+        Avoiding a mode reconfiguration for every target reduces command-bus
+        churn during smooth trajectories.
+        """
+        self.validate_joints(joints_rad)
         sdk_joints = tuple(round(value * RAD_TO_MILLI_DEG) for value in joints_rad)
         self.sdk.JointCtrl(*sdk_joints)
 

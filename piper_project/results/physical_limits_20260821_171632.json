@@ -1,0 +1,568 @@
+{
+  "phase": "multi-speed",
+  "joints": [
+    "j1",
+    "j2",
+    "j3",
+    "j4",
+    "j5",
+    "j6"
+  ],
+  "speed_percent": 100,
+  "random_seed": 8276765228300614172,
+  "multi_scenarios": [
+    "selected_j1_normal"
+  ],
+  "completed": false,
+  "position_hold_sent": true,
+  "abort_reason": "KeyboardInterrupt",
+  "observed_speed_statistics_deg_s": {
+    "startup_zero_home_read_current": {
+      "j1": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j2": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j3": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j4": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j5": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j6": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      }
+    },
+    "startup_zero_home_step_1_of_1": {
+      "j1": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j2": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j3": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j4": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j5": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j6": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      }
+    },
+    "multi_selected_j1_normal_start_read_current": {
+      "j1": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j2": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j3": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j4": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j5": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j6": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      }
+    },
+    "multi_selected_j1_normal_start_step_1_of_6": {
+      "j1": {
+        "peak_deg_s": 20.278504602560293,
+        "mean_abs_deg_s": 12.782545545867528
+      },
+      "j2": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j3": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j4": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j5": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j6": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      }
+    },
+    "multi_selected_j1_normal_start_step_2_of_6": {
+      "j1": {
+        "peak_deg_s": 23.229652490480884,
+        "mean_abs_deg_s": 15.754283399846525
+      },
+      "j2": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j3": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j4": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j5": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j6": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      }
+    },
+    "multi_selected_j1_normal_start_step_3_of_6": {
+      "j1": {
+        "peak_deg_s": 18.653161941198608,
+        "mean_abs_deg_s": 16.161244064916605
+      },
+      "j2": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j3": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j4": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j5": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j6": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      }
+    },
+    "multi_selected_j1_normal_start_step_4_of_6": {
+      "j1": {
+        "peak_deg_s": 18.97695471755262,
+        "mean_abs_deg_s": 15.861260716773943
+      },
+      "j2": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j3": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j4": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j5": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j6": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      }
+    },
+    "multi_selected_j1_normal_start_step_5_of_6": {
+      "j1": {
+        "peak_deg_s": 18.580584419926556,
+        "mean_abs_deg_s": 16.01690707827625
+      },
+      "j2": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j3": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j4": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j5": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j6": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      }
+    },
+    "multi_selected_j1_normal_start_step_6_of_6": {
+      "j1": {
+        "peak_deg_s": 19.49365245914184,
+        "mean_abs_deg_s": 15.907425590741523
+      },
+      "j2": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j3": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j4": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j5": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j6": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      }
+    },
+    "multi_selected_j1_normal_forward_read_current": {
+      "j1": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j2": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j3": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j4": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j5": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j6": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      }
+    },
+    "multi_selected_j1_normal_forward_step_1_of_12": {
+      "j1": {
+        "peak_deg_s": 39.92844986042933,
+        "mean_abs_deg_s": 16.158547418370826
+      },
+      "j2": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j3": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j4": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j5": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j6": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      }
+    },
+    "multi_selected_j1_normal_forward_step_2_of_12": {
+      "j1": {
+        "peak_deg_s": 47.79163518785878,
+        "mean_abs_deg_s": 33.49439719732134
+      },
+      "j2": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j3": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j4": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j5": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j6": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      }
+    },
+    "multi_selected_j1_normal_forward_step_3_of_12": {
+      "j1": {
+        "peak_deg_s": 46.99054089722292,
+        "mean_abs_deg_s": 32.224056951471795
+      },
+      "j2": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j3": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j4": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j5": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j6": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      }
+    },
+    "multi_selected_j1_normal_forward_step_4_of_12": {
+      "j1": {
+        "peak_deg_s": 48.83316460704285,
+        "mean_abs_deg_s": 32.609083352660264
+      },
+      "j2": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j3": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j4": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j5": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j6": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      }
+    },
+    "multi_selected_j1_normal_forward_step_5_of_12": {
+      "j1": {
+        "peak_deg_s": 48.9255506624726,
+        "mean_abs_deg_s": 38.190701836712414
+      },
+      "j2": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j3": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j4": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j5": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j6": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      }
+    },
+    "multi_selected_j1_normal_forward_step_6_of_12": {
+      "j1": {
+        "peak_deg_s": 47.87379345184196,
+        "mean_abs_deg_s": 32.57247207739069
+      },
+      "j2": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j3": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j4": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j5": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j6": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      }
+    },
+    "multi_selected_j1_normal_forward_step_7_of_12": {
+      "j1": {
+        "peak_deg_s": 48.13242035414017,
+        "mean_abs_deg_s": 32.52717483767687
+      },
+      "j2": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j3": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j4": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j5": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j6": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      }
+    },
+    "multi_selected_j1_normal_forward_step_8_of_12": {
+      "j1": {
+        "peak_deg_s": 46.361650366660726,
+        "mean_abs_deg_s": 32.598663484258445
+      },
+      "j2": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j3": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j4": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j5": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j6": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      }
+    },
+    "multi_selected_j1_normal_forward_step_9_of_12": {
+      "j1": {
+        "peak_deg_s": 48.802373620085405,
+        "mean_abs_deg_s": 32.220596537068836
+      },
+      "j2": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j3": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j4": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j5": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j6": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      }
+    },
+    "multi_selected_j1_normal_forward_step_10_of_12": {
+      "j1": {
+        "peak_deg_s": 44.80057678965254,
+        "mean_abs_deg_s": 32.662826607943956
+      },
+      "j2": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j3": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j4": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j5": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j6": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      }
+    },
+    "multi_selected_j1_normal_forward_step_11_of_12": {
+      "j1": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j2": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j3": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j4": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j5": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      },
+      "j6": {
+        "peak_deg_s": 0.0,
+        "mean_abs_deg_s": 0.0
+      }
+    }
+  },
+  "finished_at_local": "2026-08-21T17:16:38+0800"
+}

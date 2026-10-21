@@ -54,6 +54,13 @@ RealSense D435i
 python -m pip install -r requirements.txt
 ```
 
+如果只运行 `opencv_grasp_send_tcp.py` + `catch_server_1_1.py` 这条抓取链，
+可改用精简依赖文件（不包含 YOLO、GraspNet、Open3D 和测试工具）：
+
+```bash
+python -m pip install -r requirements_opencv_grasp.txt
+```
+
 注意事项：
 
 - `requirements.txt` 中包含 `-e ../sdk/piper_sdk`，需要保证 Piper SDK 位于项目相邻目录 `../sdk/piper_sdk`。

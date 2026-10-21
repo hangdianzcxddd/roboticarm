@@ -1,0 +1,18 @@
+{
+  "objects": {
+    "your_yolo_class_name": {
+      "model_path": "your_yolo_class_name.ply",
+      "model_scale": 0.001,
+      "sample_points": 50000,
+      "voxel_size_m": 0.004,
+      "min_fitness": 0.3,
+      "max_rmse_m": 0.012,
+      "object_from_grasp": [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0]
+      ]
+    }
+  }
+}
